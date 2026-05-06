@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RocketCat Shell</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260430f" />
+  </head>
+  <body>
+    <div class="shell-layout">
+      <aside class="sidebar">
+        <div class="brand-mark">
+          <span class="brand-accent"></span>
+          <div>
+            <p class="brand-title">RocketCat</p>
+              <p class="brand-subtitle">Unified Bridge</p>
+          </div>
+        </div>
+
+        <nav class="nav-section">
+          <button class="nav-item active" type="button" data-page="network">
+            <span class="nav-icon">≋</span>
+            <span>网络配置</span>
+          </button>
+          <button class="nav-item" type="button" data-page="basic">
+            <span class="nav-icon">⌁</span>
+            <span>基础信息</span>
+          </button>
+          <button class="nav-item" type="button" data-page="logs">
+            <span class="nav-icon">▤</span>
+            <span>猫猫日志</span>
+          </button>
+          <button class="nav-item" type="button" data-page="settings">
+            <span class="nav-icon">◍</span>
+            <span>基础设置</span>
+          </button>
+          <button class="nav-item" type="button" data-page="plugins">
+            <span class="nav-icon">◌</span>
+            <span>插件管理</span>
+          </button>
+        </nav>
+      </aside>
+
+      <main class="page-shell">
+        <section id="networkPage" class="page-view">
+          <header class="page-header">
+            <div>
+              <p class="eyebrow">RocketCat Shell</p>
+              <h1>网络配置</h1>
+            </div>
+            <div class="header-actions">
+              <button id="refreshButton" class="action-button subtle" type="button">刷新</button>
+              <button id="createButton" class="action-button primary" type="button">新建 Bot</button>
+            </div>
+          </header>
+
+          <section id="statusBanner" class="banner hidden"></section>
+
+          <section class="status-grid">
+            <article class="status-card">
+              <p class="status-label">Shell状态</p>
+              <p id="bridgeStatus" class="status-value">-</p>
+            </article>
+            <article class="status-card">
+              <p class="status-label">已启用 Bot</p>
+              <p id="mainBotStatus" class="status-value">-</p>
+            </article>
+            <article class="status-card wide">
+              <p class="status-label">WebUI 入口</p>
+              <p id="webuiStatus" class="status-value">-</p>
+              <p id="webuiUrl" class="status-detail">-</p>
+            </article>
+          </section>
+
+          <section class="panel-shell">
+            <div class="tab-row">
+              <button class="tab-pill">全部</button>
+              <button class="tab-pill active">WS bot</button>
+            </div>
+
+            <div id="emptyState" class="empty-state hidden">
+              <p>当前还没有 bot。点击右上角“新建 Bot”开始添加。</p>
+            </div>
+
+            <div id="botGrid" class="bot-grid"></div>
+          </section>
+        </section>
+
+        <section id="basicPage" class="page-view hidden">
+          <header class="page-header">
+            <div>
+              <p class="eyebrow">RocketCat Shell</p>
+              <h1>基础信息</h1>
+            </div>
+            <div class="header-actions">
+              <button id="basicRefreshButton" class="action-button subtle" type="button">刷新</button>
+            </div>
+          </header>
+
+          <section class="status-grid basic-summary-grid">
+            <article class="status-card">
+              <p class="status-label">已启用 Bot</p>
+              <p id="basicEnabledCount" class="status-value">0</p>
+            </article>
+            <article class="status-card">
+              <p class="status-label">已连接</p>
+              <p id="basicOnlineCount" class="status-value">0</p>
+            </article>
+            <article class="status-card wide">
+              <p class="status-label">显示规则</p>
+              <p class="status-value basic-rule-value">仅显示已启用 bot</p>
+              <p class="status-detail">所有 bot 均来自统一注册表，并显示你在网络配置里设置的客户端名称。</p>
+            </article>
+          </section>
+
+          <section class="panel-shell basic-panel-shell">
+            <div id="basicEmptyState" class="empty-state hidden">
+              <p>当前没有已启用的 bot，因此这里不会显示任何客户端信息。</p>
+            </div>
+            <div id="basicInfoGrid" class="basic-info-grid"></div>
+          </section>
+        </section>
+
+        <section id="logsPage" class="page-view hidden">
+          <header class="page-header">
+            <div>
+              <p class="eyebrow">RocketCat Shell</p>
+              <h1>猫猫日志</h1>
+            </div>
+            <div class="header-actions">
+              <span class="inline-note">仅捕获 Shell 与桥接器自身日志，最大缓存 5000 条，关闭 WebUI 自动清空。</span>
+            </div>
+          </header>
+
+          <section class="panel-shell log-panel-shell">
+            <div class="log-toolbar">
+              <div class="log-filter-group">
+                <button class="log-filter active" type="button" data-log-level="DEBUG">Debug</button>
+                <button class="log-filter active" type="button" data-log-level="INFO">Info</button>
+                <button class="log-filter active" type="button" data-log-level="WARN">Warn</button>
+                <button class="log-filter active" type="button" data-log-level="ERROR">Error</button>
+              </div>
+              <div class="log-toolbar-actions">
+                <label class="field-switch compact-switch log-auto-scroll-switch">
+                  <span id="logAutoScrollLabel">自动滚动已开启</span>
+                  <input id="logAutoScrollToggle" type="checkbox" checked />
+                  <i></i>
+                </label>
+                <div id="logMeta" class="log-meta">实时日志</div>
+                <button id="clearLogsButton" class="action-button log-clear-button" type="button">一键清空日志</button>
+              </div>
+            </div>
+
+            <div id="logConsole" class="log-console" aria-live="polite"></div>
+          </section>
+        </section>
+
+        <section id="settingsPage" class="page-view hidden">
+          <header class="page-header">
+            <div>
+              <p class="eyebrow">RocketCat Shell</p>
+              <h1>基础设置</h1>
+            </div>
+            <div class="header-actions">
+              <button id="settingsRefreshButton" class="action-button subtle" type="button">刷新</button>
+            </div>
+          </header>
+
+          <section class="status-grid settings-summary-grid">
+            <article class="status-card">
+              <p class="status-label">登录认证</p>
+              <p id="settingsAuthStatus" class="status-value">-</p>
+            </article>
+            <article class="status-card">
+              <p class="status-label">当前密码状态</p>
+              <p id="settingsPasswordMode" class="status-value">-</p>
+            </article>
+            <article class="status-card wide">
+              <p class="status-label">修改说明</p>
+              <p class="status-value basic-rule-value">修改后立即生效</p>
+              <p id="settingsPasswordHint" class="status-detail">首次登录默认密码为 123456，请尽快修改。</p>
+            </article>
+          </section>
+
+          <section class="panel-shell settings-panel-shell">
+            <form id="settingsForm" class="settings-form">
+              <section class="form-section">
+                <h3>WebUI 登录认证</h3>
+                <div class="field-grid two-columns">
+                  <label class="field-block span-two">
+                    <span>自定义 WebUI 登录密码</span>
+                    <input
+                      id="settingsWebuiPasswordInput"
+                      name="webui_access_password"
+                      type="password"
+                      autocomplete="new-password"
+                      placeholder="请输入新的 WebUI 登录密码"
+                    />
+                  </label>
+                </div>
+                <p id="settingsPasswordHelper" class="settings-helper">保存后立即生效。当前会话会保留，后续重新登录需使用新密码。</p>
+                <div class="settings-actions">
+                  <button id="settingsPasswordSaveButton" class="action-button primary" type="button">保存密码</button>
+                </div>
+              </section>
+
+              <section class="form-section">
+                <h3>WebUI 访问端口</h3>
+                <div class="field-grid two-columns">
+                  <label class="field-block span-two">
+                    <span>自定义 WebUI 访问端口</span>
+                    <input
+                      id="settingsWebuiPortInput"
+                      name="webui_port"
+                      type="number"
+                      min="1"
+                      max="65535"
+                      step="1"
+                      placeholder="请输入新的 WebUI 访问端口"
+                    />
+                  </label>
+                </div>
+                <p id="settingsPortHint" class="settings-helper">保存后会写入配置。重启 RocketCat Shell 时会优先尝试该端口；如果端口被占用，仍会自动回退到可用端口。</p>
+                <div class="settings-actions">
+                  <button id="settingsPortSaveButton" class="action-button primary" type="button">保存端口</button>
+                </div>
+              </section>
+
+              <section class="form-section">
+                <h3>Message 双向索引</h3>
+                <div class="field-grid two-columns">
+                  <label class="field-block span-two">
+                    <span>最大 message 双向索引储存条数</span>
+                    <input
+                      id="settingsMessageIndexMaxEntriesInput"
+                      name="message_index_max_entries"
+                      type="number"
+                      min="1"
+                      step="1"
+                      placeholder="请输入最大 message 双向索引储存条数"
+                    />
+                  </label>
+                </div>
+                <p id="settingsMessageIndexHint" class="settings-helper">当前最多保留 1000 条 message 双向索引。当最新 message 编号达到 3000002000 时，会自动把当前窗口 3000001001 ~ 3000002000 重新映射为 3000000001 ~ 3000001000。</p>
+                <div class="settings-actions">
+                  <button id="settingsMessageIndexRebuildButton" class="action-button subtle" type="button">手动重建双向索引</button>
+                  <button id="settingsMessageIndexSaveButton" class="action-button primary" type="button">保存条数</button>
+                </div>
+              </section>
+
+              <section class="form-section">
+                <h3>配置文件</h3>
+                <p class="settings-helper">导出或导入当前所有 Bot 设置、WebUI 登录密码、默认 WebUI 端口、message 双向索引条数上限，以及全部插件主配置。</p>
+                <div class="settings-actions">
+                  <button id="settingsExportConfigButton" class="action-button subtle" type="button">导出配置</button>
+                  <button id="settingsImportConfigButton" class="action-button primary" type="button">导入配置</button>
+                </div>
+                <input
+                  id="settingsImportFileInput"
+                  class="hidden"
+                  type="file"
+                  accept=".json,application/json"
+                />
+              </section>
+            </form>
+          </section>
+        </section>
+
+        <section id="pluginsPage" class="page-view hidden">
+          <header class="page-header">
+            <div>
+              <p class="eyebrow">RocketCat Shell</p>
+              <h1>插件管理</h1>
+            </div>
+            <div class="header-actions">
+              <button id="pluginsRefreshButton" class="action-button subtle" type="button">刷新</button>
+            </div>
+          </header>
+
+          <section class="status-grid settings-summary-grid">
+            <article class="status-card">
+              <p class="status-label">本地插件</p>
+              <p id="pluginCount" class="status-value">0</p>
+            </article>
+            <article class="status-card">
+              <p class="status-label">已启用</p>
+              <p id="pluginEnabledCount" class="status-value">0</p>
+            </article>
+            <article class="status-card wide">
+              <p class="status-label">存储规则</p>
+              <p class="status-value basic-rule-value">仅管理本地插件</p>
+              <p class="status-detail">插件本体位于 data/plugins，主配置位于 config/plugins_config，独有持久化数据预留于 data/plugin_data。</p>
+            </article>
+          </section>
+
+          <section class="panel-shell plugin-panel-shell">
+            <div id="pluginEmptyState" class="empty-state hidden">
+              <p>当前还没有本地插件。将插件目录放入 data/plugins 后，这里会自动读取。</p>
+            </div>
+
+            <div id="pluginGrid" class="plugin-grid"></div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <div id="botModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div class="modal-panel">
+        <div class="modal-header">
+          <div>
+            <p class="eyebrow">Unified Bot</p>
+            <h2 id="modalTitle">新建 Bot</h2>
+          </div>
+          <button id="closeModalButton" class="icon-button" type="button" aria-label="关闭">×</button>
+        </div>
+
+        <form id="botForm" class="form-layout">
+          <section class="form-section">
+            <h3>基础信息</h3>
+            <div class="field-grid two-columns">
+              <label class="field-block">
+                <span>Bot 名称</span>
+                <input name="name" type="text" placeholder="bot" required />
+              </label>
+              <label class="field-switch large-switch">
+                <span>启用该 Bot</span>
+                <input name="enabled" type="checkbox" />
+                <i></i>
+              </label>
+            </div>
+          </section>
+
+          <section class="form-section">
+            <h3>Rocket.Chat</h3>
+            <div class="field-grid two-columns">
+              <label class="field-block span-two">
+                <span>Rocket.Chat 服务器地址</span>
+                <input name="server_url" type="url" />
+              </label>
+              <label class="field-block">
+                <span>Rocket.Chat 用户名</span>
+                <input name="username" type="text" autocomplete="off" />
+              </label>
+              <label class="field-block">
+                <span>Rocket.Chat 密码</span>
+                <input name="password" type="password" autocomplete="new-password" />
+              </label>
+              <label class="field-block span-two">
+                <span>E2EE 密钥密码</span>
+                <input name="e2ee_password" type="password" autocomplete="new-password" />
+              </label>
+            </div>
+          </section>
+
+          <section class="form-section">
+            <h3>OneBot 反向 WS</h3>
+            <div class="field-grid two-columns">
+              <label class="field-block span-two">
+                <span>OneBot reverse WS 地址</span>
+                  <input name="onebot_ws_url" type="text" placeholder="ws://host.docker.internal:6200/ws/" />
+              </label>
+              <label class="field-block">
+                <span>OneBot Access Token</span>
+                <input name="onebot_access_token" type="text" autocomplete="off" />
+              </label>
+              <label class="field-block">
+                <span>OneBot self_id</span>
+                <input name="onebot_self_id" type="number" min="1" step="1" />
+              </label>
+            </div>
+          </section>
+
+          <section class="form-section">
+            <h3>高级设置</h3>
+            <div class="field-grid two-columns compact-grid">
+              <label class="field-block">
+                <span>重连延迟(秒)</span>
+                <input name="reconnect_delay" type="number" min="0" step="0.1" />
+              </label>
+              <label class="field-block">
+                <span>最大连续重连次数</span>
+                <input name="max_reconnect_attempts" type="number" min="0" step="1" />
+              </label>
+              <label class="field-block">
+                <span>远程媒体大小上限(字节)</span>
+                <input name="remote_media_max_size" type="number" min="0" step="1" />
+              </label>
+              <div class="switch-group">
+                <label class="field-switch">
+                  <span>子频道会话隔离</span>
+                  <input name="enable_subchannel_session_isolation" type="checkbox" />
+                  <i></i>
+                </label>
+                <label class="field-switch">
+                  <span>忽略机器人自己的消息</span>
+                  <input name="skip_own_messages" type="checkbox" />
+                  <i></i>
+                </label>
+                <label class="field-switch">
+                  <span>调试日志</span>
+                  <input name="debug" type="checkbox" />
+                  <i></i>
+                </label>
+              </div>
+            </div>
+          </section>
+        </form>
+
+        <div class="modal-footer">
+          <button id="cancelButton" class="action-button subtle" type="button">取消</button>
+          <button id="submitButton" class="action-button primary" type="button">保存 Bot</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="pluginModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="pluginModalTitle">
+      <div class="modal-panel plugin-modal-panel">
+        <div class="modal-header">
+          <div>
+            <p class="eyebrow">RocketCat Plugin</p>
+            <h2 id="pluginModalTitle">插件设置</h2>
+          </div>
+          <button id="pluginCloseModalButton" class="icon-button" type="button" aria-label="关闭">×</button>
+        </div>
+
+        <div id="pluginModalMeta" class="plugin-modal-meta"></div>
+
+        <form id="pluginSettingsForm" class="form-layout plugin-settings-form"></form>
+
+        <div class="modal-footer">
+          <button id="pluginCancelButton" class="action-button subtle" type="button">取消</button>
+          <button id="pluginSaveButton" class="action-button primary" type="button">保存插件设置</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="pluginUninstallModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="pluginUninstallTitle">
+      <div class="modal-panel plugin-uninstall-panel">
+        <div class="modal-header">
+          <div>
+            <p class="eyebrow">RocketCat Plugin</p>
+            <h2 id="pluginUninstallTitle">删除确认</h2>
+          </div>
+          <button id="pluginUninstallCloseButton" class="icon-button" type="button" aria-label="关闭">×</button>
+        </div>
+
+        <p id="pluginUninstallMessage" class="plugin-warning-text plugin-uninstall-message">你确定要删除当前插件吗？</p>
+
+        <div class="plugin-uninstall-actions">
+          <p class="plugin-uninstall-section-title">操作:</p>
+
+          <label class="plugin-uninstall-option" for="pluginUninstallDeleteConfigInput">
+            <div class="plugin-uninstall-option-main">
+              <input id="pluginUninstallDeleteConfigInput" class="plugin-uninstall-checkbox" type="checkbox" />
+              <div class="plugin-uninstall-option-text">
+                <strong>同时删除插件配置文件</strong>
+              </div>
+            </div>
+          </label>
+
+          <label class="plugin-uninstall-option" for="pluginUninstallDeleteDataInput">
+            <div class="plugin-uninstall-option-main">
+              <input id="pluginUninstallDeleteDataInput" class="plugin-uninstall-checkbox" type="checkbox" />
+              <div class="plugin-uninstall-option-text">
+                <strong>同时删除插件持久化数据</strong>
+              </div>
+            </div>
+          </label>
+
+          <p class="plugin-uninstall-note">若都不勾选，则只删除插件本体。</p>
+        </div>
+
+        <div class="modal-footer">
+          <button id="pluginUninstallCancelButton" class="action-button subtle" type="button">取消</button>
+          <button id="pluginUninstallConfirmButton" class="action-button primary danger-button" type="button">确认</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="/static/app.js?v=20260501a"></script>
+  </body>
+  </html>

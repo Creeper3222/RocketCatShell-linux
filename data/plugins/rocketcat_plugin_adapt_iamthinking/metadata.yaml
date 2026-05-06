@@ -1,0 +1,6 @@
+name: rocketcat_plugin_adapt_iamthinking
+display_name: I Am Thinking 适配器
+desc: 兼容 astrbot_plugin_iamthinking 的 set_msg_emoji_like 调用，将 OneBot 数字表情阶段映射为 Rocket.Chat reaction shortcode。
+version: v0.1.0
+author: Creeper3222
+repo: ""

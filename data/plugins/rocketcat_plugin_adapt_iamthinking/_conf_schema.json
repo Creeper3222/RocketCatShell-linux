@@ -1,0 +1,19 @@
+{
+  "enabled": {
+    "description": "启用插件",
+    "type": "bool",
+    "default": true
+  },
+  "llm_thinking_reaction": {
+    "description": "LLM 思考中贴表情shortcode",
+    "hint": "不维护完整 QQ 表情映射表，只把思考中阶段归一为一个可配置的 Rocket.Chat shortcode。默认值为 :heart:。",
+    "type": "string",
+    "default": ":heart:"
+  },
+  "llm_done_reaction": {
+    "description": "LLM应答完成时贴表情shortcode",
+    "hint": "不维护完整 QQ 表情映射表，只把完成阶段归一为一个可配置的 Rocket.Chat shortcode。默认值为 :sunny:。",
+    "type": "string",
+    "default": ":sunny:"
+  }
+}
