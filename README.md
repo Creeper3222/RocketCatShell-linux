@@ -26,6 +26,14 @@
 
 ---
 
+## v0.1.2 更新
+
+- Linux / Docker 版 bridge 已同步 RocketCatShell v0.1.2 的线程回复修复：`tmid` 会作为独立线程上下文持久化与传递，文本、图片、文件、语音、视频回复都会优先回到当前线程。
+- 修复了线程语义与普通 `reply` 语义混淆，以及 Rocket.Chat 发送回包缺失 `tmid` 时的线程丢失问题；加密房间里的分段文本、图片、文件回复会优先通过自回显消息修正线程，必要时回填已知线程 ID。
+- 在开启“子频道会话隔离”时，Docker 版也会按 room 维度维护线程上下文，并通过时间戳阻止旧消息重放覆盖较新的线程绑定。
+
+---
+
 ## v0.1.1 更新
 
 - 修复了 AstrBot 唤醒词 / 指令兼容问题：标准 OneBot `message` 和 `raw_message` 重新恢复为“纯当前用户正文”，不再混入房间名、发送者名和引用前缀。
@@ -75,6 +83,7 @@ AstrBot or other compatible OneBot-side workflow
 - 支持兼容 AstrBot 唤醒词 / 指令的入站消息格式，标准 `message` / `raw_message` 保持为纯当前用户正文。
 - 支持 OneBot 风格的群聊、私聊、消息查询、群成员查询、登录信息查询。
 - 支持文本、`at`、引用回复、图片、文件、语音、视频、Markdown 出站发送。
+- 支持 Rocket.Chat 线程上下文感知出站：同一子频道内的线程文本、图片、文件、语音、视频回复会优先跟随当前线程，而不是错误串到最近一次活跃的其他线程。
 - 支持引用链提取、回复来源识别、提及用户映射、群聊 / 私聊上下文映射，以及发送者 / 提及 / 回复 / 子频道等独立认知元数据。
 - 支持可配置的 message 双向索引窗口、自动清理 / 重排和 WebUI 手动重建。
 - 支持远端媒体下载、大小限制控制、本地临时文件落地和 Base64 媒体上传。
@@ -117,7 +126,7 @@ RocketCatShell 当前这一版明确不承诺合并转发消息语义。
 - 频道和私有群组会映射为 OneBot `group` 消息。
 - 标准 OneBot `message` / `raw_message` 会优先保持纯当前用户正文，确保 AstrBot 的唤醒词、命令前缀和 `startswith(...)` 检查仍然成立。
 - Rocket.Chat `mentions` 会转换为 OneBot `at` 段。
-- Rocket.Chat 引用、消息链接、线程回复会转换为 OneBot `reply` 语义，并补充引用上下文文本。
+- Rocket.Chat 引用和消息链接会转换为 OneBot `reply` 语义，并补充引用上下文文本；线程消息本身不会再被误折叠成普通 `reply`，而是单独保留 `rocketchat_thread_source_id` / `thread_source_id` 供线程路由使用。
 - 发送者、提及、引用链、回复摘要、房间名、房间 slug、上下文群 ID 等 Rocket.Chat 认知信息会以独立字段写入事件和消息注册表。
 - 图片、普通文件、音频、视频附件会被识别并转换成对应的 OneBot 媒体段。
 - 不支持直接桥接的媒体会降级为可读文本占位，避免整条消息消失。
@@ -127,6 +136,7 @@ RocketCatShell 当前这一版明确不承诺合并转发消息语义。
 - OneBot `text` 直接发送为 Rocket.Chat 文本。
 - OneBot `at` 会转换为 Rocket.Chat `@username` 或 `@all`。
 - OneBot `reply` 会转换为 Rocket.Chat 消息链接引用格式。
+- 当当前会话上下文处于 Rocket.Chat 线程内时，文本和媒体出站会自动带上对应 `tmid`；如果发送回包暂时缺失 `tmid`，桥接器会优先用自回显消息修正，必要时回填已知线程 ID。
 - OneBot `image` 支持 HTTP(S) 链接、本地文件和 Base64 数据。
 - OneBot `file`、`record`、`video` 支持本地文件；远端媒体会先尝试下载再上传。
 - OneBot `markdown` 会按文本内容发往 Rocket.Chat。
@@ -137,6 +147,7 @@ RocketCatShell 当前这一版明确不承诺合并转发消息语义。
 - `id_map.json` 负责保存 source ID 与 surrogate ID 的双向映射；其中 message 命名空间支持按窗口上限自动清理最早映射，并在达到重置阈值后自动重排 surrogate ID。
 - `message_registry.json` 负责保存富消息缓存、`by_source` / `by_surrogate` 索引和 `latest_by_context_sender` 路由提示，并会在 message 索引整理时同步重建。
 - 群聊上下文使用上下文房间注册表维持群上下文到真实房间的绑定关系。
+- 在开启“子频道会话隔离”时，群聊上下文会按 room 维度保留线程路由信息，并通过时间戳拒绝旧消息重放覆盖较新的线程绑定。
 - 私聊上下文使用私聊房间映射存储维护用户与私聊房间的绑定关系。
 - 可选开启“子频道会话隔离”，把不同子房间拆成不同会话上下文。
 

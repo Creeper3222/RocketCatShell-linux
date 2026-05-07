@@ -283,6 +283,10 @@ class RocketChatMediaBridge:
                 )
                 return None
 
+        if target_kind in {"image", "audio"}:
+            encoded = base64.b64encode(decrypted).decode("ascii")
+            return {"name": str(name), "url": f"base64://{encoded}"}
+
         suffix = self._guess_media_suffix(file_obj, media_url, ".bin")
         local_path = self._write_temp_media_file(decrypted, suffix)
         return {"name": str(name), "path": local_path}
