@@ -352,9 +352,6 @@ class InboundTranslator:
             if candidate:
                 return candidate, self._QUOTE_PATTERN.sub("", text).strip()
 
-        if raw_msg.get("tmid"):
-            return str(raw_msg["tmid"]), text
-
         return None, text
 
     async def _build_quote_contexts(
