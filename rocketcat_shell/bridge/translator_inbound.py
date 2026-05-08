@@ -211,7 +211,7 @@ class InboundTranslator:
                 "reply_message_text": str(direct_reply_context.get("text") or ""),
                 "timestamp": timestamp,
                 "onebot_message": event,
-                "thread_source_id": raw_msg.get("tmid") or "",
+                "thread_source_id": thread_source_id,
             }
         )
         return event
