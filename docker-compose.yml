@@ -10,19 +10,19 @@ services:
       - "${ROCKETCAT_ONEBOT_PORT:-6200}:${ROCKETCAT_ONEBOT_PORT:-6200}"
     volumes:
       - type: bind
-        source: ${ROCKETCAT_CONFIG_DIR:-D:/docker/RocketCatShell/config}
+        source: ${ROCKETCAT_CONFIG_DIR:-./config}
         target: /app/config
       - type: bind
-        source: ${ROCKETCAT_BOTS_DIR:-D:/docker/RocketCatShell/data/bots}
+        source: ${ROCKETCAT_BOTS_DIR:-./data/bots}
         target: /app/data/bots
       - type: bind
-        source: ${ROCKETCAT_PLUGINS_DIR:-D:/docker/RocketCatShell/data/plugins}
+        source: ${ROCKETCAT_PLUGINS_DIR:-./data/plugins}
         target: /app/data/plugins
       - type: bind
-        source: ${ROCKETCAT_PLUGIN_DATA_DIR:-D:/docker/RocketCatShell/data/plugin_data}
+        source: ${ROCKETCAT_PLUGIN_DATA_DIR:-./data/plugin_data}
         target: /app/data/plugin_data
       - type: bind
-        source: ${ROCKETCAT_LOGS_DIR:-D:/docker/RocketCatShell/logs}
+        source: ${ROCKETCAT_LOGS_DIR:-./logs}
         target: /app/logs
     extra_hosts:
       - "host.docker.internal:host-gateway"
