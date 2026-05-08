@@ -3,7 +3,6 @@
 config/
 logs/
 data/bots/
-data/plugins/
 data/plugin_data/
 __pycache__/
 *.py[cod]
