@@ -160,6 +160,7 @@ class InboundTranslator:
             "rocketchat_room_surrogate_id": room_mapping.surrogate_id,
             "rocketchat_context_source_id": context_source_id,
             "rocketchat_context_group_id": context_surrogate_id,
+            "rocketchat_thread_source_id": thread_source_id,
         }
 
         if room_type != "d":
