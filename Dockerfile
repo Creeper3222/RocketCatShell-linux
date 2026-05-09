@@ -13,6 +13,7 @@ RUN python -m pip install --upgrade pip \
 COPY LICENSE README.md ./
 COPY rocketcat_shell ./rocketcat_shell
 COPY data/plugins ./data/plugins
+COPY tools ./tools
 COPY data/plugins /opt/rocketcat/builtin_plugins
 COPY docker/examples /opt/rocketcat/examples
 COPY docker/entrypoint.sh /usr/local/bin/rocketcat-entrypoint.sh

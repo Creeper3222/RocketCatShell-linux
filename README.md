@@ -7,6 +7,10 @@
 
 本项目的目标不是继续做一个“宿主里的桥接插件”，而是把 RocketCat 发展成一套真正独立的 `Rocket.Chat <-> OneBot v11` 桥接软件。
 
+这个 live 目录对应的是 RocketCatShell 的 Linux / Docker 迁移版：核心功能与 Windows `v0.1.3` rebuild 对齐，同时保留容器初始化、外部挂载目录和内置插件自动补种等 docker 化包装层。
+
+> 当前 README 对应版本为 `v0.1.3`。本次大幅重构作为 `v0.1.3` 发布，并且属于破坏性更新。
+
 这意味着：
 
 - RocketCatShell 自己拥有 `config/`、`data/`、`logs/` 目录边界。
@@ -15,31 +19,31 @@
 
 ---
 
-## Linux / Docker 版说明
+## v0.1.3（破坏性更新）
 
-这个仓库是 RocketCatShell 的 Linux 打包版，目标是直接用于 Linux 主机和 Docker 部署。
+`v0.1.3` 对 RocketCatShell 的运行态、持久化模型、WebUI 管理边界和插件承载方式做了重构级调整。
 
-- 新增 `launcher.sh`，用于 Linux 本机一键创建 `.venv`、补齐依赖并启动。
-- 新增 `Dockerfile`、`docker-compose.yml` 和 `docker/entrypoint.sh`，用于构建镜像并持久化运行数据。
-- 容器首次启动时，如果 `config/shell.json` 不存在，会自动写入一份适合容器环境的默认配置：`webui_host=0.0.0.0`、`auto_open_browser=false`。
-- 容器首次启动时，如果挂载出来的 `data/plugins/` 还是空的，会自动补种内置插件 `rocketcat_plugin_adapt_iamthinking`，避免被 volume 覆盖后丢失。
+- 本次更新不承诺兼容 `v0.1.2` 及更早版本的旧配置文件、旧运行态持久化数据、旧目录结构，以及“依附 AstrBot 插件宿主”的部署方式。
+- 升级到 `v0.1.3` 前，请先自行备份旧版本目录，再按当前 README 描述的独立 Shell 目录重新部署或迁移。
+
+- 桥接运行态已切换为以内存为权威的热存储：ID 映射、消息注册表、私聊房间映射和群上下文绑定都会在热路径常驻内存，不再依赖旧版 JSON 逐条读写。
+- 持久化改为单写入后台 worker：运行态会以 `runtime.snapshot.bin` + `runtime.journal.bin` 的组合落盘，启动时先载入快照再回放 journal，用于恢复最近状态而不是拖慢收发热路径。
+- 入站翻译链路新增批量提交与更细粒度的热路径优化：房间信息查询、引用构建、提及提取、媒体描述提取都会尽量复用结果，降低图片 / 引用 / 提及混合消息的处理成本。
+- 新增房间信息缓存 TTL 配置 `room_info_cache_ttl_seconds`，默认 300 秒，避免同一房间元信息被高频重复拉取。
+- 支持可选性能追踪：可通过环境变量 `ROCKETCAT_PERF_TRACE` 或 bot 原始配置 `perf_trace_enabled` 打开，记录 `translate` / `emit_event` 以及入站 `room_lookup`、`mapping_alloc`、`quote_contexts`、`message_store`、`batch_commit` 等阶段耗时。
+- 猫猫日志现在也会捕获 `RocketCatPerf` 性能追踪日志，并提供左上角 `Perf` 开关用于独立过滤这类日志。
+- 新增 `tools/benchmark_inbound_translate.py`，可在本地对比 control / rebuild 两条入站翻译路径的延迟差异。
+- message 索引策略改为固定窗口：只保留最近 N 条 message 映射，超出窗口时裁剪最旧映射，WebUI 的“重建索引”只做窗口整理与关联消息缓存重建，不再保留旧版 reset / compact 语义。
 
 ---
 
-## v0.1.2 更新
+## Linux / Docker 补充说明
 
-- Linux / Docker 版 bridge 已同步 RocketCatShell v0.1.2 的线程回复修复：`tmid` 会作为独立线程上下文持久化与传递，文本、图片、文件、语音、视频回复都会优先回到当前线程。
-- 修复了线程语义与普通 `reply` 语义混淆，以及 Rocket.Chat 发送回包缺失 `tmid` 时的线程丢失问题；加密房间里的分段文本、图片、文件回复会优先通过自回显消息修正线程，必要时回填已知线程 ID。
-- 在开启“子频道会话隔离”时，Docker 版也会按 room 维度维护线程上下文，并通过时间戳阻止旧消息重放覆盖较新的线程绑定。
-
----
-
-## v0.1.1 更新
-
-- 修复了 AstrBot 唤醒词 / 指令兼容问题：标准 OneBot `message` 和 `raw_message` 重新恢复为“纯当前用户正文”，不再混入房间名、发送者名和引用前缀。
-- 补回了上游认知所需的 Rocket.Chat 元数据：发送者、提及、子频道 / 群上下文、引用链和回复摘要改为独立字段写入事件与消息注册表，不再污染标准文本。
-- 新增可配置的 message 双向索引窗口：支持按上限自动清理最早映射、在达到重置阈值后自动重排 surrogate ID，并支持 WebUI 手动重建索引。
-- `id_map.json` 与 `message_registry.json` 现在会同步整理：`by_source`、`by_surrogate`、缓存的 `message_id` / `reply id` 会跟随 active mappings 一起重建，`latest_by_context_sender` 会按保留消息重新计算。
+- `launcher.sh` 会先调用 `tools/check_requirements.py` 检查依赖，再在缺失或版本不兼容时自动安装并复检。
+- `Dockerfile` 会把 `tools/` 一并打进镜像，保证容器内和宿主机目录里的工具链一致。
+- `docker/entrypoint.sh` 仍负责容器首次启动时写入 `config/shell.json` 默认值，并在外部 volume 为空时补种内置插件。
+- `docker-compose.yml`、`.env` 和 `.env.example` 已改为 Linux 风格的默认持久化路径 `/opt/rocketcatshell/...`，不再使用旧的 Windows `D:/docker/...` 示例。
+- 共享媒体导出仍保留在 Docker 版里：图片/语音在适合时会优先落到 `ROCKETCAT_SHARED_MEDIA_HOST_DIR`，减少容器内临时文件与 base64 膨胀。
 
 ---
 
@@ -77,15 +81,15 @@ AstrBot or other compatible OneBot-side workflow
 - 内置独立 WebUI，可管理网络配置、基础信息、运行日志、基础设置和本地插件。
 - WebUI 默认启用登录门禁，初始密码为 `123456`。
 - 支持自定义 WebUI 端口，并在端口占用时自动回退到可用端口。
-- 支持配置导出 / 导入，统一打包 Bot 设置、WebUI 密码 / 端口、message 双向索引条数上限和本地插件主配置。
+- 支持配置导出 / 导入，统一打包 Bot 设置、WebUI 密码 / 端口、消息映射窗口条数上限和本地插件主配置。
 - 支持自动重连、最大连续重连次数限制、自动停用失败 Bot。
 - 支持动态订阅新房间，机器人被拉入新房间后无需重启。
 - 支持兼容 AstrBot 唤醒词 / 指令的入站消息格式，标准 `message` / `raw_message` 保持为纯当前用户正文。
 - 支持 OneBot 风格的群聊、私聊、消息查询、群成员查询、登录信息查询。
+- 支持以内存热存储 + snapshot / journal 恢复的运行态，降低高频消息场景下的磁盘读写压力。
 - 支持文本、`at`、引用回复、图片、文件、语音、视频、Markdown 出站发送。
-- 支持 Rocket.Chat 线程上下文感知出站：同一子频道内的线程文本、图片、文件、语音、视频回复会优先跟随当前线程，而不是错误串到最近一次活跃的其他线程。
 - 支持引用链提取、回复来源识别、提及用户映射、群聊 / 私聊上下文映射，以及发送者 / 提及 / 回复 / 子频道等独立认知元数据。
-- 支持可配置的 message 双向索引窗口、自动清理 / 重排和 WebUI 手动重建。
+- 支持固定大小的 message 索引窗口、超窗自动裁剪和 WebUI 手动窗口重建。
 - 支持远端媒体下载、大小限制控制、本地临时文件落地和 Base64 媒体上传。
 - 支持 Rocket.Chat 官方 E2EE 私聊 / 私有群组文本与媒体收发。
 - 支持本地插件系统，可发现、启停、重载、卸载本地插件，并在运行时接管 OneBot action。
@@ -126,7 +130,7 @@ RocketCatShell 当前这一版明确不承诺合并转发消息语义。
 - 频道和私有群组会映射为 OneBot `group` 消息。
 - 标准 OneBot `message` / `raw_message` 会优先保持纯当前用户正文，确保 AstrBot 的唤醒词、命令前缀和 `startswith(...)` 检查仍然成立。
 - Rocket.Chat `mentions` 会转换为 OneBot `at` 段。
-- Rocket.Chat 引用和消息链接会转换为 OneBot `reply` 语义，并补充引用上下文文本；线程消息本身不会再被误折叠成普通 `reply`，而是单独保留 `rocketchat_thread_source_id` / `thread_source_id` 供线程路由使用。
+- Rocket.Chat 引用、消息链接、线程回复会转换为 OneBot `reply` 语义，并补充引用上下文文本。
 - 发送者、提及、引用链、回复摘要、房间名、房间 slug、上下文群 ID 等 Rocket.Chat 认知信息会以独立字段写入事件和消息注册表。
 - 图片、普通文件、音频、视频附件会被识别并转换成对应的 OneBot 媒体段。
 - 不支持直接桥接的媒体会降级为可读文本占位，避免整条消息消失。
@@ -136,20 +140,27 @@ RocketCatShell 当前这一版明确不承诺合并转发消息语义。
 - OneBot `text` 直接发送为 Rocket.Chat 文本。
 - OneBot `at` 会转换为 Rocket.Chat `@username` 或 `@all`。
 - OneBot `reply` 会转换为 Rocket.Chat 消息链接引用格式。
-- 当当前会话上下文处于 Rocket.Chat 线程内时，文本和媒体出站会自动带上对应 `tmid`；如果发送回包暂时缺失 `tmid`，桥接器会优先用自回显消息修正，必要时回填已知线程 ID。
 - OneBot `image` 支持 HTTP(S) 链接、本地文件和 Base64 数据。
 - OneBot `file`、`record`、`video` 支持本地文件；远端媒体会先尝试下载再上传。
 - OneBot `markdown` 会按文本内容发往 Rocket.Chat。
 
 ### 上下文与映射
 
-- Rocket.Chat 的房间 ID、用户 ID、消息 ID 会被桥接器映射为可持久化的 OneBot surrogate ID。
-- `id_map.json` 负责保存 source ID 与 surrogate ID 的双向映射；其中 message 命名空间支持按窗口上限自动清理最早映射，并在达到重置阈值后自动重排 surrogate ID。
-- `message_registry.json` 负责保存富消息缓存、`by_source` / `by_surrogate` 索引和 `latest_by_context_sender` 路由提示，并会在 message 索引整理时同步重建。
+- Rocket.Chat 的房间 ID、用户 ID、消息 ID 会被桥接器映射为可持久化的 OneBot surrogate ID，但热路径以内存态为准。
+- 每个 bot 的桥接运行态会落盘为 `runtime.snapshot.bin` 与 `runtime.journal.bin`，覆盖 ID 映射、消息缓存、私聊房间映射、群上下文绑定和最近消息窗口，用于快速恢复最近状态。
+- message 命名空间采用固定窗口，只保留最近 N 条映射；窗口整理时会同步刷新消息缓存、reply 关联以及 `latest_by_context_sender` 路由提示。
 - 群聊上下文使用上下文房间注册表维持群上下文到真实房间的绑定关系。
-- 在开启“子频道会话隔离”时，群聊上下文会按 room 维度保留线程路由信息，并通过时间戳拒绝旧消息重放覆盖较新的线程绑定。
 - 私聊上下文使用私聊房间映射存储维护用户与私聊房间的绑定关系。
 - 可选开启“子频道会话隔离”，把不同子房间拆成不同会话上下文。
+
+---
+
+## 性能与诊断
+
+- 启动恢复阶段会记录 `snapshot_load_ms`、`journal_replay_ms` 和 `journal_records_replayed`，便于判断热存储恢复成本。
+- 入站 tracing 会拆分 `translate` 与 `emit_event` 两个阶段，并把 `room_lookup`、`mapping_alloc`、`room_bindings`、`mention_segments`、`quote_contexts`、`mention_metadata`、`media_segments`、`context_media`、`message_store`、`batch_commit` 等热路径阶段拆开记录。
+- `room_info_cache_ttl_seconds` 用于平衡房间元信息实时性与 REST 开销；默认值适合大多数稳定群组场景。
+- `tools/benchmark_inbound_translate.py` 可用于本地构造文本 / 引用 / 线程 / 图片场景，对比 control 与 rebuild 两条入站翻译链路的延迟。
 
 ---
 
@@ -176,14 +187,14 @@ RocketCatShell 当前这一版明确不承诺合并转发消息语义。
   <img src="https://github.com/user-attachments/assets/9cd515ce-92f5-4a63-8d8d-8f42d360b836" width="100%" />
 </p>
 
-RocketCatShell 启动后会在本地启动一个独立 WebUI，默认监听 `127.0.0.1`，默认端口 `5751`。
+RocketCatShell 启动后会在本地启动一个独立 WebUI：本机直接运行时默认监听 `127.0.0.1`，默认端口 `5751`；Docker 容器首次启动时会写入 `webui_host=0.0.0.0`，再由 `docker-compose.yml` 负责对宿主机发布端口。
 
 ### 页面能力
 
 - `网络配置`：查看 Bot 状态、创建 / 编辑 / 删除 Bot。
 - `基础信息`：查看每个 Bot 的账号信息、OneBot self ID、Rocket.Chat 服务器品牌头像和服务器名称。
-- `猫猫日志`：查看 RocketCatShell 运行日志，并支持清空日志。
-- `基础设置`：管理 WebUI 登录密码、WebUI 端口、message 双向索引条数上限，以及配置导出 / 导入。
+- `猫猫日志`：查看 RocketCatShell 与 `RocketCatPerf` 运行日志，可按级别和 `Perf` 开关过滤，并支持清空日志。
+- `基础设置`：管理 WebUI 登录密码、WebUI 端口、消息映射窗口条数上限，以及配置导出 / 导入。
 - `插件管理`：管理 RocketCatShell 本地插件，包括启停、设置、重载和卸载。
 
 ### WebUI 认证
@@ -201,7 +212,7 @@ RocketCatShell 启动后会在本地启动一个独立 WebUI，默认监听 `127
 
 - 导出默认文件名为 `rocketcat_config.json`。
 - 顶层判别字段为 `Is rocketcat config`。
-- 导出内容包含所有 Bot 设置、WebUI 登录密码、WebUI 端口、message 双向索引条数上限和本地插件主配置。
+- 导出内容包含所有 Bot 设置（包括 `room_info_cache_ttl_seconds` 与 `perf_trace_enabled`）、WebUI 登录密码、WebUI 端口、消息映射窗口条数上限和本地插件主配置。
 - 导入时会先校验判别字段；若不是 RocketCatShell 配置文件，则会返回失败提示。
 
 ---
@@ -247,48 +258,32 @@ RocketCatShell 当前已经拥有自己的本地插件系统，而不再只是�
 
 ### 方式一：直接运行 launcher.sh（推荐）
 
-如果你的 Linux 主机已经有 Python 3，直接运行 `launcher.sh` 即可。启动器会自动创建本地 `.venv`，并在缺依赖时自动安装。
+如果你的 Linux 主机已经有 Python 3，直接运行 `launcher.sh`。启动器会自动创建本地 `.venv`，检查 `requirements.txt` 是否满足，并在缺失或版本不兼容时自动安装依赖。
 
 ```bash
 chmod +x launcher.sh
 ./launcher.sh
 ```
 
-### 方式二：使用 Docker Compose
-
-如果你更希望直接作为容器部署，在项目根目录执行：
-
-```bash
-cp .env.example .env
-docker compose up -d --build
-```
-
-这个 linux 仓库已经按你当前这台机器的常见链路收敛了默认值：
-
-- RocketCatShell 跑在 Docker 容器里。
-- AstrBot 仍跑在宿主机上。
-- 容器内默认 OneBot 上游地址是 `ws://host.docker.internal:6200/ws/`，用于连接宿主机 AstrBot 暴露的 OneBot v11 reverse WS。
-- WebUI 默认只发布到宿主机回环地址 `127.0.0.1:5751`，避免直接暴露到公网。
-
-默认会持久化以下目录：
-
-- `./config`
-- `./data/bots`
-- `./data/plugins`
-- `./data/plugin_data`
-- `./logs`
-
-如果你需要改宿主机端口、OneBot 上游地址或持久化路径，直接编辑项目根目录下的 `.env`。
-
-### 方式三：使用本地虚拟环境
+### 方式二：使用本地虚拟环境
 
 在项目根目录执行：
 
 ```bash
-python3 -m venv .venv
+python -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+### 方式三：使用 Docker Compose
+
+如果你希望直接作为容器部署，先按需修改 `.env`，再执行：
+
+```bash
+docker compose up -d --build
+```
+
+默认会把持久化目录挂到 `/opt/rocketcatshell/...`；如果你要改宿主机挂载位置，优先修改 `.env` 里的 `ROCKETCAT_*_DIR` 和 `ROCKETCAT_SHARED_MEDIA_HOST_DIR`。
 
 
 
@@ -308,7 +303,7 @@ launcher.sh
 
 如果本地 `.venv` 不存在，启动器会自动尝试使用系统 `python3` 或 `python` 创建 `.venv`。
 
-如果检测到 `aiohttp`、`cryptography`、`fastapi`、`uvicorn` 或 `PyYAML` 等依赖缺失，启动器还会自动执行：
+如果检测到依赖缺失或版本不满足，启动器会自动执行：
 
 ```bash
 pip install -r requirements.txt
@@ -316,52 +311,12 @@ pip install -r requirements.txt
 
 然后再启动 RocketCatShell。
 
-### Docker 启动
-
-如果使用 Compose：
-
-```bash
-cp .env.example .env
-docker compose up -d
-docker compose logs -f
-```
-
-推荐先检查 `.env` 里的这几个字段是否符合你的机器：
-
-- `ROCKETCAT_WEBUI_BIND_IP=127.0.0.1`
-- `ROCKETCAT_WEBUI_PORT=5751`
-- `ROCKETCAT_DEFAULT_ONEBOT_WS_URL=ws://host.docker.internal:6200/ws/`
-- `ROCKETCAT_CONFIG_DIR=./config`
-- `ROCKETCAT_BOTS_DIR=./data/bots`
-- `ROCKETCAT_PLUGINS_DIR=./data/plugins`
-- `ROCKETCAT_PLUGIN_DATA_DIR=./data/plugin_data`
-- `ROCKETCAT_LOGS_DIR=./logs`
-
-如果你之前已经在宿主机本地跑过一次 RocketCatShell，项目根目录下可能已经存在 `config/shell.json`，并且其中的 `webui_host` 仍然是本地模式默认值 `127.0.0.1`。这时容器会直接复用这份配置，导致端口映射后仍无法从宿主机访问 WebUI。遇到这种情况，请把 `webui_host` 改成 `0.0.0.0`，或者删除这份 `config/shell.json` 让容器入口自动重建。
-
-第一次通过 compose 启动时，如果 `config/shell.json` 还不存在，容器会直接读取 `.env` 中的 `ROCKETCAT_*` 变量生成这份默认配置，而不是再写入固定死的静态模板。
-
-如果只想单独构建镜像并手动运行：
-
-```bash
-docker build -t rocketcatshell:linux .
-docker run -d \
-	--name rocketcatshell \
-	-p 5751:5751 \
-	-v $(pwd)/config:/app/config \
-	-v $(pwd)/data/bots:/app/data/bots \
-	-v $(pwd)/data/plugins:/app/data/plugins \
-	-v $(pwd)/data/plugin_data:/app/data/plugin_data \
-	-v $(pwd)/logs:/app/logs \
-	rocketcatshell:linux
-```
-
 ### Python 模块入口
 
 也可以直接使用：
 
 ```bash
-python3 -m rocketcat_shell
+python -m rocketcat_shell
 ```
 
 可选参数：
@@ -389,22 +344,15 @@ RocketCatShell 在第一次安装、还没有保存过任何配置时，会自�
 
 其中初始默认值包括：
 
-- WebUI 地址：`127.0.0.1:5751`
+- 本机直接运行时的 WebUI 地址：`http://127.0.0.1:5751/`
+- Docker Compose 默认宿主机访问地址：`http://127.0.0.1:5751/`（容器内 `webui_host=0.0.0.0`，再由 compose 负责端口发布）
 - WebUI 初始密码：`123456`
-- 最大 message 双向索引储存条数：`1000`
-- shell 默认 OneBot reverse WS 地址：`ws://127.0.0.1:6200/ws/`
+- 最大消息映射窗口条数：`1000`
+- 本机直接运行时默认 OneBot reverse WS 地址：`ws://127.0.0.1:6199/ws/`
+- Docker Compose / `docker/entrypoint.sh` 默认 OneBot reverse WS 地址：`ws://host.docker.internal:6200/ws/`
 - `next_onebot_self_id`：`910001`
 
 也就是说，只要依赖安装正确，RocketCatShell 在空配置状态下可以自己创建必需目录和初始配置文件。
-
-对于 Docker 版，`docker/entrypoint.sh` 会在 `config/shell.json` 缺失时先写入一份容器默认模板，因此首次容器启动的 WebUI 监听地址会变成 `0.0.0.0:5751`，同时关闭自动打开浏览器。
-
-对当前这个仓库来说，模板默认值已经进一步收敛为：
-
-- `webui_host=0.0.0.0`
-- `webui_port=5751`
-- `default_onebot_ws_url=ws://host.docker.internal:6200/ws/`
-- `auto_open_browser=false`
 
 ---
 
@@ -422,36 +370,24 @@ RocketCatShell 在第一次安装、还没有保存过任何配置时，会自�
 本地部署最常见的地址是：
 
 ```text
-ws://127.0.0.1:6200/ws/
+ws://127.0.0.1:6199/ws/
 ```
 
-如果 RocketCatShell 跑在 Docker 容器里，而 AstrBot 跑在宿主机上，那么在 RocketCatShell 里更应该填写：
+如果你使用当前这个 Docker / Linux live，并且 OneBot 上游跑在宿主机上，那么默认 `.env` / `docker/entrypoint.sh` 会使用：
 
 ```text
 ws://host.docker.internal:6200/ws/
 ```
 
-如果 AstrBot 也部署在 Docker 容器里，并且与 RocketCatShell 在同一个 Docker 网络中运行，则应该使用 AstrBot 容器服务名或别名，例如：
-
-```text
-ws://astrbot:6200/ws/
-```
-
-当前 compose 已经把这个地址作为默认新建 Bot 的 OneBot 上游地址写进首份 `config/shell.json`。
-
 ### 2. 启动 RocketCatShell
 
-启动后打开：
+在默认 `docker-compose.yml` 端口发布配置下，宿主机打开：
 
 ```text
 http://127.0.0.1:5751/
 ```
 
-如果你运行在 Docker 容器里，仍然通过宿主机访问：
-
-```text
-http://127.0.0.1:5751/
-```
+如果你是直接运行 `launcher.sh`，且没有改 `webui_host` / `webui_port`，本机访问地址同样是这个地址。
 
 使用默认密码登录：
 
@@ -503,10 +439,10 @@ http://127.0.0.1:5751/
 
 | 配置项 | 说明 |
 |--------|------|
-| `webui_host` | WebUI 监听主机；本地运行默认 `127.0.0.1`，Docker 推荐设为 `0.0.0.0`。 |
+| `webui_host` | WebUI 监听主机；本机直接运行默认 `127.0.0.1`，Docker 容器首次启动生成的 `shell.json` 默认 `0.0.0.0`。 |
 | `webui_port` | WebUI 监听端口，默认 `5751`。 |
 | `webui_access_password` | WebUI 登录密码，默认 `123456`。 |
-| `message_index_max_entries` | 最大 message 双向索引储存条数，默认 `1000`；超出后会清理最早映射，并在达到重置阈值后自动重排当前窗口。 |
+| `message_index_max_entries` | 最大消息映射窗口条数，默认 `1000`；超出后会清理最早映射，并在达到重置阈值后自动重排当前窗口。 |
 | `log_level` | 日志级别，默认 `INFO`。 |
 | `auto_open_browser` | 启动后是否自动打开浏览器。 |
 | `default_onebot_ws_url` | 新建 Bot 时使用的默认 OneBot reverse WS 地址。 |
@@ -539,6 +475,8 @@ http://127.0.0.1:5751/
 | `max_reconnect_attempts` | 最大重连次数；`0` 表示不限次数。 |
 | `enable_subchannel_session_isolation` | 是否按子频道隔离上下文。 |
 | `remote_media_max_size` | 远端媒体大小上限。 |
+| `room_info_cache_ttl_seconds` | 房间信息缓存 TTL，单位秒，默认 `300`。 |
+| `perf_trace_enabled` | 是否输出入站性能追踪日志；也可被环境变量 `ROCKETCAT_PERF_TRACE` 覆盖。 |
 | `skip_own_messages` | 是否忽略自己发出的消息。 |
 | `debug` | 是否启用调试模式。 |
 
@@ -567,11 +505,10 @@ logs/
 
 - `config/` 只保存配置和插件主配置。
 - `data/` 保存本地插件本体、插件持久化数据和各 Bot 运行时数据。
-- `data/bots/<bot>/id_map.json` 保存 user / room / message / context 的双向 surrogate ID 映射。
-- `data/bots/<bot>/message_registry.json` 保存富消息缓存、`by_source` / `by_surrogate` 索引和最近上下文发言者到房间的路由提示。
+- `data/bots/<bot>/runtime.snapshot.bin` 保存最近一次热存储快照，覆盖 ID 映射、消息缓存、私聊房间映射和群上下文绑定。
+- `data/bots/<bot>/runtime.journal.bin` 保存快照之后的增量变更，用于启动恢复和窗口整理后的状态回放。
+- Bot 运行时仍然会按目录划分，但桥接热路径以内存态为准，不再依赖旧版逐文件在线更新模式。
 - `logs/` 保存 RocketCatShell 自己的运行日志。
-- Docker Compose 默认只把 `config/`、`data/bots/`、`data/plugins/`、`data/plugin_data/`、`logs/` 作为宿主机持久化目录挂载出来，不会把代码目录本身映射回容器。
-- 为了避免宿主机空目录把镜像里的内置插件盖掉，容器入口会自动把内置插件补种到 `data/plugins/`。
 
 当前代码中的路径解析都基于项目根目录的相对布局发现，不依赖写死的 Windows 绝对路径。
 

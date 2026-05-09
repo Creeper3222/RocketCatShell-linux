@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import os
+import asyncio
 import re
 import time
 from typing import Any
@@ -10,6 +10,7 @@ from rocketcat_shell.logger import logger
 
 from .id_map import DurableIdMap
 from .media import summarize_unsupported_media
+from .perf import PerfTrace, perf_stage
 from .rocketchat_client import RocketChatClient
 from .storage import ContextRoomStore, MessageStore, PrivateRoomStore
 
@@ -34,7 +35,7 @@ class InboundTranslator:
         self._context_rooms = context_rooms
         self._self_id = self_id
 
-    async def translate(self, raw_msg: dict) -> dict | None:
+    async def translate(self, raw_msg: dict, *, perf_trace: PerfTrace | None = None) -> dict | None:
         room_id = str(raw_msg.get("rid") or "")
         sender = raw_msg.get("u", {}) or {}
         sender_source_id = str(sender.get("_id") or "")
@@ -42,179 +43,216 @@ class InboundTranslator:
         if not room_id or not sender_source_id or not source_message_id:
             return None
 
-        room_type = await self._rocketchat.get_room_type(room_id)
-        room_info = await self._rocketchat.get_room_info(room_id)
-        room_mapping = await self._id_map.get_or_create("room", room_id)
-        sender_mapping = await self._id_map.get_or_create("user", sender_source_id)
-        message_mapping = await self._id_map.get_or_create("message", source_message_id)
-        context_source_id = self._build_group_context_source_id(room_type, room_id)
-        context_surrogate_id = await self._resolve_context_surrogate_id(
-            room_type=room_type,
-            room_mapping=room_mapping,
-            context_source_id=context_source_id,
+        quote_contexts_task = asyncio.create_task(
+            self._build_quote_contexts(raw_msg, max_depth=self._MAX_QUOTE_DEPTH)
         )
-        room_name = self._resolve_room_display_name(room_info, room_id)
-        room_slug = self._resolve_room_slug(room_info, room_id)
-        room_context_label = self._format_room_context_label(room_type, room_name)
-        sender_name = sender.get("name") or sender.get("username") or sender_source_id
-        thread_source_id = str(raw_msg.get("tmid") or "").strip()
-        timestamp = self._extract_timestamp(raw_msg)
+        runtime_batch = self._begin_runtime_batch()
+        try:
+            with perf_stage(perf_trace, "room_lookup"):
+                room_info = await self._rocketchat.get_room_info(room_id)
+                room_type = str(room_info.get("t") or "c")
+            with perf_stage(perf_trace, "mapping_alloc"):
+                room_mapping = await self._get_or_create_mapping("room", room_id, batch=runtime_batch)
+                sender_mapping = await self._get_or_create_mapping("user", sender_source_id, batch=runtime_batch)
+                message_mapping = await self._get_or_create_mapping("message", source_message_id, batch=runtime_batch)
+                context_source_id = self._build_group_context_source_id(room_type, room_id)
+                context_surrogate_id = await self._resolve_context_surrogate_id(
+                    room_type=room_type,
+                    room_mapping=room_mapping,
+                    context_source_id=context_source_id,
+                    batch=runtime_batch,
+                )
+            room_name = self._resolve_room_display_name(room_info, room_id)
+            room_slug = self._resolve_room_slug(room_info, room_id)
+            room_context_label = self._format_room_context_label(room_type, room_name)
+            sender_name = sender.get("name") or sender.get("username") or sender_source_id
+            thread_source_id = str(raw_msg.get("tmid") or "").strip()
+            timestamp = self._extract_timestamp(raw_msg)
 
-        if room_type == "d":
-            await self._private_rooms.bind(sender_source_id, sender_mapping.surrogate_id, room_id)
-        elif context_surrogate_id is not None:
-            await self._context_rooms.bind(
-                context_source_id=context_source_id,
-                context_surrogate_id=context_surrogate_id,
-                room_source_id=room_id,
-                room_surrogate_id=room_mapping.surrogate_id,
-                room_name=room_name,
-                room_slug=room_slug,
-                thread_source_id=thread_source_id,
-                timestamp=timestamp,
+            with perf_stage(perf_trace, "room_bindings"):
+                if room_type == "d":
+                    await self._bind_private_room(
+                        sender_source_id,
+                        sender_mapping.surrogate_id,
+                        room_id,
+                        batch=runtime_batch,
+                    )
+                elif context_surrogate_id is not None:
+                    await self._bind_context_room(
+                        context_source_id=context_source_id,
+                        context_surrogate_id=context_surrogate_id,
+                        room_source_id=room_id,
+                        room_surrogate_id=room_mapping.surrogate_id,
+                        room_name=room_name,
+                        room_slug=room_slug,
+                        thread_source_id=thread_source_id,
+                        timestamp=timestamp,
+                        batch=runtime_batch,
+                    )
+
+            reply_source_id, cleaned_text = self._extract_reply_source_id(raw_msg)
+            current_input_text = cleaned_text.strip()
+            with perf_stage(perf_trace, "mention_segments"):
+                message_segments, cleaned_text = await self._build_mention_segments(
+                    raw_msg,
+                    cleaned_text,
+                    batch=runtime_batch,
+                )
+            with perf_stage(perf_trace, "quote_contexts"):
+                quote_contexts = await quote_contexts_task
+            with perf_stage(perf_trace, "mention_metadata"):
+                mention_metadata = await self._extract_mention_metadata(raw_msg, batch=runtime_batch)
+            mention_display_names = [
+                str(item.get("name") or "")
+                for item in mention_metadata
+                if str(item.get("name") or "")
+            ]
+            with perf_stage(perf_trace, "context_media"):
+                current_media = await self._extract_context_media_descriptors(raw_msg)
+            with perf_stage(perf_trace, "media_segments"):
+                media_segments = self._rocketchat.media.build_onebot_segments_from_descriptors(current_media)
+            quote_media_segments = self._build_quote_media_segments(
+                quote_contexts,
+                max_depth=self._MAX_QUOTE_DEPTH,
+            )
+            quote_context_block = self._format_quote_context_block(quote_contexts)
+
+            segments: list[dict] = []
+            if reply_source_id:
+                reply_mapping = await self._get_or_create_mapping(
+                    "message",
+                    reply_source_id,
+                    batch=runtime_batch,
+                )
+                segments.append({"type": "reply", "data": {"id": str(reply_mapping.surrogate_id)}})
+            segments.extend(message_segments)
+
+            message_text = cleaned_text.strip()
+            current_message_line = self._format_current_message_line(
+                room_context_label=room_context_label,
+                sender_name=sender_name,
+                message_text=message_text,
+                mention_names=mention_display_names,
+                media=current_media,
             )
 
-        reply_source_id, cleaned_text = self._extract_reply_source_id(raw_msg)
-        current_input_text = cleaned_text.strip()
-        message_segments, cleaned_text = await self._build_mention_segments(raw_msg, cleaned_text)
-        quote_contexts = await self._build_quote_contexts(raw_msg, max_depth=self._MAX_QUOTE_DEPTH)
-        mention_display_names = self._extract_mention_display_names(raw_msg)
-        mention_metadata = await self._extract_mention_metadata(raw_msg)
-        media_segments = await self._rocketchat.media.extract_onebot_segments(raw_msg)
-        quote_media_segments = self._build_quote_media_segments(
-            quote_contexts,
-            max_depth=self._MAX_QUOTE_DEPTH,
-        )
-        current_media = await self._extract_context_media_descriptors(raw_msg)
-        quote_context_block = self._format_quote_context_block(quote_contexts)
+            segments.extend(quote_media_segments)
+            segments.extend(media_segments)
 
-        segments: list[dict] = []
-        if reply_source_id:
-            reply_mapping = await self._id_map.get_or_create("message", reply_source_id)
-            segments.append({"type": "reply", "data": {"id": str(reply_mapping.surrogate_id)}})
-        segments.extend(message_segments)
+            if not segments:
+                media_placeholder = summarize_unsupported_media(raw_msg)
+                if media_placeholder:
+                    segments.append({"type": "text", "data": {"text": media_placeholder}})
+                    message_text = media_placeholder
+                    current_input_text = media_placeholder
 
-        message_text = cleaned_text.strip()
-        current_message_line = self._format_current_message_line(
-            room_context_label=room_context_label,
-            sender_name=sender_name,
-            message_text=message_text,
-            mention_names=mention_display_names,
-            media=current_media,
-        )
+            if not segments:
+                return None
 
-        segments.extend(quote_media_segments)
-        segments.extend(media_segments)
-
-        if not segments:
-            media_placeholder = summarize_unsupported_media(raw_msg)
-            if media_placeholder:
-                segments.append({"type": "text", "data": {"text": media_placeholder}})
-                message_text = media_placeholder
-                current_input_text = media_placeholder
-
-        if not segments:
-            return None
-
-        timestamp = self._extract_timestamp(raw_msg)
-        direct_reply_context = quote_contexts[0] if quote_contexts else {}
-        combined_raw_message = self._compose_raw_message(
-            current_message_text=current_input_text,
-            fallback=message_text,
-        )
-        event = {
-            "time": timestamp,
-            "self_id": self._self_id,
-            "post_type": "message",
-            "message_type": "private" if room_type == "d" else "group",
-            "sub_type": "friend" if room_type == "d" else "normal",
-            "message_id": message_mapping.surrogate_id,
-            "user_id": sender_mapping.surrogate_id,
-            "message": segments,
-            "raw_message": combined_raw_message,
-            "font": 0,
-            "sender": {
+            direct_reply_context = quote_contexts[0] if quote_contexts else {}
+            combined_raw_message = self._compose_raw_message(
+                current_message_text=current_input_text,
+                fallback=message_text,
+            )
+            event = {
+                "time": timestamp,
+                "self_id": self._self_id,
+                "post_type": "message",
+                "message_type": "private" if room_type == "d" else "group",
+                "sub_type": "friend" if room_type == "d" else "normal",
+                "message_id": message_mapping.surrogate_id,
                 "user_id": sender_mapping.surrogate_id,
-                "nickname": sender_name,
-                "card": sender_name,
-            },
-            "message_format": "array",
-            "rocketchat_sender_name": sender_name,
-            "rocketchat_sender_username": str(sender.get("username") or ""),
-            "rocketchat_sender_source_id": sender_source_id,
-            "rocketchat_sender_surrogate_id": sender_mapping.surrogate_id,
-            "rocketchat_mentions": mention_metadata,
-            "rocketchat_quote_contexts": quote_contexts,
-            "rocketchat_quote_context_text": quote_context_block,
-            "rocketchat_current_message_input_text": current_input_text,
-            "rocketchat_quote_media_segments": quote_media_segments,
-            "rocketchat_current_message_text": message_text,
-            "rocketchat_current_message_line": current_message_line,
-            "rocketchat_reply_source_id": reply_source_id,
-            "rocketchat_reply_sender_name": str(direct_reply_context.get("sender_name") or ""),
-            "rocketchat_reply_message_text": str(direct_reply_context.get("text") or ""),
-            "rocketchat_room_source_id": room_id,
-            "rocketchat_room_name": room_name,
-            "rocketchat_room_slug": room_slug,
-            "rocketchat_room_label": room_context_label,
-            "rocketchat_room_surrogate_id": room_mapping.surrogate_id,
-            "rocketchat_context_source_id": context_source_id,
-            "rocketchat_context_group_id": context_surrogate_id,
-            "rocketchat_thread_source_id": thread_source_id,
-        }
-
-        if room_type != "d":
-            event["group_id"] = context_surrogate_id if context_surrogate_id is not None else room_mapping.surrogate_id
-            event["group_name"] = room_name
-
-        if quote_contexts:
-            logger.info(
-                self._format_inbound_quote_log(
-                    room_context_label=room_context_label,
-                    sender_name=sender_name,
-                    sender_surrogate_id=sender_mapping.surrogate_id,
-                    current_message_line=current_message_line,
-                    quote_contexts=quote_contexts,
-                )
-            )
-        else:
-            logger.info(
-                self._format_inbound_message_log(
-                    room_context_label=room_context_label,
-                    sender_name=sender_name,
-                    sender_surrogate_id=sender_mapping.surrogate_id,
-                    current_message_line=current_message_line,
-                )
-            )
-
-        await self._messages.put(
-            {
-                "source_id": source_message_id,
-                "surrogate_id": message_mapping.surrogate_id,
-                "room_source_id": room_id,
-                "room_surrogate_id": room_mapping.surrogate_id,
-                "room_type": room_type,
-                "room_name": room_name,
-                "room_slug": room_slug,
-                "context_source_id": context_source_id,
-                "context_surrogate_id": context_surrogate_id,
-                "sender_source_id": sender_source_id,
-                "sender_surrogate_id": sender_mapping.surrogate_id,
-                "sender_name": sender_name,
-                "sender_username": str(sender.get("username") or ""),
-                "mention_metadata": mention_metadata,
-                "input_text": current_input_text,
-                "text": message_text,
-                "quote_contexts": quote_contexts,
-                "quote_context_text": quote_context_block,
-                "reply_sender_name": str(direct_reply_context.get("sender_name") or ""),
-                "reply_message_text": str(direct_reply_context.get("text") or ""),
-                "timestamp": timestamp,
-                "onebot_message": event,
-                "thread_source_id": thread_source_id,
+                "message": segments,
+                "raw_message": combined_raw_message,
+                "font": 0,
+                "sender": {
+                    "user_id": sender_mapping.surrogate_id,
+                    "nickname": sender_name,
+                    "card": sender_name,
+                },
+                "message_format": "array",
+                "rocketchat_sender_name": sender_name,
+                "rocketchat_sender_username": str(sender.get("username") or ""),
+                "rocketchat_sender_source_id": sender_source_id,
+                "rocketchat_sender_surrogate_id": sender_mapping.surrogate_id,
+                "rocketchat_mentions": mention_metadata,
+                "rocketchat_quote_contexts": quote_contexts,
+                "rocketchat_quote_context_text": quote_context_block,
+                "rocketchat_current_message_input_text": current_input_text,
+                "rocketchat_quote_media_segments": quote_media_segments,
+                "rocketchat_current_message_text": message_text,
+                "rocketchat_current_message_line": current_message_line,
+                "rocketchat_reply_source_id": reply_source_id,
+                "rocketchat_reply_sender_name": str(direct_reply_context.get("sender_name") or ""),
+                "rocketchat_reply_message_text": str(direct_reply_context.get("text") or ""),
+                "rocketchat_room_source_id": room_id,
+                "rocketchat_room_name": room_name,
+                "rocketchat_room_slug": room_slug,
+                "rocketchat_room_label": room_context_label,
+                "rocketchat_room_surrogate_id": room_mapping.surrogate_id,
+                "rocketchat_context_source_id": context_source_id,
+                "rocketchat_context_group_id": context_surrogate_id,
+                "rocketchat_thread_source_id": thread_source_id,
             }
-        )
-        return event
+
+            if room_type != "d":
+                event["group_id"] = context_surrogate_id if context_surrogate_id is not None else room_mapping.surrogate_id
+                event["group_name"] = room_name
+
+            if quote_contexts:
+                logger.info(
+                    self._format_inbound_quote_log(
+                        room_context_label=room_context_label,
+                        sender_name=sender_name,
+                        sender_surrogate_id=sender_mapping.surrogate_id,
+                        current_message_line=current_message_line,
+                        quote_contexts=quote_contexts,
+                    )
+                )
+            else:
+                logger.info(
+                    self._format_inbound_message_log(
+                        room_context_label=room_context_label,
+                        sender_name=sender_name,
+                        sender_surrogate_id=sender_mapping.surrogate_id,
+                        current_message_line=current_message_line,
+                    )
+                )
+
+            with perf_stage(perf_trace, "message_store"):
+                await self._put_message_entry(
+                    {
+                        "source_id": source_message_id,
+                        "surrogate_id": message_mapping.surrogate_id,
+                        "room_source_id": room_id,
+                        "room_surrogate_id": room_mapping.surrogate_id,
+                        "room_type": room_type,
+                        "room_name": room_name,
+                        "room_slug": room_slug,
+                        "context_source_id": context_source_id,
+                        "context_surrogate_id": context_surrogate_id,
+                        "sender_source_id": sender_source_id,
+                        "sender_surrogate_id": sender_mapping.surrogate_id,
+                        "sender_name": sender_name,
+                        "sender_username": str(sender.get("username") or ""),
+                        "mention_metadata": mention_metadata,
+                        "input_text": current_input_text,
+                        "text": message_text,
+                        "quote_contexts": quote_contexts,
+                        "quote_context_text": quote_context_block,
+                        "reply_sender_name": str(direct_reply_context.get("sender_name") or ""),
+                        "reply_message_text": str(direct_reply_context.get("text") or ""),
+                        "timestamp": timestamp,
+                        "onebot_message": event,
+                        "thread_source_id": thread_source_id,
+                    },
+                    batch=runtime_batch,
+                )
+            return event
+        finally:
+            await self._cancel_pending_task(quote_contexts_task)
+            with perf_stage(perf_trace, "batch_commit"):
+                self._commit_runtime_batch(runtime_batch)
 
     async def hydrate(self, surrogate_message_id: int | str) -> dict | None:
         cached = await self._messages.get_by_surrogate(surrogate_message_id)
@@ -243,7 +281,68 @@ class InboundTranslator:
             return False
         return bool(event.get("rocketchat_reply_source_id"))
 
-    async def _build_mention_segments(self, raw_msg: dict, text: str) -> tuple[list[dict], str]:
+    def _begin_runtime_batch(self) -> Any | None:
+        begin_batch = getattr(self._id_map, "begin_batch", None)
+        if callable(begin_batch):
+            return begin_batch()
+        return None
+
+    def _commit_runtime_batch(self, batch: Any = None) -> None:
+        if batch is None:
+            return
+        has_pending = getattr(batch, "has_pending", None)
+        commit = getattr(batch, "commit", None)
+        if callable(has_pending) and callable(commit) and has_pending():
+            commit()
+
+    async def _cancel_pending_task(self, task: asyncio.Task[Any] | None) -> None:
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            return
+
+    async def _get_or_create_mapping(self, namespace: str, source_id: str, *, batch: Any = None) -> Any:
+        if batch is not None:
+            getter = getattr(batch, "get_or_create_mapping", None)
+            if callable(getter):
+                return getter(namespace, source_id)
+        return await self._id_map.get_or_create(namespace, source_id)
+
+    async def _bind_private_room(
+        self,
+        user_source_id: str,
+        user_surrogate_id: int,
+        room_source_id: str,
+        *,
+        batch: Any = None,
+    ) -> None:
+        if batch is not None:
+            binder = getattr(batch, "bind_private_room", None)
+            if callable(binder):
+                binder(user_source_id, user_surrogate_id, room_source_id)
+                return
+        await self._private_rooms.bind(user_source_id, user_surrogate_id, room_source_id)
+
+    async def _bind_context_room(self, *, batch: Any = None, **kwargs) -> None:
+        if batch is not None:
+            binder = getattr(batch, "bind_context_room", None)
+            if callable(binder):
+                binder(**kwargs)
+                return
+        await self._context_rooms.bind(**kwargs)
+
+    async def _put_message_entry(self, entry: dict[str, Any], *, batch: Any = None) -> None:
+        if batch is not None:
+            putter = getattr(batch, "put_message", None)
+            if callable(putter):
+                putter(entry)
+                return
+        await self._messages.put(entry)
+
+    async def _build_mention_segments(self, raw_msg: dict, text: str, *, batch: Any = None) -> tuple[list[dict], str]:
         mentions = raw_msg.get("mentions")
         if not isinstance(mentions, list) or not mentions:
             stripped = text.strip()
@@ -261,7 +360,7 @@ class InboundTranslator:
             if not mention_id:
                 continue
 
-            mention_segment = await self._build_mention_segment(mention)
+            mention_segment = await self._build_mention_segment(mention, batch=batch)
             if mention_segment is None:
                 continue
 
@@ -292,7 +391,7 @@ class InboundTranslator:
         segments.extend(unmatched_segments)
         return segments, "".join(text_parts).strip()
 
-    async def _build_mention_segment(self, mention: dict[str, Any]) -> dict[str, Any] | None:
+    async def _build_mention_segment(self, mention: dict[str, Any], *, batch: Any = None) -> dict[str, Any] | None:
         mention_id = mention.get("_id")
         if not mention_id:
             return None
@@ -302,7 +401,7 @@ class InboundTranslator:
         if str(mention_id) == str(self._rocketchat.user_id):
             mention_qq = str(self._self_id)
         else:
-            mapping = await self._id_map.get_or_create("user", str(mention_id))
+            mapping = await self._get_or_create_mapping("user", str(mention_id), batch=batch)
             mention_qq = str(mapping.surrogate_id)
         return {"type": "at", "data": {"qq": mention_qq, "name": name}}
 
@@ -403,22 +502,52 @@ class InboundTranslator:
         if not isinstance(attachments, list):
             return
 
+        candidates: list[tuple[dict[str, Any], str]] = []
         for attachment in attachments:
             if not isinstance(attachment, dict):
                 continue
             source_id = self._extract_message_id_from_url(str(attachment.get("message_link") or ""))
             if not source_id or source_id in visited:
                 continue
-
             visited.add(source_id)
-            contexts.append(await self._build_quote_context_entry(attachment, source_id, depth))
-            await self._collect_quote_contexts_from_payload(
-                attachment,
-                contexts=contexts,
-                depth=depth + 1,
-                max_depth=max_depth,
-                visited=visited,
-            )
+            candidates.append((attachment, source_id))
+
+        if not candidates:
+            return
+
+        branches = await asyncio.gather(
+            *[
+                self._build_quote_context_branch(
+                    attachment,
+                    source_id,
+                    depth=depth,
+                    max_depth=max_depth,
+                    visited=visited,
+                )
+                for attachment, source_id in candidates
+            ]
+        )
+        for branch in branches:
+            contexts.extend(branch)
+
+    async def _build_quote_context_branch(
+        self,
+        payload: dict[str, Any],
+        source_id: str,
+        *,
+        depth: int,
+        max_depth: int,
+        visited: set[str],
+    ) -> list[dict[str, Any]]:
+        branch = [await self._build_quote_context_entry(payload, source_id, depth)]
+        await self._collect_quote_contexts_from_payload(
+            payload,
+            contexts=branch,
+            depth=depth + 1,
+            max_depth=max_depth,
+            visited=visited,
+        )
+        return branch
 
     async def _collect_quote_contexts_from_message_id(
         self,
@@ -521,79 +650,9 @@ class InboundTranslator:
         self,
         payload: dict[str, Any],
     ) -> list[dict[str, str]]:
-        media: list[dict[str, str]] = []
-        seen: set[tuple[str, str]] = set()
-
-        candidates: list[dict[str, Any]] = []
-        media_shaped_keys = (
-            "type",
-            "mimeType",
-            "contentType",
-            "image_url",
-            "imageUrl",
-            "audio_url",
-            "audioUrl",
-            "video_url",
-            "videoUrl",
-            "title_link",
-            "titleLink",
-            "url",
-            "path",
-            "link",
-        )
-
-        def collect_candidates(source: dict[str, Any]) -> None:
-            files_raw = source.get("files", [])
-            if isinstance(files_raw, dict):
-                candidates.append(files_raw)
-            elif isinstance(files_raw, list):
-                candidates.extend([item for item in files_raw if isinstance(item, dict)])
-
-            for key in ("file", "fileUpload"):
-                single_file = source.get(key)
-                if isinstance(single_file, dict):
-                    candidates.append(single_file)
-
-            if any(source.get(key) for key in media_shaped_keys):
-                candidates.append(source)
-
-        collect_candidates(payload)
-        for attachment in self._rocketchat.media.get_all_attachments_recursive(
+        return await self._rocketchat.media.extract_media_descriptors(
             payload,
             skip_quote_attachments=True,
-        ):
-            collect_candidates(attachment)
-
-        for candidate in candidates:
-            kind = self._rocketchat.media.classify_file_kind(candidate)
-            materialized = await self._rocketchat.media._materialize_media_reference(candidate, kind)
-            if not materialized:
-                continue
-            file_ref = str(materialized.get("path") or materialized.get("url") or "")
-            if not file_ref:
-                continue
-            key = (kind, file_ref)
-            if key in seen:
-                continue
-            seen.add(key)
-            media.append(
-                {
-                    "kind": kind,
-                    "name": str(materialized.get("name") or self._extract_context_media_name(candidate, file_ref)),
-                    "url": str(materialized.get("url") or ""),
-                    "path": str(materialized.get("path") or ""),
-                }
-            )
-
-        return media
-
-    def _extract_context_media_name(self, payload: dict[str, Any], media_url: str) -> str:
-        return str(
-            payload.get("name")
-            or payload.get("title")
-            or payload.get("file_name")
-            or os.path.basename(urlparse(media_url).path)
-            or "attachment"
         )
 
     def _extract_context_sender_name(self, payload: dict[str, Any]) -> str:
@@ -610,20 +669,7 @@ class InboundTranslator:
         text = str(payload.get("text") or payload.get("msg") or "")
         return self._QUOTE_PATTERN.sub("", text).strip()
 
-    def _extract_mention_display_names(self, raw_msg: dict[str, Any]) -> list[str]:
-        mentions = raw_msg.get("mentions")
-        if not isinstance(mentions, list):
-            return []
-        result: list[str] = []
-        for mention in mentions:
-            if not isinstance(mention, dict):
-                continue
-            name = mention.get("name") or mention.get("username") or mention.get("_id")
-            if name:
-                result.append(str(name))
-        return result
-
-    async def _extract_mention_metadata(self, raw_msg: dict[str, Any]) -> list[dict[str, Any]]:
+    async def _extract_mention_metadata(self, raw_msg: dict[str, Any], *, batch: Any = None) -> list[dict[str, Any]]:
         mentions = raw_msg.get("mentions")
         if not isinstance(mentions, list):
             return []
@@ -636,7 +682,7 @@ class InboundTranslator:
             if not mention_id:
                 continue
 
-            segment = await self._build_mention_segment(mention)
+            segment = await self._build_mention_segment(mention, batch=batch)
             if segment is None:
                 continue
 
@@ -809,12 +855,13 @@ class InboundTranslator:
         room_type: str,
         room_mapping: Any,
         context_source_id: str,
+        batch: Any = None,
     ) -> int | None:
         if room_type == "d" or not context_source_id:
             return None
         if getattr(self._rocketchat.config, "enable_subchannel_session_isolation", False):
             return int(room_mapping.surrogate_id)
-        context_mapping = await self._id_map.get_or_create("context", context_source_id)
+        context_mapping = await self._get_or_create_mapping("context", context_source_id, batch=batch)
         return None if context_mapping is None else int(context_mapping.surrogate_id)
 
     def _build_group_context_source_id(self, room_type: str, room_id: str) -> str:

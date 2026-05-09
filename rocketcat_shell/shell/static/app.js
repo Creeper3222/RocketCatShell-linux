@@ -12,6 +12,8 @@ const DEFAULT_FORM = {
   max_reconnect_attempts: 10,
   enable_subchannel_session_isolation: true,
   remote_media_max_size: 20971520,
+  room_info_cache_ttl_seconds: 300.0,
+  perf_trace_enabled: false,
   skip_own_messages: true,
   debug: false,
 };
@@ -42,6 +44,7 @@ const state = {
     pollTimer: null,
     generation: 0,
     autoScroll: true,
+    showPerf: true,
     activeLevels: new Set(['DEBUG', 'INFO', 'WARN', 'ERROR']),
   },
   plugins: {
@@ -138,6 +141,7 @@ const elements = {
   logMeta: document.getElementById('logMeta'),
   clearLogsButton: document.getElementById('clearLogsButton'),
   logFilterButtons: Array.from(document.querySelectorAll('[data-log-level]')),
+  logPerfButton: document.querySelector('[data-log-perf]'),
 };
 
 function showToast(message, kind = 'default') {
@@ -172,20 +176,24 @@ function isAbortError(error) {
   return Boolean(error && (error.name === 'AbortError' || error.code === 20));
 }
 
-async function writeTextWithPicker(fileName, text) {
-  if (typeof window.showSaveFilePicker === 'function') {
-    const handle = await window.showSaveFilePicker({
-      suggestedName: fileName,
-      types: [
-        {
-          description: 'RocketCat 配置文件',
-          accept: {
-            'application/json': ['.json'],
-          },
+function buildJsonSavePickerOptions(fileName) {
+  return {
+    suggestedName: fileName,
+    types: [
+      {
+        description: 'RocketCat 配置文件',
+        accept: {
+          'application/json': ['.json'],
         },
-      ],
-    });
-    const writable = await handle.createWritable();
+      },
+    ],
+  };
+}
+
+async function writeTextWithPicker(fileName, text, handle = null) {
+  if (handle || typeof window.showSaveFilePicker === 'function') {
+    const pickerHandle = handle || await window.showSaveFilePicker(buildJsonSavePickerOptions(fileName));
+    const writable = await pickerHandle.createWritable();
     await writable.write(text);
     await writable.close();
     return;
@@ -459,7 +467,7 @@ function renderSettings(payload) {
   }
   if (elements.settingsMessageIndexHint) {
     elements.settingsMessageIndexHint.textContent = settings.message_index_hint
-      || '当前最多保留 1000 条 message 双向索引。当最新 message 编号达到 3000002000 时，会自动把当前窗口 3000001001 ~ 3000002000 重新映射为 3000000001 ~ 3000001000。';
+      || '当前最多保留 1000 条最近 message 映射。当最新 message 编号达到 3000002000 时，会自动把当前映射窗口 3000001001 ~ 3000002000 重新映射为 3000000001 ~ 3000001000。';
   }
 
   if (elements.settingsWebuiPasswordInput) {
@@ -492,7 +500,15 @@ function renderLogAutoScrollState() {
 
 function renderLogs({ scrollToBottom = false } = {}) {
   const activeLevels = state.logs.activeLevels;
-  const visibleItems = state.logs.items.filter((item) => activeLevels.has(item.level));
+  const visibleItems = state.logs.items.filter((item) => {
+    if (!activeLevels.has(item.level)) {
+      return false;
+    }
+    if (!state.logs.showPerf && item.is_perf) {
+      return false;
+    }
+    return true;
+  });
 
   if (!visibleItems.length) {
     elements.logConsole.innerHTML = '<div class="log-empty">暂时还没有 Shell 或桥接器实时日志。</div>';
@@ -512,6 +528,9 @@ function renderLogs({ scrollToBottom = false } = {}) {
   for (const button of elements.logFilterButtons) {
     const level = button.dataset.logLevel;
     button.classList.toggle('active', state.logs.activeLevels.has(level));
+  }
+  if (elements.logPerfButton) {
+    elements.logPerfButton.classList.toggle('active', state.logs.showPerf);
   }
 
   renderLogAutoScrollState();
@@ -1038,6 +1057,9 @@ async function loadBasicInfo({ forceReload = false, silent = false } = {}) {
 
 async function saveBot() {
   const payload = collectFormData();
+  if (!Number.isFinite(payload.room_info_cache_ttl_seconds) || payload.room_info_cache_ttl_seconds < 0) {
+    throw new Error('房间信息缓存 TTL 必须是大于等于 0 的数字');
+  }
   const isEditing = Boolean(state.editingId);
   const endpoint = state.editingId ? `/api/bots/${state.editingId}` : '/api/bots';
   const method = state.editingId ? 'PUT' : 'POST';
@@ -1090,12 +1112,12 @@ async function savePortSettings() {
 async function saveMessageIndexSettings() {
   const rawValue = String(elements.settingsMessageIndexMaxEntriesInput?.value || '').trim();
   if (!rawValue) {
-    throw new Error('请输入最大 message 双向索引储存条数');
+    throw new Error('请输入最大消息映射窗口条数');
   }
 
   const maxEntries = Number(rawValue);
   if (!Number.isInteger(maxEntries) || maxEntries <= 0) {
-    throw new Error('最大 message 双向索引储存条数必须是正整数');
+    throw new Error('最大消息映射窗口条数必须是正整数');
   }
 
   const payload = await requestJson('/api/settings', {
@@ -1104,7 +1126,7 @@ async function saveMessageIndexSettings() {
   });
   state.settings.loaded = true;
   renderSettings(payload);
-  showToast('message 双向索引条数上限已保存，现有索引窗口已按新规则整理', 'success');
+  showToast('消息映射窗口条数上限已保存，现有映射窗口已按新规则整理', 'success');
 }
 
 function summarizeMessageIndexResult(result) {
@@ -1112,13 +1134,13 @@ function summarizeMessageIndexResult(result) {
   const changedBotCount = Number(result?.changed_bot_count) || 0;
   const removedCount = Number(result?.removed_message_mapping_count) || 0;
   if (botCount <= 0) {
-    return '当前没有可处理的 Bot 索引';
+    return '当前没有可处理的 Bot 消息映射窗口';
   }
-  return `已处理 ${botCount} 个 Bot，发生重排 ${changedBotCount} 个，清理 ${removedCount} 条旧映射`;
+  return `已处理 ${botCount} 个 Bot，整理 ${changedBotCount} 个映射窗口，清理 ${removedCount} 条旧映射`;
 }
 
 async function rebuildMessageIndexes() {
-  const confirmed = window.confirm('确认按当前条数上限手动重建所有 Bot 的 message 双向索引吗？');
+  const confirmed = window.confirm('确认按当前窗口条数上限手动整理所有 Bot 的消息映射窗口吗？');
   if (!confirmed) {
     return;
   }
@@ -1131,9 +1153,13 @@ async function rebuildMessageIndexes() {
 }
 
 async function exportShellConfiguration() {
+  const fileName = 'rocketcat_config.json';
+  const handle = typeof window.showSaveFilePicker === 'function'
+    ? await window.showSaveFilePicker(buildJsonSavePickerOptions(fileName))
+    : null;
   const payload = await requestJson('/api/settings/export-config');
   const text = `${JSON.stringify(payload, null, 2)}\n`;
-  await writeTextWithPicker('rocketcat_config.json', text);
+  await writeTextWithPicker(fileName, text, handle);
 }
 
 async function importShellConfiguration() {
@@ -1381,7 +1407,7 @@ elements.settingsMessageIndexRebuildButton?.addEventListener('click', async () =
   try {
     await rebuildMessageIndexes();
   } catch (error) {
-    showToast(error.message || '手动重建双向索引失败', 'error');
+    showToast(error.message || '手动整理消息映射窗口失败', 'error');
   }
 });
 elements.settingsExportConfigButton?.addEventListener('click', async () => {
@@ -1521,6 +1547,11 @@ for (const button of elements.logFilterButtons) {
     renderLogs();
   });
 }
+
+elements.logPerfButton?.addEventListener('click', () => {
+  state.logs.showPerf = !state.logs.showPerf;
+  renderLogs();
+});
 
 window.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') {

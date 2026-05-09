@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from html import unescape
 from typing import Any, Awaitable, Callable
 from urllib.parse import quote, urlparse
@@ -47,6 +48,7 @@ class RocketChatClient:
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._subscribed_rooms: set[str] = set()
         self._room_info_cache: dict[str, dict[str, Any]] = {}
+        self._room_info_cache_expires_at: dict[str, float] = {}
         self._room_type_cache: dict[str, str] = {}
         self._room_name_cache: dict[str, str] = {}
         self._user_cache: dict[str, dict[str, Any]] = {}
@@ -116,8 +118,7 @@ class RocketChatClient:
                     await self._handle_reconnect_exhausted(exc)
                     break
                 logger.warning(
-                    f"[RocketChatOneBotBridge] Rocket.Chat 重连失败第 {self._consecutive_reconnect_failures} 次: {exc!r}，{self.config.reconnect_delay:.1f}s 后继续重连。完整 traceback 如下：",
-                    exc_info=exc,
+                    f"[RocketChatOneBotBridge] Rocket.Chat 重连失败第 {self._consecutive_reconnect_failures} 次: {exc!r}，{self.config.reconnect_delay:.1f}s 后继续重连。"
                 )
                 await asyncio.sleep(self.config.reconnect_delay)
 
@@ -265,8 +266,10 @@ class RocketChatClient:
         }
 
     async def get_room_info(self, room_id: str, refresh: bool = False) -> dict[str, Any]:
-        if not refresh and room_id in self._room_info_cache:
-            return self._room_info_cache[room_id]
+        if not refresh:
+            cached_room = self._get_cached_room_info(room_id)
+            if cached_room is not None:
+                return cached_room
 
         data = await self._request_json(
             "GET",
@@ -278,6 +281,18 @@ class RocketChatClient:
         final_room = room or fallback
         self._cache_room_info(final_room)
         return self._room_info_cache.get(room_id, final_room)
+
+    def _get_cached_room_info(self, room_id: str) -> dict[str, Any] | None:
+        cached_room = self._room_info_cache.get(room_id)
+        if cached_room is None:
+            return None
+
+        expires_at = self._room_info_cache_expires_at.get(room_id)
+        if expires_at is not None and time.monotonic() >= expires_at:
+            self._room_info_cache.pop(room_id, None)
+            self._room_info_cache_expires_at.pop(room_id, None)
+            return None
+        return cached_room
 
     async def get_room_type(self, room_id: str) -> str:
         room = await self.get_room_info(room_id)
@@ -878,6 +893,11 @@ class RocketChatClient:
         cached = dict(self._room_info_cache.get(str(room_id), {}))
         cached.update(room)
         self._room_info_cache[str(room_id)] = cached
+        ttl_seconds = max(0.0, float(self.config.room_info_cache_ttl_seconds))
+        if ttl_seconds > 0:
+            self._room_info_cache_expires_at[str(room_id)] = time.monotonic() + ttl_seconds
+        else:
+            self._room_info_cache_expires_at.pop(str(room_id), None)
         room_type = cached.get("t")
         if room_type:
             self._room_type_cache[str(room_id)] = str(room_type)

@@ -13,12 +13,14 @@ from rocketcat_shell.plugin_system import (
 )
 
 from .config import BridgeConfig
+from .hot_storage import RuntimeHotStoreBundle, build_runtime_hot_stores
 from .id_map import DurableIdMap
 from .onebot_actions import OneBotActionHandler
 from .onebot_client import OneBotReverseWsClient
 from .paths import resolve_plugin_data_dir
+from .perf import maybe_trace, perf_enabled, perf_stage
 from .rocketchat_client import RocketChatClient
-from .storage import ContextRoomStore, JsonStore, MessageStore, PrivateRoomStore
+from .storage import JsonStore
 from .translator_inbound import InboundTranslator
 from .translator_outbound import OutboundMessageTranslator
 
@@ -53,14 +55,8 @@ class BridgeRuntime:
 
         self.config = BridgeConfig.from_mapping(raw_config)
         self.state_store = JsonStore(self.data_dir / "runtime_state.json")
-        self.message_store = MessageStore(JsonStore(self.data_dir / "message_registry.json"))
-        self.id_map = DurableIdMap(
-            JsonStore(self.data_dir / "id_map.json"),
-            message_window_size=self.message_index_max_entries,
-            on_message_window_changed=self.message_store.rebuild_for_active_mappings,
-        )
-        self.private_room_store = PrivateRoomStore(JsonStore(self.data_dir / "private_rooms.json"))
-        self.context_room_store = ContextRoomStore(JsonStore(self.data_dir / "context_room_registry.json"))
+        self._hot_store_bundle: RuntimeHotStoreBundle | None = None
+        self._ensure_hot_store_bundle()
         self.rocketchat: RocketChatClient | None = None
         self.inbound_translator: InboundTranslator | None = None
         self.outbound_translator: OutboundMessageTranslator | None = None
@@ -80,6 +76,7 @@ class BridgeRuntime:
 
     async def start(self) -> None:
         self._reload_config_snapshot()
+        self._ensure_hot_store_bundle()
         errors = self.config.validate()
         if errors:
             logger.error(
@@ -117,6 +114,10 @@ class BridgeRuntime:
             self._failure_task = None
         await self._stop_clients()
         await self.state_store.write({"status": "stopped"})
+        if self._hot_store_bundle is not None:
+            hot_store_bundle = self._hot_store_bundle
+            self._hot_store_bundle = None
+            await asyncio.to_thread(hot_store_bundle.close)
         self._started = False
 
     @property
@@ -127,11 +128,13 @@ class BridgeRuntime:
         self.message_index_max_entries = DurableIdMap.normalize_message_window_size(
             message_index_max_entries
         )
+        self._ensure_hot_store_bundle()
         self.id_map.set_message_window_size(self.message_index_max_entries)
         if isinstance(self.raw_config, dict):
             self.raw_config["message_index_max_entries"] = self.message_index_max_entries
 
     async def rebuild_message_indexes(self, *, force_compact: bool = False) -> dict[str, Any]:
+        self._ensure_hot_store_bundle()
         return await self.id_map.rebuild_message_window(force_compact=force_compact)
 
     async def get_basic_info_summary(self) -> dict[str, Any] | None:
@@ -205,16 +208,37 @@ class BridgeRuntime:
     async def _handle_rocketchat_message(self, raw_msg: dict[str, Any]) -> None:
         if self.inbound_translator is None or self.onebot is None:
             return
-        event = await self.inbound_translator.translate(raw_msg)
-        if event is None:
-            return
-        await self.onebot.emit_event(event)
+        trace = maybe_trace(
+            perf_enabled(self.config),
+            "rocketchat_receive_to_emit",
+            tags={
+                "instance": self.instance_name,
+                "room_id": str(raw_msg.get("rid") or ""),
+                "source_message_id": str(raw_msg.get("_id") or ""),
+            },
+        )
+        try:
+            with perf_stage(trace, "translate"):
+                event = await self.inbound_translator.translate(raw_msg, perf_trace=trace)
+            if event is None:
+                if trace is not None:
+                    trace.finish(status="dropped")
+                return
+            with perf_stage(trace, "emit_event"):
+                await self.onebot.emit_event(event)
+            if trace is not None:
+                trace.finish(status="ok", message_id=event.get("message_id"))
+        except Exception:
+            if trace is not None:
+                trace.finish(status="error")
+            raise
 
     def _reload_config_snapshot(self) -> None:
         self.config = BridgeConfig.from_mapping(self.raw_config)
 
     async def _start_clients(self) -> None:
         self._reload_config_snapshot()
+        self._ensure_hot_store_bundle()
         self._failure_handled = False
 
         self.rocketchat = RocketChatClient(
@@ -288,6 +312,18 @@ class BridgeRuntime:
         self.onebot = None
         self._plugin_runtime_context = None
         self._runtime_plugins = []
+
+    def _ensure_hot_store_bundle(self) -> None:
+        if self._hot_store_bundle is not None:
+            return
+        self._hot_store_bundle = build_runtime_hot_stores(
+            self.data_dir,
+            message_window_size=self.message_index_max_entries,
+        )
+        self.message_store = self._hot_store_bundle.message_store
+        self.id_map = self._hot_store_bundle.id_map
+        self.private_room_store = self._hot_store_bundle.private_room_store
+        self.context_room_store = self._hot_store_bundle.context_room_store
 
     async def _dispatch_plugin_action(
         self,

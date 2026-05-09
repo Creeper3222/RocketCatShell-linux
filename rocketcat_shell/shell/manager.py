@@ -8,9 +8,9 @@ from typing import Any
 from urllib.parse import quote
 
 from ..__init__ import __version__
+from ..bridge.hot_storage import build_runtime_hot_stores
 from ..bridge.id_map import DurableIdMap
 from ..bridge.runtime import BridgeRuntime
-from ..bridge.storage import JsonStore, MessageStore
 from ..layout import ProjectLayout
 from ..logger import logger
 from ..models import BotRecord, DEFAULT_WEBUI_ACCESS_PASSWORD, ShellSettings
@@ -198,9 +198,9 @@ class ShellManager:
                 )
             )
         except (TypeError, ValueError) as exc:
-            raise ValueError("配置导入失败，最大 message 双向索引储存条数必须是正整数") from exc
+            raise ValueError("配置导入失败，最大消息映射窗口条数必须是正整数") from exc
         if candidate_message_index_max_entries <= 0:
-            raise ValueError("配置导入失败，最大 message 双向索引储存条数必须是正整数")
+            raise ValueError("配置导入失败，最大消息映射窗口条数必须是正整数")
 
         candidate_bots = self._build_import_bots(raw_bots, defaults=settings)
 
@@ -277,9 +277,9 @@ class ShellManager:
                 try:
                     candidate_max_entries = int(raw_max_entries)
                 except (TypeError, ValueError) as exc:
-                    raise ValueError("最大 message 双向索引储存条数必须是正整数") from exc
+                    raise ValueError("最大消息映射窗口条数必须是正整数") from exc
                 if candidate_max_entries <= 0:
-                    raise ValueError("最大 message 双向索引储存条数必须是正整数")
+                    raise ValueError("最大消息映射窗口条数必须是正整数")
                 settings.message_index_max_entries = candidate_max_entries
                 changes.append("message_index")
                 should_apply_message_index_policy = True
@@ -292,7 +292,7 @@ class ShellManager:
         if should_apply_message_index_policy:
             await self._apply_message_index_policy(
                 force_compact=False,
-                reason="message index settings updated",
+                reason="message mapping window settings updated",
             )
 
         if "password" in changes:
@@ -304,7 +304,7 @@ class ShellManager:
             )
         if "message_index" in changes:
             logger.info(
-                "[RocketCatShell] 最大 message 双向索引储存条数已更新为 %s；现有索引窗口已按新规则整理。",
+                "[RocketCatShell] 最大消息映射窗口条数已更新为 %s；现有映射窗口已按新规则整理。",
                 settings.message_index_max_entries,
             )
         return await self.get_settings_state()
@@ -312,7 +312,7 @@ class ShellManager:
     async def rebuild_message_indexes(self) -> dict[str, Any]:
         return await self._apply_message_index_policy(
             force_compact=True,
-            reason="manual message index rebuild",
+            reason="manual message mapping window rebuild",
         )
 
     async def get_webui_state(self) -> dict[str, Any]:
@@ -689,9 +689,9 @@ class ShellManager:
         pre_compact_start = upper_surrogate_id + 1
         reset_surrogate_id = DurableIdMap.message_reset_surrogate_id(normalized_max_entries)
         return (
-            f"当前最多保留 {normalized_max_entries} 条 message 双向索引。"
+            f"当前最多保留 {normalized_max_entries} 条最近 message 映射。"
             f" 当最新 message 编号达到 {reset_surrogate_id} 时，"
-            f"会自动把当前窗口 {pre_compact_start} ~ {reset_surrogate_id} 重新映射为 "
+            f"会自动把当前映射窗口 {pre_compact_start} ~ {reset_surrogate_id} 重新映射为 "
             f"{lower_surrogate_id} ~ {upper_surrogate_id}。"
         )
 
@@ -752,7 +752,7 @@ class ShellManager:
             "items": items,
         }
         logger.info(
-            "[RocketCatShell] message index policy applied | reason=%s | bots=%s | changed=%s | compacted=%s | removed=%s | max_entries=%s",
+            "[RocketCatShell] message mapping window policy applied | reason=%s | bots=%s | changed=%s | compacted=%s | removed=%s | max_entries=%s",
             reason,
             summary["bot_count"],
             summary["changed_bot_count"],
@@ -769,13 +769,14 @@ class ShellManager:
         max_entries: int,
         force_compact: bool,
     ) -> dict[str, Any]:
-        message_store = MessageStore(JsonStore(data_dir / "message_registry.json"))
-        id_map = DurableIdMap(
-            JsonStore(data_dir / "id_map.json"),
+        hot_stores = build_runtime_hot_stores(
+            data_dir,
             message_window_size=max_entries,
-            on_message_window_changed=message_store.rebuild_for_active_mappings,
         )
-        return await id_map.rebuild_message_window(force_compact=force_compact)
+        try:
+            return await hot_stores.id_map.rebuild_message_window(force_compact=force_compact)
+        finally:
+            hot_stores.close()
 
     def _require_settings(self) -> ShellSettings:
         if self.settings is None:

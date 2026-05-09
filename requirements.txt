@@ -1,3 +1,4 @@
+# Core runtime dependencies for the rebuild branch hot-path runtime.
 aiohttp>=3.9,<4
 cryptography>=44.0.3
 fastapi>=0.110,<1

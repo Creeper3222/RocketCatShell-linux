@@ -8,11 +8,13 @@ DEFAULT_WEBUI_HOST = "127.0.0.1"
 DEFAULT_WEBUI_PORT = 5751
 DEFAULT_WEBUI_ACCESS_PASSWORD = "123456"
 DEFAULT_MESSAGE_INDEX_MAX_ENTRIES = 1000
-DEFAULT_ONEBOT_WS_URL = "ws://127.0.0.1:6200/ws/"
+DEFAULT_ONEBOT_WS_URL = "ws://127.0.0.1:6199/ws/"
 DEFAULT_RECONNECT_DELAY = 5.0
 DEFAULT_MAX_RECONNECT_ATTEMPTS = 10
 DEFAULT_ENABLE_SUBCHANNEL_SESSION_ISOLATION = True
 DEFAULT_REMOTE_MEDIA_MAX_SIZE = 20 * 1024 * 1024
+DEFAULT_ROOM_INFO_CACHE_TTL_SECONDS = 300.0
+DEFAULT_PERF_TRACE_ENABLED = False
 DEFAULT_SKIP_OWN_MESSAGES = True
 DEFAULT_DEBUG = False
 DEFAULT_START_SELF_ID = 910001
@@ -160,6 +162,8 @@ class BotRecord:
     max_reconnect_attempts: int
     enable_subchannel_session_isolation: bool
     remote_media_max_size: int
+    room_info_cache_ttl_seconds: float
+    perf_trace_enabled: bool
     skip_own_messages: bool
     debug: bool
 
@@ -198,6 +202,14 @@ class BotRecord:
                 data.get("remote_media_max_size", defaults.default_remote_media_max_size),
                 defaults.default_remote_media_max_size,
             ),
+            room_info_cache_ttl_seconds=_coerce_float(
+                data.get("room_info_cache_ttl_seconds", DEFAULT_ROOM_INFO_CACHE_TTL_SECONDS),
+                DEFAULT_ROOM_INFO_CACHE_TTL_SECONDS,
+            ),
+            perf_trace_enabled=_coerce_bool(
+                data.get("perf_trace_enabled", DEFAULT_PERF_TRACE_ENABLED),
+                DEFAULT_PERF_TRACE_ENABLED,
+            ),
             skip_own_messages=_coerce_bool(
                 data.get("skip_own_messages", defaults.default_skip_own_messages),
                 defaults.default_skip_own_messages,
@@ -221,6 +233,8 @@ class BotRecord:
             "max_reconnect_attempts": self.max_reconnect_attempts,
             "enable_subchannel_session_isolation": self.enable_subchannel_session_isolation,
             "remote_media_max_size": self.remote_media_max_size,
+            "room_info_cache_ttl_seconds": self.room_info_cache_ttl_seconds,
+            "perf_trace_enabled": self.perf_trace_enabled,
             "skip_own_messages": self.skip_own_messages,
             "debug": self.debug,
         }
@@ -248,4 +262,6 @@ class BotRecord:
             errors.append("max_reconnect_attempts must be >= 0")
         if self.remote_media_max_size < 0:
             errors.append("remote_media_max_size must be >= 0")
+        if self.room_info_cache_ttl_seconds < 0:
+            errors.append("room_info_cache_ttl_seconds must be >= 0")
         return errors

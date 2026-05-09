@@ -20,7 +20,8 @@ from ..logger import logger
 
 
 class BridgeLogBuffer:
-    PREFIXES = ("[RocketChatOneBotBridge]", "[RocketCatShell]")
+    PERF_PREFIX = "[RocketCatPerf]"
+    PREFIXES = ("[RocketChatOneBotBridge]", "[RocketCatShell]", PERF_PREFIX)
 
     def __init__(self, max_entries: int = 5000):
         self.max_entries = int(max_entries)
@@ -33,6 +34,8 @@ class BridgeLogBuffer:
         if not any(prefix in message for prefix in self.PREFIXES):
             return
 
+        is_perf = self.PERF_PREFIX in message
+
         level = record.levelname.upper()
         if level == "WARNING":
             level = "WARN"
@@ -42,6 +45,7 @@ class BridgeLogBuffer:
             "timestamp": datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S")
             + f".{int(record.msecs):03d}",
             "level": level,
+            "is_perf": is_perf,
             "message": message,
             "line": f"[{datetime.fromtimestamp(record.created).strftime('%Y-%m-%d %H:%M:%S')}.{int(record.msecs):03d}] [{level}] {message}",
         }
@@ -94,7 +98,7 @@ class ShellWebUI:
         self._bound_socket: socket.socket | None = None
         self._log_buffer = BridgeLogBuffer(max_entries=5000)
         self._log_handler = BridgeLogHandler(self._log_buffer)
-        self._app = FastAPI(title="RocketCat Shell", version="v0.1.2")
+        self._app = FastAPI(title="RocketCat Shell", version="v0.1.1")
         self._static_dir = Path(__file__).resolve().parent / "static"
         self._login_file = self._static_dir / "login.html"
         self._setup_routes()
@@ -509,8 +513,8 @@ class ShellWebUI:
         try:
             result = await self.manager.rebuild_message_indexes()
         except Exception as exc:
-            logger.error(f"[RocketCatShell] 手动重建 message 双向索引失败: {exc!r}")
-            raise HTTPException(status_code=500, detail="手动重建 message 双向索引失败") from exc
+            logger.error(f"[RocketCatShell] 手动整理消息映射窗口失败: {exc!r}")
+            raise HTTPException(status_code=500, detail="手动整理消息映射窗口失败") from exc
         return {"ok": True, "result": result}
 
     async def _handle_logs(

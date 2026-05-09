@@ -5,6 +5,7 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 VENV_DIR="$ROOT_DIR/.venv"
 LOCAL_PYTHON="$VENV_DIR/bin/python"
 REQUIREMENTS_FILE="$ROOT_DIR/requirements.txt"
+DEPENDENCY_CHECKER="$ROOT_DIR/tools/check_requirements.py"
 
 PYTHON_CMD=""
 BOOTSTRAP_PYTHON=""
@@ -36,9 +37,21 @@ if [ ! -f "$REQUIREMENTS_FILE" ]; then
     exit 1
 fi
 
-if ! "$PYTHON_CMD" -c "import aiohttp, cryptography, fastapi, uvicorn, yaml" >/dev/null 2>&1; then
-    echo "Missing dependencies detected. Installing requirements..."
-    "$PYTHON_CMD" -m pip install -r "$REQUIREMENTS_FILE"
+if [ ! -f "$DEPENDENCY_CHECKER" ]; then
+    echo "Dependency checker was not found: $DEPENDENCY_CHECKER" >&2
+    exit 1
+fi
+
+echo "Checking Python dependencies..."
+if ! "$PYTHON_CMD" "$DEPENDENCY_CHECKER" "$REQUIREMENTS_FILE"; then
+    echo "Missing or incompatible dependencies detected. Installing requirements..."
+    "$PYTHON_CMD" -m pip install --disable-pip-version-check -r "$REQUIREMENTS_FILE"
+
+    echo "Re-checking Python dependencies..."
+    if ! "$PYTHON_CMD" "$DEPENDENCY_CHECKER" "$REQUIREMENTS_FILE"; then
+        echo "Dependencies are still missing or incompatible after installation." >&2
+        exit 1
+    fi
 fi
 
 echo "Starting RocketCatShell..."

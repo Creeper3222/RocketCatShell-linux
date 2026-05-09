@@ -5,12 +5,14 @@ from typing import Any, Mapping
 
 
 DEFAULT_SERVER_URL = "http://127.0.0.1:3000"
-DEFAULT_ONEBOT_WS_URL = "ws://127.0.0.1:6200/ws/"
+DEFAULT_ONEBOT_WS_URL = "ws://127.0.0.1:6199/ws/"
 DEFAULT_ONEBOT_SELF_ID = 910001
 DEFAULT_RECONNECT_DELAY = 5.0
 DEFAULT_MAX_RECONNECT_ATTEMPTS = 10
 DEFAULT_ENABLE_SUBCHANNEL_SESSION_ISOLATION = True
 DEFAULT_REMOTE_MEDIA_MAX_SIZE = 20 * 1024 * 1024
+DEFAULT_ROOM_INFO_CACHE_TTL_SECONDS = 300.0
+DEFAULT_PERF_TRACE_ENABLED = False
 
 
 def _coerce_bool(value: Any) -> bool:
@@ -63,6 +65,8 @@ class BridgeConfig:
     max_reconnect_attempts: int
     enable_subchannel_session_isolation: bool
     remote_media_max_size: int
+    room_info_cache_ttl_seconds: float
+    perf_trace_enabled: bool
     skip_own_messages: bool
     debug: bool
     bot_id: str = ""
@@ -96,6 +100,13 @@ class BridgeConfig:
                 data.get("remote_media_max_size", DEFAULT_REMOTE_MEDIA_MAX_SIZE),
                 DEFAULT_REMOTE_MEDIA_MAX_SIZE,
             ),
+            room_info_cache_ttl_seconds=_coerce_float(
+                data.get("room_info_cache_ttl_seconds", DEFAULT_ROOM_INFO_CACHE_TTL_SECONDS),
+                DEFAULT_ROOM_INFO_CACHE_TTL_SECONDS,
+            ),
+            perf_trace_enabled=_coerce_bool(
+                data.get("perf_trace_enabled", DEFAULT_PERF_TRACE_ENABLED)
+            ),
             skip_own_messages=_coerce_bool(data.get("skip_own_messages", True)),
             debug=_coerce_bool(data.get("debug", False)),
             bot_id=str(data.get("id") or data.get("bot_id") or "").strip(),
@@ -117,6 +128,8 @@ class BridgeConfig:
             "max_reconnect_attempts": self.max_reconnect_attempts,
             "enable_subchannel_session_isolation": self.enable_subchannel_session_isolation,
             "remote_media_max_size": self.remote_media_max_size,
+            "room_info_cache_ttl_seconds": self.room_info_cache_ttl_seconds,
+            "perf_trace_enabled": self.perf_trace_enabled,
             "skip_own_messages": self.skip_own_messages,
             "debug": self.debug,
             "id": self.bot_id,
@@ -143,4 +156,6 @@ class BridgeConfig:
             errors.append("max_reconnect_attempts 不能小于 0")
         if self.remote_media_max_size < 0:
             errors.append("remote_media_max_size 不能小于 0")
+        if self.room_info_cache_ttl_seconds < 0:
+            errors.append("room_info_cache_ttl_seconds 不能小于 0")
         return errors
