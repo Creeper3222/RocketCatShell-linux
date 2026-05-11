@@ -60,6 +60,8 @@ class PluginExecutionContext:
 
 
 class RocketCatPlugin:
+    handled_actions: tuple[str, ...] | set[str] | frozenset[str] = ()
+
     def __init__(self, context: PluginContext, config: dict[str, Any]):
         self.context = context
         self.config = dict(config)
@@ -73,6 +75,20 @@ class RocketCatPlugin:
 
     async def on_unload(self, runtime: PluginExecutionContext) -> None:
         return None
+
+    def get_handled_actions(self) -> frozenset[str]:
+        raw_actions = self.handled_actions
+        if isinstance(raw_actions, str):
+            action = raw_actions.strip()
+            return frozenset({action} if action else ())
+        try:
+            return frozenset(
+                action
+                for action in (str(item).strip() for item in raw_actions)
+                if action
+            )
+        except TypeError:
+            return frozenset()
 
     async def handle_onebot_action(
         self,

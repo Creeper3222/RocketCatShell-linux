@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from copy import deepcopy
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -243,7 +244,15 @@ class InboundTranslator:
                         "reply_sender_name": str(direct_reply_context.get("sender_name") or ""),
                         "reply_message_text": str(direct_reply_context.get("text") or ""),
                         "timestamp": timestamp,
-                        "onebot_message": event,
+                        "onebot_message_segments": segments,
+                        "raw_message": combined_raw_message,
+                        "self_id": self._self_id,
+                        "reply_source_id": reply_source_id,
+                        "quote_media_segments": quote_media_segments,
+                        "current_message_line": current_message_line,
+                        "room_label": room_context_label,
+                        "group_id": event.get("group_id"),
+                        "group_name": event.get("group_name"),
                         "thread_source_id": thread_source_id,
                     },
                     batch=runtime_batch,
@@ -256,7 +265,7 @@ class InboundTranslator:
 
     async def hydrate(self, surrogate_message_id: int | str) -> dict | None:
         cached = await self._messages.get_by_surrogate(surrogate_message_id)
-        cached_event = cached.get("onebot_message") if isinstance(cached, dict) else None
+        cached_event = self._extract_cached_event(cached)
         source_id = str(cached.get("source_id") or "") if isinstance(cached, dict) else ""
         if cached_event and not self._should_refresh_cached_reply_message(cached):
             return cached_event
@@ -271,10 +280,106 @@ class InboundTranslator:
             return cached_event
         return await self.translate(raw_msg)
 
+    def _extract_cached_event(self, cached: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(cached, dict):
+            return None
+        cached_event = cached.get("onebot_message")
+        if isinstance(cached_event, dict):
+            return cached_event
+        return self._rebuild_cached_event(cached)
+
+    def _rebuild_cached_event(self, entry: dict[str, Any]) -> dict[str, Any] | None:
+        source_id = str(entry.get("source_id") or "").strip()
+        surrogate_id = entry.get("surrogate_id")
+        sender_surrogate_id = entry.get("sender_surrogate_id")
+        if not source_id or surrogate_id is None or sender_surrogate_id is None:
+            return None
+
+        room_type = str(entry.get("room_type") or "c")
+        room_name = str(entry.get("room_name") or "")
+        room_label = str(entry.get("room_label") or self._format_room_context_label(room_type, room_name))
+        message_text = str(entry.get("text") or "")
+        current_input_text = str(entry.get("input_text") or message_text)
+        sender_name = str(entry.get("sender_name") or entry.get("sender_source_id") or "")
+        quote_contexts = deepcopy(entry.get("quote_contexts") or [])
+        quote_media_segments = deepcopy(entry.get("quote_media_segments") or [])
+        segments = deepcopy(entry.get("onebot_message_segments") or [])
+        timestamp = int(entry.get("timestamp") or time.time())
+        context_surrogate_id = entry.get("context_surrogate_id")
+        direct_reply_context = quote_contexts[0] if quote_contexts else {}
+
+        event: dict[str, Any] = {
+            "time": timestamp,
+            "self_id": int(entry.get("self_id") or self._self_id),
+            "post_type": "message",
+            "message_type": "private" if room_type == "d" else "group",
+            "sub_type": "friend" if room_type == "d" else "normal",
+            "message_id": int(surrogate_id),
+            "user_id": int(sender_surrogate_id),
+            "message": segments,
+            "raw_message": str(entry.get("raw_message") or current_input_text or message_text),
+            "font": 0,
+            "sender": {
+                "user_id": int(sender_surrogate_id),
+                "nickname": sender_name,
+                "card": sender_name,
+            },
+            "message_format": "array",
+            "rocketchat_sender_name": sender_name,
+            "rocketchat_sender_username": str(entry.get("sender_username") or ""),
+            "rocketchat_sender_source_id": str(entry.get("sender_source_id") or ""),
+            "rocketchat_sender_surrogate_id": int(sender_surrogate_id),
+            "rocketchat_mentions": deepcopy(entry.get("mention_metadata") or []),
+            "rocketchat_quote_contexts": quote_contexts,
+            "rocketchat_quote_context_text": str(entry.get("quote_context_text") or ""),
+            "rocketchat_current_message_input_text": current_input_text,
+            "rocketchat_quote_media_segments": quote_media_segments,
+            "rocketchat_current_message_text": message_text,
+            "rocketchat_current_message_line": str(
+                entry.get("current_message_line")
+                or self._format_current_message_line(
+                    room_context_label=room_label,
+                    sender_name=sender_name,
+                    message_text=message_text,
+                    mention_names=[
+                        str(item.get("name") or "")
+                        for item in (entry.get("mention_metadata") or [])
+                        if isinstance(item, dict) and str(item.get("name") or "")
+                    ],
+                    media=[],
+                )
+            ),
+            "rocketchat_reply_source_id": str(entry.get("reply_source_id") or ""),
+            "rocketchat_reply_sender_name": str(
+                entry.get("reply_sender_name") or direct_reply_context.get("sender_name") or ""
+            ),
+            "rocketchat_reply_message_text": str(
+                entry.get("reply_message_text") or direct_reply_context.get("text") or ""
+            ),
+            "rocketchat_room_source_id": str(entry.get("room_source_id") or ""),
+            "rocketchat_room_name": room_name,
+            "rocketchat_room_slug": str(entry.get("room_slug") or ""),
+            "rocketchat_room_label": room_label,
+            "rocketchat_room_surrogate_id": int(entry.get("room_surrogate_id") or 0),
+            "rocketchat_context_source_id": str(entry.get("context_source_id") or ""),
+            "rocketchat_context_group_id": context_surrogate_id,
+            "rocketchat_thread_source_id": str(entry.get("thread_source_id") or ""),
+        }
+
+        if room_type != "d":
+            group_id = entry.get("group_id")
+            if group_id is None:
+                group_id = context_surrogate_id if context_surrogate_id is not None else entry.get("room_surrogate_id")
+            event["group_id"] = int(group_id)
+            event["group_name"] = str(entry.get("group_name") or room_name)
+        return event
+
     def _should_refresh_cached_reply_message(self, cached: dict[str, Any] | None) -> bool:
         if not isinstance(cached, dict):
             return False
         if cached.get("quote_contexts"):
+            return True
+        if cached.get("reply_source_id"):
             return True
         event = cached.get("onebot_message")
         if not isinstance(event, dict):

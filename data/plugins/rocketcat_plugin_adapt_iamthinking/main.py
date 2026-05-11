@@ -13,6 +13,8 @@ _DEFAULT_DONE_REACTION = ":sunny:"
 
 
 class Plugin(RocketCatPlugin):
+    handled_actions = frozenset({"set_msg_emoji_like"})
+
     def __init__(self, context, config: dict[str, Any]):
         super().__init__(context, config)
         self._numeric_reaction_states: dict[str, dict[str, Any]] = {}

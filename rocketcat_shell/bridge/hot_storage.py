@@ -116,7 +116,7 @@ class RuntimeStateMutationBatch:
 
     def put_message(self, entry: dict[str, Any]) -> None:
         self._state_engine._put_message_without_record(entry)
-        self._mutations.append({"op": "message_put", "entry": deepcopy(entry)})
+        self._mutations.append({"op": "message_put", "entry": entry})
 
     def commit(self) -> None:
         if self._committed:
@@ -159,7 +159,7 @@ class JournalPersistenceWorker:
         self._queue.put(record)
 
     def enqueue_batch(self, mutations: list[dict[str, Any]]) -> None:
-        self._queue.put({"op": "batch", "mutations": deepcopy(mutations)})
+        self._queue.put({"op": "batch", "mutations": mutations})
 
     def flush(self) -> None:
         done = threading.Event()
@@ -285,14 +285,36 @@ class RuntimeStateEngine:
 
     def export_snapshot_payload(self) -> dict[str, Any]:
         with self._lock:
+            messages_by_source: dict[str, dict[str, Any]] = {}
+            messages_by_surrogate: dict[str, dict[str, Any]] = {}
+            for source_id, entry in self._messages_by_source.items():
+                if not isinstance(entry, dict):
+                    continue
+                cloned_entry = self._clone_message_entry(entry)
+                messages_by_source[str(source_id)] = cloned_entry
+                surrogate_id = str(cloned_entry.get("surrogate_id") or "").strip()
+                if surrogate_id:
+                    messages_by_surrogate[surrogate_id] = cloned_entry
+
+            context_room_by_source: dict[str, dict[str, Any]] = {}
+            context_room_by_surrogate: dict[str, dict[str, Any]] = {}
+            for context_source_id, entry in self._context_room_by_source.items():
+                if not isinstance(entry, dict):
+                    continue
+                cloned_entry = deepcopy(entry)
+                context_room_by_source[str(context_source_id)] = cloned_entry
+                context_surrogate_id = str(cloned_entry.get("context_surrogate_id") or "").strip()
+                if context_surrogate_id:
+                    context_room_by_surrogate[context_surrogate_id] = cloned_entry
+
             return {
                 "message_window_size": self._message_window_size,
                 "counters": deepcopy(self._counters),
                 "forward": deepcopy(self._forward),
                 "reverse": deepcopy(self._reverse),
                 "message_order": list(self._message_order),
-                "messages_by_source": deepcopy(self._messages_by_source),
-                "messages_by_surrogate": deepcopy(self._messages_by_surrogate),
+                "messages_by_source": messages_by_source,
+                "messages_by_surrogate": messages_by_surrogate,
                 "latest_by_context_sender": deepcopy(self._latest_by_context_sender),
                 "context_sender_message_order": {
                     key: list(value)
@@ -300,8 +322,8 @@ class RuntimeStateEngine:
                 },
                 "private_room_by_user_source": deepcopy(self._private_room_by_user_source),
                 "private_room_by_user_surrogate": deepcopy(self._private_room_by_user_surrogate),
-                "context_room_by_source": deepcopy(self._context_room_by_source),
-                "context_room_by_surrogate": deepcopy(self._context_room_by_surrogate),
+                "context_room_by_source": context_room_by_source,
+                "context_room_by_surrogate": context_room_by_surrogate,
             }
 
     def load_snapshot_payload(self, payload: dict[str, Any]) -> None:
@@ -339,11 +361,17 @@ class RuntimeStateEngine:
                 for source_id, entry in (state.get("messages_by_source") or {}).items()
                 if isinstance(entry, dict)
             }
-            self._messages_by_surrogate = {
-                str(surrogate_id): deepcopy(entry)
-                for surrogate_id, entry in (state.get("messages_by_surrogate") or {}).items()
-                if isinstance(entry, dict)
-            }
+            self._messages_by_surrogate = {}
+            for entry in self._messages_by_source.values():
+                surrogate_id = str(entry.get("surrogate_id") or "").strip()
+                if surrogate_id:
+                    self._messages_by_surrogate[surrogate_id] = entry
+            if not self._messages_by_surrogate:
+                self._messages_by_surrogate = {
+                    str(surrogate_id): deepcopy(entry)
+                    for surrogate_id, entry in (state.get("messages_by_surrogate") or {}).items()
+                    if isinstance(entry, dict)
+                }
             self._latest_by_context_sender = {
                 self._normalize_pair_key(pair_key): deepcopy(entry)
                 for pair_key, entry in (state.get("latest_by_context_sender") or {}).items()
@@ -361,16 +389,21 @@ class RuntimeStateEngine:
                 str(user_surrogate_id): str(room_source_id)
                 for user_surrogate_id, room_source_id in (state.get("private_room_by_user_surrogate") or {}).items()
             }
-            self._context_room_by_source = {
-                str(context_source_id): deepcopy(entry)
-                for context_source_id, entry in (state.get("context_room_by_source") or {}).items()
-                if isinstance(entry, dict)
-            }
-            self._context_room_by_surrogate = {
-                str(context_surrogate_id): deepcopy(entry)
-                for context_surrogate_id, entry in (state.get("context_room_by_surrogate") or {}).items()
-                if isinstance(entry, dict)
-            }
+            self._context_room_by_source = {}
+            self._context_room_by_surrogate = {}
+            for context_source_id, entry in (state.get("context_room_by_source") or {}).items():
+                if not isinstance(entry, dict):
+                    continue
+                cloned_entry = deepcopy(entry)
+                self._context_room_by_source[str(context_source_id)] = cloned_entry
+                context_surrogate_id = str(cloned_entry.get("context_surrogate_id") or "").strip()
+                if context_surrogate_id:
+                    self._context_room_by_surrogate[context_surrogate_id] = cloned_entry
+            if not self._context_room_by_surrogate:
+                for context_surrogate_id, entry in (state.get("context_room_by_surrogate") or {}).items():
+                    if not isinstance(entry, dict):
+                        continue
+                    self._context_room_by_surrogate[str(context_surrogate_id)] = deepcopy(entry)
 
     def replay_journal(self, journal_path: Path) -> None:
         for record in JournalPersistenceWorker.iter_records(journal_path) or []:
@@ -449,7 +482,7 @@ class RuntimeStateEngine:
             return int(value) if value is not None else None
 
     def put_message(self, entry: dict[str, Any]) -> None:
-        normalized_entry = deepcopy(entry)
+        normalized_entry = self._normalize_message_entry(entry)
         source_id = str(normalized_entry["source_id"])
         with self._lock:
             previous_entry = self._messages_by_source.get(source_id)
@@ -478,10 +511,10 @@ class RuntimeStateEngine:
                 existing_entry = self._messages_by_source.get(source_id)
                 if not isinstance(existing_entry, dict):
                     continue
-                entry = deepcopy(existing_entry)
+                entry = self._clone_message_entry(existing_entry)
                 MessageStore._rewrite_entry_surrogate(entry, surrogate_id, normalized_mappings)
-                new_by_source[source_id] = deepcopy(entry)
-                new_by_surrogate[str(surrogate_id)] = deepcopy(entry)
+                new_by_source[source_id] = entry
+                new_by_surrogate[str(surrogate_id)] = entry
                 retained_entries.append(entry)
 
             self._messages_by_source = new_by_source
@@ -493,12 +526,12 @@ class RuntimeStateEngine:
     def get_message_by_source(self, source_id: str) -> dict[str, Any] | None:
         with self._lock:
             entry = self._messages_by_source.get(str(source_id))
-            return deepcopy(entry) if isinstance(entry, dict) else None
+            return self._clone_message_entry(entry) if isinstance(entry, dict) else None
 
     def get_message_by_surrogate(self, surrogate_id: int | str) -> dict[str, Any] | None:
         with self._lock:
             entry = self._messages_by_surrogate.get(str(surrogate_id))
-            return deepcopy(entry) if isinstance(entry, dict) else None
+            return self._clone_message_entry(entry) if isinstance(entry, dict) else None
 
     def get_latest_room_by_context_sender(
         self,
@@ -608,7 +641,7 @@ class RuntimeStateEngine:
                     return False
             normalized_entry = deepcopy(entry)
             self._context_room_by_source[str(normalized_entry["context_source_id"])] = normalized_entry
-            self._context_room_by_surrogate[str(normalized_entry["context_surrogate_id"])] = deepcopy(normalized_entry)
+            self._context_room_by_surrogate[str(normalized_entry["context_surrogate_id"])] = normalized_entry
         return True
 
     def get_context_room_by_source(self, context_source_id: str) -> dict[str, Any] | None:
@@ -728,17 +761,17 @@ class RuntimeStateEngine:
                 existing_entry = self._messages_by_source.get(source_id)
                 if not isinstance(existing_entry, dict):
                     continue
-                entry = deepcopy(existing_entry)
+                entry = self._clone_message_entry(existing_entry)
                 MessageStore._rewrite_entry_surrogate(entry, surrogate_id, normalized_mappings)
-                new_by_source[source_id] = deepcopy(entry)
-                new_by_surrogate[str(surrogate_id)] = deepcopy(entry)
+                new_by_source[source_id] = entry
+                new_by_surrogate[str(surrogate_id)] = entry
                 retained_entries.append(entry)
             self._messages_by_source = new_by_source
             self._messages_by_surrogate = new_by_surrogate
             self._rebuild_latest_indexes_from_entries_locked(retained_entries)
 
     def _put_message_without_record(self, entry: dict[str, Any]) -> None:
-        normalized_entry = deepcopy(entry)
+        normalized_entry = self._normalize_message_entry(entry)
         source_id = str(normalized_entry["source_id"])
         with self._lock:
             previous_entry = self._messages_by_source.get(source_id)
@@ -872,6 +905,14 @@ class RuntimeStateEngine:
         if not mutations or self._writer is None:
             return
         self._writer.enqueue_batch(mutations)
+
+    @staticmethod
+    def _normalize_message_entry(entry: dict[str, Any]) -> dict[str, Any]:
+        return deepcopy(entry)
+
+    @staticmethod
+    def _clone_message_entry(entry: dict[str, Any]) -> dict[str, Any]:
+        return deepcopy(entry)
 
     @staticmethod
     def _normalize_pair_key(pair_key: Any) -> tuple[str, str]:

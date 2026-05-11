@@ -42,6 +42,8 @@ const state = {
     lastId: 0,
     maxEntries: 5000,
     pollTimer: null,
+    abortController: null,
+    polling: false,
     generation: 0,
     autoScroll: true,
     showPerf: true,
@@ -163,6 +165,7 @@ async function requestJson(url, options = {}) {
   });
   const payload = await response.json().catch(() => ({}));
   if (response.status === 401 && !options.skipAuthRedirect) {
+    stopLogPolling();
     window.location.replace('/');
     throw new Error(payload.error || payload.detail || '登录已失效，请重新登录');
   }
@@ -275,6 +278,9 @@ function setActivePage(page) {
 
   if (page === 'logs') {
     renderLogs();
+    startLogPolling();
+  } else {
+    stopLogPolling();
   }
 }
 
@@ -540,16 +546,20 @@ function renderLogs({ scrollToBottom = false } = {}) {
   }
 }
 
-async function loadLogs({ reset = false } = {}) {
+async function loadLogs({ reset = false, waitSeconds = 0, signal = null } = {}) {
   const afterId = reset ? 0 : state.logs.lastId;
   const requestGeneration = state.logs.generation;
-  const payload = await requestJson(`/api/logs?after_id=${afterId}`);
+  const query = new URLSearchParams({
+    after_id: String(afterId),
+    wait: String(Math.max(0, Number(waitSeconds) || 0)),
+  });
+  const payload = await requestJson(`/api/logs?${query.toString()}`, { signal });
 
   if (requestGeneration !== state.logs.generation) {
     return;
   }
 
-  if (reset) {
+  if (reset || payload.reset) {
     state.logs.items = [];
     state.logs.lastId = 0;
   }
@@ -595,21 +605,46 @@ async function clearLogs() {
 }
 
 function startLogPolling() {
-  if (state.logs.pollTimer) {
+  if (state.logs.polling) {
     return;
   }
+  state.logs.polling = true;
 
   const poll = async () => {
+    if (!state.logs.polling) {
+      return;
+    }
+    const controller = new AbortController();
+    state.logs.abortController = controller;
     try {
-      await loadLogs();
+      await loadLogs({ waitSeconds: 25, signal: controller.signal });
     } catch (error) {
-      console.error('log polling failed', error);
+      if (!isAbortError(error)) {
+        console.error('log polling failed', error);
+      }
     } finally {
-      state.logs.pollTimer = window.setTimeout(poll, 1000);
+      if (state.logs.abortController === controller) {
+        state.logs.abortController = null;
+      }
+      if (state.logs.polling) {
+        state.logs.pollTimer = window.setTimeout(poll, 250);
+      }
     }
   };
 
-  state.logs.pollTimer = window.setTimeout(poll, 1000);
+  poll();
+}
+
+function stopLogPolling() {
+  state.logs.polling = false;
+  if (state.logs.pollTimer) {
+    window.clearTimeout(state.logs.pollTimer);
+    state.logs.pollTimer = null;
+  }
+  if (state.logs.abortController) {
+    state.logs.abortController.abort();
+    state.logs.abortController = null;
+  }
 }
 
 function effectiveStatusLabel(bot) {
@@ -1567,7 +1602,6 @@ Promise.all([
 ])
   .then(() => {
     setActivePage('network');
-    startLogPolling();
   })
   .catch((error) => {
     showToast(error.message || '加载失败', 'error');

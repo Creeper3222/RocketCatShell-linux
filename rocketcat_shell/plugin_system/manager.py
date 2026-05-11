@@ -81,21 +81,28 @@ class PluginDescriptor:
 class RuntimePluginBinding:
     descriptor: PluginDescriptor
     instance: RocketCatPlugin
+    handled_actions: frozenset[str]
 
 
 class RocketCatPluginManager:
     def __init__(self, layout: ProjectLayout):
         self.layout = layout
         self._plugins: dict[str, PluginDescriptor] = {}
+        self._plugins_signature: tuple[tuple[str, int, int, bool], ...] | None = None
 
     async def initialize(self) -> None:
         self.layout.ensure_directories()
         self.refresh()
 
     def refresh(self) -> None:
+        signature = self._build_plugins_signature()
+        if signature == self._plugins_signature:
+            return
+
         discovered: dict[str, PluginDescriptor] = {}
         if not self.layout.plugins_dir.exists():
             self._plugins = discovered
+            self._plugins_signature = signature
             return
 
         for child in sorted(self.layout.plugins_dir.iterdir(), key=lambda item: item.name.lower()):
@@ -104,6 +111,7 @@ class RocketCatPluginManager:
             descriptor = self._build_descriptor(child)
             discovered[descriptor.plugin_id] = descriptor
         self._plugins = discovered
+        self._plugins_signature = self._build_plugins_signature()
 
     def list_plugins(self) -> list[dict[str, Any]]:
         self.refresh()
@@ -134,6 +142,7 @@ class RocketCatPluginManager:
         write_json(descriptor.config_path, normalized)
         refreshed = self._build_descriptor(descriptor.plugin_dir)
         self._plugins[plugin_id] = refreshed
+        self._invalidate_cache()
         return refreshed.to_detail()
 
     def set_plugin_enabled(self, plugin_id: str, enabled: bool) -> dict[str, Any]:
@@ -169,6 +178,7 @@ class RocketCatPluginManager:
             descriptor.config_path.unlink()
             deleted_config = True
         self._plugins.pop(plugin_id, None)
+        self._invalidate_cache()
         self.refresh()
         return {
             "plugin_id": plugin_id,
@@ -196,7 +206,13 @@ class RocketCatPluginManager:
                     exc,
                 )
                 continue
-            bindings.append(RuntimePluginBinding(descriptor=descriptor, instance=instance))
+            bindings.append(
+                RuntimePluginBinding(
+                    descriptor=descriptor,
+                    instance=instance,
+                    handled_actions=self._get_handled_actions(instance),
+                )
+            )
         return bindings
 
     async def shutdown_runtime_plugins(
@@ -221,9 +237,23 @@ class RocketCatPluginManager:
         params: dict[str, Any],
         runtime: PluginExecutionContext,
     ) -> dict[str, Any] | None:
+        normalized_action = str(action or "").strip()
+        indexed_bindings: list[RuntimePluginBinding] = []
+        fallback_bindings: list[RuntimePluginBinding] = []
         for binding in bindings:
+            if binding.handled_actions:
+                if normalized_action in binding.handled_actions:
+                    indexed_bindings.append(binding)
+            else:
+                fallback_bindings.append(binding)
+
+        for binding in [*indexed_bindings, *fallback_bindings]:
             try:
-                result = binding.instance.handle_onebot_action(action, dict(params or {}), runtime)
+                result = binding.instance.handle_onebot_action(
+                    normalized_action,
+                    dict(params or {}),
+                    runtime,
+                )
                 result = await self._call_maybe_async(result)
             except Exception as exc:
                 logger.error(
@@ -276,6 +306,17 @@ class RocketCatPluginManager:
                 return value
         raise RuntimeError("插件 main.py 中未找到 Plugin 类")
 
+    def _get_handled_actions(self, instance: RocketCatPlugin) -> frozenset[str]:
+        try:
+            return instance.get_handled_actions()
+        except Exception as exc:
+            logger.warning(
+                "[RocketCatShell] 鑾峰彇鎻掍欢 %s action 绱㈠紩澶辫触: %r",
+                instance.context.plugin_id,
+                exc,
+            )
+            return frozenset()
+
     def _build_descriptor(self, plugin_dir: Path) -> PluginDescriptor:
         plugin_id = plugin_dir.name
         config_path = self.layout.plugins_config_dir / f"{plugin_id}_config.json"
@@ -288,6 +329,7 @@ class RocketCatPluginManager:
             normalized_config = {"enabled": True}
         if raw_config != normalized_config:
             write_json(config_path, normalized_config)
+            self._plugins_signature = None
 
         installed_at = self._get_installed_at(plugin_dir)
         logo_path = plugin_dir / "logo.png"
@@ -313,6 +355,42 @@ class RocketCatPluginManager:
         if descriptor is None:
             raise KeyError(plugin_id)
         return descriptor
+
+    def _invalidate_cache(self) -> None:
+        self._plugins_signature = None
+
+    def _build_plugins_signature(self) -> tuple[tuple[str, int, int, bool], ...]:
+        paths: list[Path] = [
+            self.layout.plugins_dir,
+            self.layout.plugins_config_dir,
+        ]
+        if self.layout.plugins_dir.exists():
+            try:
+                for child in sorted(self.layout.plugins_dir.iterdir(), key=lambda item: item.name.lower()):
+                    if not child.is_dir() or not child.name.startswith(_PLUGIN_PREFIX):
+                        continue
+                    paths.extend(
+                        [
+                            child,
+                            child / "metadata.yaml",
+                            child / "_conf_schema.json",
+                            child / "main.py",
+                            child / "logo.png",
+                            self.layout.plugins_config_dir / f"{child.name}_config.json",
+                        ]
+                    )
+            except OSError:
+                pass
+
+        signature: list[tuple[str, int, int, bool]] = []
+        for path in paths:
+            try:
+                stat = path.stat()
+            except OSError:
+                signature.append((str(path), 0, 0, False))
+                continue
+            signature.append((str(path), int(stat.st_mtime_ns), int(stat.st_size), path.is_dir()))
+        return tuple(signature)
 
     def _read_metadata(self, path: Path) -> dict[str, Any]:
         if not path.exists():

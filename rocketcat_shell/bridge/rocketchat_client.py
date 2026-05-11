@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import hashlib
 import os
 import re
 import time
@@ -14,6 +14,7 @@ import aiohttp
 from rocketcat_shell.logger import logger
 
 from .config import BridgeConfig
+from .json_codec import json_dumps, json_dumps_compact, json_loads
 from .media import RocketChatMediaBridge
 from .rocketchat_e2ee import RocketChatE2EEManager
 
@@ -24,6 +25,20 @@ FailureCallback = Callable[[str, int, str], Awaitable[None]]
 
 class RocketChatClient:
     _INBOUND_SIGNATURE_IGNORED_KEYS = {"_updatedAt", "reactions"}
+    _INBOUND_WORKER_COUNT = 2
+    _INBOUND_QUEUE_MAX_SIZE = 512
+    _SERVER_BRANDING_CACHE_TTL_SECONDS = 300.0
+    _INBOUND_SIGNATURE_FIELD_NAMES = (
+        "_id",
+        "rid",
+        "msg",
+        "text",
+        "tmid",
+        "t",
+        "groupable",
+        "editedAt",
+        "e2e",
+    )
     _HTML_TITLE_RE = re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL)
     _HTML_APP_NAME_RE = re.compile(
         r"<meta[^>]+name=[\"']application-name[\"'][^>]+content=[\"'](.*?)[\"']",
@@ -46,12 +61,16 @@ class RocketChatClient:
         self._pending_ddp_results: dict[str, asyncio.Future] = {}
         self._ddp_call_id = 0
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._inbound_queues: list[asyncio.Queue[dict[str, Any]]] = []
+        self._inbound_workers: set[asyncio.Task[Any]] = set()
         self._subscribed_rooms: set[str] = set()
         self._room_info_cache: dict[str, dict[str, Any]] = {}
         self._room_info_cache_expires_at: dict[str, float] = {}
         self._room_type_cache: dict[str, str] = {}
         self._room_name_cache: dict[str, str] = {}
         self._user_cache: dict[str, dict[str, Any]] = {}
+        self._server_branding_cache: dict[str, str] | None = None
+        self._server_branding_cache_expires_at = 0.0
         self._seen_inbound_message_signatures: dict[str, str] = {}
         self._recent_self_messages: dict[str, list[dict[str, Any]]] = {}
         self._pending_self_message_waiters: dict[str, list[asyncio.Future[dict[str, Any]]]] = {}
@@ -71,7 +90,17 @@ class RocketChatClient:
         if self._running:
             return
         self._running = True
-        self._http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45.0))
+        connector = aiohttp.TCPConnector(
+            limit=64,
+            limit_per_host=16,
+            ttl_dns_cache=300,
+            keepalive_timeout=30,
+        )
+        self._http_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=45.0),
+            connector=connector,
+            json_serialize=json_dumps,
+        )
         self._task = asyncio.create_task(self._run_forever())
 
     async def stop(self) -> None:
@@ -84,6 +113,7 @@ class RocketChatClient:
                 pass
             self._task = None
         await self._cancel_background_tasks()
+        await self._stop_inbound_workers()
         if self._ws is not None and not self._ws.closed:
             await self._ws.close()
         self._ws = None
@@ -91,6 +121,8 @@ class RocketChatClient:
             await self._http_session.close()
         self._http_session = None
         self._seen_inbound_message_signatures.clear()
+        self._server_branding_cache = None
+        self._server_branding_cache_expires_at = 0.0
         self._clear_self_message_waiters()
         self._consecutive_reconnect_failures = 0
         self.bot_profile = {}
@@ -140,7 +172,7 @@ class RocketChatClient:
         if self._http_session is None:
             raise RuntimeError("Rocket.Chat HTTP session 尚未初始化")
         async with self._http_session.request(method, url, **kwargs) as resp:
-            return await resp.json(content_type=None)
+            return await resp.json(content_type=None, loads=json_loads)
 
     async def _request_text(self, method: str, url: str, **kwargs) -> str:
         if self._http_session is None:
@@ -158,6 +190,63 @@ class RocketChatClient:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
         finally:
             self._background_tasks.clear()
+
+    def _start_inbound_workers(self) -> None:
+        if self._inbound_workers:
+            return
+        self._inbound_queues = [
+            asyncio.Queue(maxsize=self._INBOUND_QUEUE_MAX_SIZE)
+            for _ in range(self._INBOUND_WORKER_COUNT)
+        ]
+        for index in range(self._INBOUND_WORKER_COUNT):
+            task = asyncio.create_task(
+                self._inbound_worker_loop(self._inbound_queues[index]),
+                name=f"RocketChatInboundWorker:{index + 1}",
+            )
+            self._inbound_workers.add(task)
+            task.add_done_callback(self._inbound_workers.discard)
+
+    async def _stop_inbound_workers(self) -> None:
+        workers = list(self._inbound_workers)
+        self._inbound_workers.clear()
+        for task in workers:
+            if not task.done():
+                task.cancel()
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
+        self._inbound_queues = []
+
+    async def _drain_inbound_queue(self) -> None:
+        if not self._inbound_queues:
+            return
+        await asyncio.gather(*(queue_obj.join() for queue_obj in self._inbound_queues))
+
+    async def _enqueue_incoming_message(self, raw_msg: dict[str, Any]) -> None:
+        if not self._inbound_queues:
+            await self._handle_incoming_message(raw_msg)
+            return
+        room_id = str(raw_msg.get("rid") or "")
+        bucket = int.from_bytes(
+            hashlib.blake2b(room_id.encode("utf-8"), digest_size=2).digest(),
+            "big",
+        ) % len(self._inbound_queues)
+        queue_obj = self._inbound_queues[bucket]
+        await queue_obj.put(raw_msg)
+
+    async def _inbound_worker_loop(self, queue_obj: asyncio.Queue[dict[str, Any]]) -> None:
+        while self._running:
+            raw_msg = await queue_obj.get()
+            try:
+                await self._handle_incoming_message(raw_msg)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "[RocketChatOneBotBridge] Rocket.Chat inbound worker 澶勭悊娑堟伅寮傚父: %r",
+                    exc,
+                )
+            finally:
+                queue_obj.task_done()
 
     def _clear_self_message_waiters(self) -> None:
         for waiters in self._pending_self_message_waiters.values():
@@ -344,10 +433,18 @@ class RocketChatClient:
             return ""
         return f"{normalized_server}/assets/logo_dark.png"
 
-    async def get_server_branding_summary(self) -> dict[str, str] | None:
+    async def get_server_branding_summary(self, refresh: bool = False) -> dict[str, str] | None:
         normalized_server = str(self.config.server_url or "").strip().rstrip("/")
         if not normalized_server:
             return None
+
+        now = time.monotonic()
+        if (
+            not refresh
+            and self._server_branding_cache is not None
+            and now < self._server_branding_cache_expires_at
+        ):
+            return dict(self._server_branding_cache)
 
         display_name = ""
         try:
@@ -367,10 +464,13 @@ class RocketChatClient:
         if not display_name:
             display_name = str(urlparse(normalized_server).netloc or normalized_server).strip()
 
-        return {
+        summary = {
             "display_name": display_name,
             "avatar_url": self.build_server_logo_url(),
         }
+        self._server_branding_cache = dict(summary)
+        self._server_branding_cache_expires_at = now + self._SERVER_BRANDING_CACHE_TTL_SECONDS
+        return summary
 
     async def get_room_members(self, room_id: str) -> list[dict[str, Any]]:
         room_type = await self.get_room_type(room_id)
@@ -928,6 +1028,7 @@ class RocketChatClient:
         ) as ws:
             self._ws = ws
             try:
+                self._start_inbound_workers()
                 await self._ddp_connect(ws)
                 await self._ddp_login(ws)
                 subscriptions = await self._get_subscriptions()
@@ -943,6 +1044,9 @@ class RocketChatClient:
                     e2ee_task.add_done_callback(self._background_tasks.discard)
                 await self._ws_listen_loop(ws)
             finally:
+                if self._running:
+                    await self._drain_inbound_queue()
+                await self._stop_inbound_workers()
                 self._ws = None
 
     async def _ddp_call(
@@ -959,13 +1063,15 @@ class RocketChatClient:
         future = asyncio.get_running_loop().create_future()
         self._pending_ddp_results[call_id] = future
         try:
-            await self._ws.send_json(
-                {
-                    "msg": "method",
-                    "method": method,
-                    "id": call_id,
-                    "params": params or [],
-                }
+            await self._ws.send_str(
+                json_dumps(
+                    {
+                        "msg": "method",
+                        "method": method,
+                        "id": call_id,
+                        "params": params or [],
+                    }
+                )
             )
             data = await asyncio.wait_for(future, timeout=timeout)
             if data.get("error"):
@@ -975,32 +1081,34 @@ class RocketChatClient:
             self._pending_ddp_results.pop(call_id, None)
 
     async def _ddp_connect(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        await ws.send_json({"msg": "connect", "version": "1", "support": ["1"]})
+        await ws.send_str(json_dumps({"msg": "connect", "version": "1", "support": ["1"]}))
         async for raw in ws:
             if raw.type != aiohttp.WSMsgType.TEXT:
                 continue
-            data = json.loads(raw.data)
+            data = json_loads(raw.data)
             if data.get("msg") == "ping":
-                await ws.send_json({"msg": "pong"})
+                await ws.send_str(json_dumps({"msg": "pong"}))
             elif data.get("msg") == "connected":
                 return
         raise RuntimeError("Rocket.Chat DDP connect 未收到 connected")
 
     async def _ddp_login(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        await ws.send_json(
-            {
-                "msg": "method",
-                "method": "login",
-                "id": "ddp-login",
-                "params": [{"resume": self.auth_token}],
-            }
+        await ws.send_str(
+            json_dumps(
+                {
+                    "msg": "method",
+                    "method": "login",
+                    "id": "ddp-login",
+                    "params": [{"resume": self.auth_token}],
+                }
+            )
         )
         async for raw in ws:
             if raw.type != aiohttp.WSMsgType.TEXT:
                 continue
-            data = json.loads(raw.data)
+            data = json_loads(raw.data)
             if data.get("msg") == "ping":
-                await ws.send_json({"msg": "pong"})
+                await ws.send_str(json_dumps({"msg": "pong"}))
             elif data.get("msg") == "result" and data.get("id") == "ddp-login":
                 if data.get("error"):
                     raise RuntimeError(f"Rocket.Chat DDP 登录失败: {data['error']}")
@@ -1016,24 +1124,28 @@ class RocketChatClient:
             room_id = sub.get("rid")
             if not room_id:
                 continue
-            await ws.send_json(
-                {
-                    "msg": "sub",
-                    "id": f"room-{room_id}",
-                    "name": "stream-room-messages",
-                    "params": [room_id, False],
-                }
+            await ws.send_str(
+                json_dumps(
+                    {
+                        "msg": "sub",
+                        "id": f"room-{room_id}",
+                        "name": "stream-room-messages",
+                        "params": [room_id, False],
+                    }
+                )
             )
             self._subscribed_rooms.add(str(room_id))
 
     async def _ddp_subscribe_user_events(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        await ws.send_json(
-            {
-                "msg": "sub",
-                "id": f"user-notif-{self.user_id}",
-                "name": "stream-notify-user",
-                "params": [f"{self.user_id}/rooms-changed", False],
-            }
+        await ws.send_str(
+            json_dumps(
+                {
+                    "msg": "sub",
+                    "id": f"user-notif-{self.user_id}",
+                    "name": "stream-notify-user",
+                    "params": [f"{self.user_id}/rooms-changed", False],
+                }
+            )
         )
 
     async def _ws_listen_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
@@ -1041,7 +1153,7 @@ class RocketChatClient:
             if not self._running:
                 break
             if raw.type == aiohttp.WSMsgType.TEXT:
-                data = json.loads(raw.data)
+                data = json_loads(raw.data)
                 await self._dispatch_ddp(data, ws)
             elif raw.type in {
                 aiohttp.WSMsgType.CLOSE,
@@ -1056,14 +1168,14 @@ class RocketChatClient:
         collection = data.get("collection", "")
 
         if msg_type == "ping":
-            await ws.send_json({"msg": "pong"})
+            await ws.send_str(json_dumps({"msg": "pong"}))
             return
 
         if msg_type == "changed" and collection == "stream-room-messages":
             args = data.get("fields", {}).get("args", [])
             for raw_msg in args:
                 if isinstance(raw_msg, dict):
-                    await self._handle_incoming_message(raw_msg)
+                    await self._enqueue_incoming_message(raw_msg)
             return
 
         if msg_type == "changed" and collection == "stream-notify-user":
@@ -1102,13 +1214,15 @@ class RocketChatClient:
             }
         )
         if event_type == "inserted" and str(room_id) not in self._subscribed_rooms:
-            await ws.send_json(
-                {
-                    "msg": "sub",
-                    "id": f"room-{room_id}",
-                    "name": "stream-room-messages",
-                    "params": [room_id, False],
-                }
+            await ws.send_str(
+                json_dumps(
+                    {
+                        "msg": "sub",
+                        "id": f"room-{room_id}",
+                        "name": "stream-room-messages",
+                        "params": [room_id, False],
+                    }
+                )
             )
             self._subscribed_rooms.add(str(room_id))
 
@@ -1138,12 +1252,7 @@ class RocketChatClient:
         if not source_message_id:
             return True
 
-        signature = json.dumps(
-            self._normalize_inbound_message_for_signature(raw_msg),
-            ensure_ascii=False,
-            sort_keys=True,
-            default=str,
-        )
+        signature = self._build_inbound_message_signature(raw_msg)
         previous = self._seen_inbound_message_signatures.get(source_message_id)
         self._seen_inbound_message_signatures[source_message_id] = signature
         if len(self._seen_inbound_message_signatures) > 5000:
@@ -1157,6 +1266,29 @@ class RocketChatClient:
             )
             return False
         return True
+
+    def _build_inbound_message_signature(self, raw_msg: dict[str, Any]) -> str:
+        parts: list[str] = []
+        for key in self._INBOUND_SIGNATURE_FIELD_NAMES:
+            value = raw_msg.get(key)
+            if value is None:
+                continue
+            if isinstance(value, (dict, list)):
+                value = self._stable_hash_json(value)
+            parts.append(f"{key}={value}")
+        for key in ("attachments", "files", "urls", "mentions"):
+            value = raw_msg.get(key)
+            if value:
+                parts.append(f"{key}={self._stable_hash_json(value)}")
+        return "\x1f".join(parts)
+
+    def _stable_hash_json(self, value: Any) -> str:
+        payload = json_dumps_compact(
+            value,
+            sort_keys=True,
+            default=str,
+        )
+        return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
 
     def _normalize_inbound_message_for_signature(self, value: Any) -> Any:
         if isinstance(value, dict):

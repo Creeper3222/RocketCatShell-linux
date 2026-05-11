@@ -7,7 +7,6 @@ services:
     restart: unless-stopped
     ports:
       - "${ROCKETCAT_WEBUI_BIND_IP:-127.0.0.1}:${ROCKETCAT_WEBUI_PORT:-5751}:${ROCKETCAT_WEBUI_PORT:-5751}"
-      - "${ROCKETCAT_ONEBOT_PORT:-6200}:${ROCKETCAT_ONEBOT_PORT:-6200}"
     volumes:
       - type: bind
         source: ${ROCKETCAT_CONFIG_DIR:-/opt/rocketcatshell/config}

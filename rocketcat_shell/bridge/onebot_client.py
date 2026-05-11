@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from typing import Any, Awaitable, Callable
 
@@ -10,6 +9,7 @@ import aiohttp
 from rocketcat_shell.logger import logger
 
 from .config import BridgeConfig
+from .json_codec import json_dumps, json_loads
 
 
 ActionHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -38,7 +38,17 @@ class OneBotReverseWsClient:
         if self._running:
             return
         self._running = True
-        self._http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45.0))
+        connector = aiohttp.TCPConnector(
+            limit=16,
+            limit_per_host=8,
+            ttl_dns_cache=300,
+            keepalive_timeout=30,
+        )
+        self._http_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=45.0),
+            connector=connector,
+            json_serialize=json_dumps,
+        )
         self._task = asyncio.create_task(self._run_forever())
 
     async def stop(self) -> None:
@@ -140,7 +150,7 @@ class OneBotReverseWsClient:
             payload = await self._outgoing.get()
             if self._ws is None or self._ws.closed:
                 break
-            await self._ws.send_json(payload)
+            await self._ws.send_str(json_dumps(payload))
 
     async def _send_lifecycle_connect(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         payload = {
@@ -150,7 +160,7 @@ class OneBotReverseWsClient:
             "meta_event_type": "lifecycle",
             "sub_type": "connect",
         }
-        await ws.send_json(payload)
+        await ws.send_str(json_dumps(payload))
         logger.info("[RocketChatOneBotBridge] 已上报 OneBot lifecycle.connect 元事件。")
 
     async def _listen_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
@@ -164,7 +174,7 @@ class OneBotReverseWsClient:
                 }:
                     break
                 continue
-            data = json.loads(raw.data)
+            data = json_loads(raw.data)
             action = data.get("action")
             if not action:
                 continue
@@ -178,4 +188,4 @@ class OneBotReverseWsClient:
                 "wording": response.get("wording", ""),
                 "echo": echo,
             }
-            await ws.send_json(response_payload)
+            await ws.send_str(json_dumps(response_payload))

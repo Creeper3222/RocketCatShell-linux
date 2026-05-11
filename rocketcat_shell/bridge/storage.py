@@ -176,12 +176,12 @@ class MessageStore:
     ) -> None:
         entry["surrogate_id"] = int(surrogate_id)
         event = entry.get("onebot_message")
-        if not isinstance(event, dict):
-            return
-
-        event["message_id"] = int(surrogate_id)
-        reply_source_id = str(event.get("rocketchat_reply_source_id") or "").strip()
-        segments = event.get("message")
+        reply_source_id = str(entry.get("reply_source_id") or "").strip()
+        segments = entry.get("onebot_message_segments")
+        if isinstance(event, dict):
+            event["message_id"] = int(surrogate_id)
+            reply_source_id = reply_source_id or str(event.get("rocketchat_reply_source_id") or "").strip()
+            segments = event.get("message")
         if not isinstance(segments, list):
             return
 
@@ -197,7 +197,10 @@ class MessageStore:
                 updated_segment["data"] = updated_data
                 rewritten_segments.append(updated_segment)
 
-        event["message"] = rewritten_segments
+        if isinstance(event, dict):
+            event["message"] = rewritten_segments
+        else:
+            entry["onebot_message_segments"] = rewritten_segments
 
     @staticmethod
     def _build_latest_by_context_sender(entries: list[dict[str, Any]]) -> dict[str, Any]:

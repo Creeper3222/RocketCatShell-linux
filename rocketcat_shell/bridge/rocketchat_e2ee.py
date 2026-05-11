@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-import json
 import os
+import tempfile
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -16,6 +16,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from rocketcat_shell.logger import logger
+
+from .json_codec import json_dumps_compact, json_loads
 
 
 def _b64_encode(data: bytes) -> str:
@@ -43,7 +45,7 @@ def _binary_decode(data: str) -> bytes:
 
 
 def _json_dumps(data: Any) -> str:
-    return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+    return json_dumps_compact(data)
 
 
 def _uint_to_b64url(value: int) -> str:
@@ -129,7 +131,7 @@ def _export_private_jwk(key: rsa.RSAPrivateKey) -> dict[str, Any]:
 
 
 def _import_public_jwk(data: str | dict[str, Any]) -> rsa.RSAPublicKey:
-    jwk = json.loads(data) if isinstance(data, str) else data
+    jwk = json_loads(data) if isinstance(data, str) else data
     numbers = rsa.RSAPublicNumbers(
         e=_b64url_to_uint(jwk["e"]),
         n=_b64url_to_uint(jwk["n"]),
@@ -138,7 +140,7 @@ def _import_public_jwk(data: str | dict[str, Any]) -> rsa.RSAPublicKey:
 
 
 def _import_private_jwk(data: str | dict[str, Any]) -> rsa.RSAPrivateKey:
-    jwk = json.loads(data) if isinstance(data, str) else data
+    jwk = json_loads(data) if isinstance(data, str) else data
     public_numbers = rsa.RSAPublicNumbers(
         e=_b64url_to_uint(jwk["e"]),
         n=_b64url_to_uint(jwk["n"]),
@@ -180,7 +182,7 @@ def _decrypt_private_key_from_server(
     password: str,
     stored_private_key: str,
 ) -> str:
-    parsed = json.loads(stored_private_key)
+    parsed = json_loads(stored_private_key)
     if "$binary" in parsed:
         raw = _b64_decode(parsed["$binary"])
         iv = raw[:16]
@@ -222,7 +224,7 @@ class SessionKey:
 
     @classmethod
     def from_jwk_json(cls, key_id: str, jwk_json: str) -> "SessionKey":
-        jwk = json.loads(jwk_json)
+        jwk = json_loads(jwk_json)
         return cls(
             key_id=key_id,
             alg=jwk["alg"],
@@ -268,7 +270,7 @@ class RoomKeyStore:
 @dataclass
 class EncryptedMediaUpload:
     encrypted_name: str
-    encrypted_bytes: bytes
+    encrypted_path: str
     key_jwk: dict[str, Any]
     iv_b64: str
     sha256: str
@@ -278,6 +280,8 @@ class EncryptedMediaUpload:
 
 
 class RocketChatE2EEManager:
+    _MEDIA_ENCRYPT_CHUNK_SIZE = 1024 * 1024
+
     def __init__(self, client: Any, enabled: bool, password: str) -> None:
         self.client = client
         self.enabled = enabled
@@ -434,7 +438,7 @@ class RocketChatE2EEManager:
         *,
         file_name: str,
         mime_type: str,
-        file_bytes: bytes,
+        file_path: str,
     ) -> Optional[EncryptedMediaUpload]:
         room_info = await self.client.get_room_info(room_id)
         if not await self.should_encrypt_room(room_info):
@@ -447,11 +451,35 @@ class RocketChatE2EEManager:
         iv = os.urandom(16)
         file_key = os.urandom(32)
         encryptor = Cipher(algorithms.AES(file_key), modes.CTR(iv)).encryptor()
-        encrypted_bytes = encryptor.update(file_bytes) + encryptor.finalize()
+        sha256 = hashlib.sha256()
+        size = 0
+        encrypted_path = ""
+        tmp = tempfile.NamedTemporaryFile(suffix=".e2ee", delete=False)
+        encrypted_path = tmp.name
+        try:
+            with open(file_path, "rb") as source:
+                while True:
+                    chunk = source.read(self._MEDIA_ENCRYPT_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    sha256.update(chunk)
+                    encrypted_chunk = encryptor.update(chunk)
+                    if encrypted_chunk:
+                        tmp.write(encrypted_chunk)
+            final_chunk = encryptor.finalize()
+            if final_chunk:
+                tmp.write(final_chunk)
+            tmp.close()
+        except Exception:
+            tmp.close()
+            if encrypted_path and os.path.exists(encrypted_path):
+                os.unlink(encrypted_path)
+            raise
 
         return EncryptedMediaUpload(
             encrypted_name=hashlib.sha256(file_name.encode("utf-8")).hexdigest(),
-            encrypted_bytes=encrypted_bytes,
+            encrypted_path=encrypted_path,
             key_jwk={
                 "kty": "oct",
                 "k": _b64url_encode(file_key),
@@ -460,10 +488,10 @@ class RocketChatE2EEManager:
                 "alg": "A256CTR",
             },
             iv_b64=_b64_encode(iv),
-            sha256=hashlib.sha256(file_bytes).hexdigest(),
+            sha256=sha256.hexdigest(),
             original_name=file_name,
             mime_type=mime_type,
-            size=len(file_bytes),
+            size=size,
         )
 
     async def build_upload_file_content(
@@ -859,7 +887,7 @@ class RocketChatE2EEManager:
                 return None
 
             plaintext = session_key.decrypt_payload(iv, ciphertext)
-            decoded = json.loads(plaintext.decode("utf-8"))
+            decoded = json_loads(plaintext.decode("utf-8"))
             if not isinstance(decoded, dict):
                 return None
 
@@ -901,7 +929,7 @@ class RocketChatE2EEManager:
         if self.client._http_session is None:
             raise RuntimeError("Rocket.Chat HTTP session 尚未初始化")
         async with self.client._http_session.get(url, params=params, headers=self.client._auth_headers()) as resp:
-            data = await resp.json(content_type=None)
+            data = await resp.json(content_type=None, loads=json_loads)
         if not data.get("success"):
             raise RuntimeError(f"GET {path} failed: {data}")
         return data
@@ -911,7 +939,7 @@ class RocketChatE2EEManager:
         if self.client._http_session is None:
             raise RuntimeError("Rocket.Chat HTTP session 尚未初始化")
         async with self.client._http_session.post(url, json=payload, headers=self.client._auth_headers()) as resp:
-            data = await resp.json(content_type=None)
+            data = await resp.json(content_type=None, loads=json_loads)
         if not data.get("success"):
             raise RuntimeError(f"POST {path} failed: {data}")
         return data

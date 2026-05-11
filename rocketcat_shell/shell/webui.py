@@ -28,6 +28,9 @@ class BridgeLogBuffer:
         self._entries: deque[dict[str, Any]] = deque(maxlen=self.max_entries)
         self._lock = threading.Lock()
         self._next_id = 1
+        self._version = 0
+        self._changed = asyncio.Event()
+        self._event_loop: asyncio.AbstractEventLoop | None = None
 
     def append_record(self, record: logging.LogRecord) -> None:
         message = record.getMessage()
@@ -53,17 +56,49 @@ class BridgeLogBuffer:
         with self._lock:
             self._entries.append(entry)
             self._next_id += 1
+            self._version += 1
+        self._notify_changed()
 
     def get_entries(self, *, after_id: int = 0) -> list[dict[str, Any]]:
         with self._lock:
             return [dict(entry) for entry in self._entries if int(entry["id"]) > int(after_id)]
+
+    def latest_id(self) -> int:
+        with self._lock:
+            if self._entries:
+                return int(self._entries[-1]["id"])
+            return max(0, self._next_id - 1)
+
+    @property
+    def version(self) -> int:
+        with self._lock:
+            return self._version
+
+    async def wait_for_change(self, version: int, *, timeout: float) -> None:
+        self._event_loop = asyncio.get_running_loop()
+        if self.version != version:
+            return
+        try:
+            await asyncio.wait_for(self._changed.wait(), timeout=max(0.0, float(timeout)))
+        except asyncio.TimeoutError:
+            return
+        finally:
+            self._changed.clear()
 
     def clear(self) -> int:
         with self._lock:
             cleared = len(self._entries)
             self._entries.clear()
             self._next_id = 1
-            return cleared
+            self._version += 1
+        self._notify_changed()
+        return cleared
+
+    def _notify_changed(self) -> None:
+        loop = self._event_loop
+        if loop is None or loop.is_closed():
+            return
+        loop.call_soon_threadsafe(self._changed.set)
 
 
 class BridgeLogHandler(logging.Handler):
@@ -98,7 +133,7 @@ class ShellWebUI:
         self._bound_socket: socket.socket | None = None
         self._log_buffer = BridgeLogBuffer(max_entries=5000)
         self._log_handler = BridgeLogHandler(self._log_buffer)
-        self._app = FastAPI(title="RocketCat Shell", version="v0.1.1")
+        self._app = FastAPI(title="RocketCat Shell", version="v0.1.4")
         self._static_dir = Path(__file__).resolve().parent / "static"
         self._login_file = self._static_dir / "login.html"
         self._setup_routes()
@@ -520,10 +555,22 @@ class ShellWebUI:
     async def _handle_logs(
         self,
         after_id: int = Query(default=0, ge=0),
+        wait: float = Query(default=0.0, ge=0.0, le=30.0),
     ) -> dict[str, Any]:
+        latest_id = self._log_buffer.latest_id()
+        reset_cursor = after_id > latest_id
+        effective_after_id = 0 if reset_cursor else after_id
+        initial_version = self._log_buffer.version
+        if wait > 0 and not reset_cursor and effective_after_id >= latest_id:
+            await self._log_buffer.wait_for_change(initial_version, timeout=wait)
+            latest_id = self._log_buffer.latest_id()
+            reset_cursor = after_id > latest_id
+            effective_after_id = 0 if reset_cursor else after_id
         return {
-            "items": self._log_buffer.get_entries(after_id=after_id),
+            "items": self._log_buffer.get_entries(after_id=effective_after_id),
             "max_entries": self._log_buffer.max_entries,
+            "latest_id": latest_id,
+            "reset": reset_cursor,
         }
 
     async def _handle_clear_logs(self) -> dict[str, Any]:
