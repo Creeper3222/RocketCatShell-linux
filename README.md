@@ -58,7 +58,7 @@
 - `Dockerfile` 会把 `tools/` 一并打进镜像，保证容器内和宿主机目录里的工具链一致。
 - `docker/entrypoint.sh` 仍负责容器首次启动时写入 `config/shell.json` 默认值，并在外部 volume 为空时补种内置插件。
 - `docker-compose.yml`、`.env` 和 `.env.example` 已改为 Linux 风格的默认持久化路径 `/opt/rocketcatshell/...`，不再使用旧的 Windows `D:/docker/...` 示例。
-- 共享媒体导出仍保留在 Docker 版里：图片/语音在适合时会优先落到 `ROCKETCAT_SHARED_MEDIA_HOST_DIR`，减少容器内临时文件与 base64 膨胀。
+- 共享媒体导出仍保留在 Docker 版里：默认继续使用 `ROCKETCAT_SHARED_MEDIA_HOST_DIR` 路径传输，减少容器内临时文件与 Base64 膨胀；如果 AstrBot 和 RocketCatShell 同为 Docker 且更适合直接传 Base64，可在基础设置页启用 `enable_base64_media_transport`，或在首次启动前把 `.env` 里的 `ROCKETCAT_DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT=true`。
 
 ---
 
@@ -300,6 +300,8 @@ docker compose up -d --build
 
 默认会把持久化目录挂到项目目录下的 `./config`、`./data/...` 和 `./logs`，共享图片缓存目录会显式挂到 `./data/bots/_shared_media`；如果你要改宿主机挂载位置，优先修改 `.env` 里的 `ROCKETCAT_*_DIR` 和 `ROCKETCAT_SHARED_MEDIA_HOST_DIR`。
 
+Docker 首次启动时，“基础设置”里的“启用 Base64 传输媒体”默认关闭；如果你希望新安装首次生成的 `shell.json` 直接开启它，可以在 `.env` 中把 `ROCKETCAT_DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT=true`。
+
 
 
 ---
@@ -363,6 +365,7 @@ RocketCatShell 在第一次安装、还没有保存过任何配置时，会自�
 - Docker Compose 默认宿主机访问地址：`http://127.0.0.1:5751/`（容器内 `webui_host=0.0.0.0`，再由 compose 负责端口发布）
 - WebUI 初始密码：`123456`
 - 最大消息映射窗口条数：`1000`
+- Base64 媒体传输开关：`false`
 - 本机直接运行时默认 OneBot reverse WS 地址：`ws://127.0.0.1:6199/ws/`
 - Docker Compose / `docker/entrypoint.sh` 默认 OneBot reverse WS 地址：`ws://host.docker.internal:6200/ws/`
 - `next_onebot_self_id`：`910001`
@@ -393,6 +396,8 @@ ws://127.0.0.1:6199/ws/
 ```text
 ws://host.docker.internal:6200/ws/
 ```
+
+如果 AstrBot 也跑在 Docker，并且它不能直接访问 `ROCKETCAT_SHARED_MEDIA_HOST_DIR` 指向的共享目录，那么可以在“基础设置”页启用“启用 Base64 传输媒体”，或者在首次部署前把 `.env` 里的 `ROCKETCAT_DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT=true`，让新生成的 `shell.json` 默认启用该模式。
 
 ### 2. 启动 RocketCatShell
 
@@ -458,6 +463,7 @@ http://127.0.0.1:5751/
 | `webui_port` | WebUI 监听端口，默认 `5751`。 |
 | `webui_access_password` | WebUI 登录密码，默认 `123456`。 |
 | `message_index_max_entries` | 最大消息映射窗口条数，默认 `1000`；超出后会清理最早映射，并在达到重置阈值后自动重排当前窗口。 |
+| `enable_base64_media_transport` | 是否把可本地读取的图片/语音/视频优先转成 `base64://` 发送，默认 `false`；关闭时继续沿用共享目录路径模式。 |
 | `log_level` | 日志级别，默认 `INFO`。 |
 | `auto_open_browser` | 启动后是否自动打开浏览器。 |
 | `default_onebot_ws_url` | 新建 Bot 时使用的默认 OneBot reverse WS 地址。 |

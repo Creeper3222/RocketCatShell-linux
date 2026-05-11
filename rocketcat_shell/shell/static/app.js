@@ -87,6 +87,7 @@ const elements = {
   settingsPasswordHint: document.getElementById('settingsPasswordHint'),
   settingsPortHint: document.getElementById('settingsPortHint'),
   settingsMessageIndexHint: document.getElementById('settingsMessageIndexHint'),
+  settingsBase64MediaHint: document.getElementById('settingsBase64MediaHint'),
   pluginCount: document.getElementById('pluginCount'),
   pluginEnabledCount: document.getElementById('pluginEnabledCount'),
   basicInfoGrid: document.getElementById('basicInfoGrid'),
@@ -111,9 +112,11 @@ const elements = {
   settingsWebuiPasswordInput: document.getElementById('settingsWebuiPasswordInput'),
   settingsWebuiPortInput: document.getElementById('settingsWebuiPortInput'),
   settingsMessageIndexMaxEntriesInput: document.getElementById('settingsMessageIndexMaxEntriesInput'),
+  settingsBase64MediaTransportInput: document.getElementById('settingsBase64MediaTransportInput'),
   settingsPasswordSaveButton: document.getElementById('settingsPasswordSaveButton'),
   settingsPortSaveButton: document.getElementById('settingsPortSaveButton'),
   settingsMessageIndexSaveButton: document.getElementById('settingsMessageIndexSaveButton'),
+  settingsBase64MediaSaveButton: document.getElementById('settingsBase64MediaSaveButton'),
   settingsMessageIndexRebuildButton: document.getElementById('settingsMessageIndexRebuildButton'),
   settingsExportConfigButton: document.getElementById('settingsExportConfigButton'),
   settingsImportConfigButton: document.getElementById('settingsImportConfigButton'),
@@ -475,6 +478,11 @@ function renderSettings(payload) {
     elements.settingsMessageIndexHint.textContent = settings.message_index_hint
       || '当前最多保留 1000 条最近 message 映射。当最新 message 编号达到 3000002000 时，会自动把当前映射窗口 3000001001 ~ 3000002000 重新映射为 3000000001 ~ 3000001000。';
   }
+  if (elements.settingsBase64MediaHint) {
+    elements.settingsBase64MediaHint.textContent = settings.enable_base64_media_transport
+      ? '当前已启用 Base64 传输媒体；保存后会立即重建运行中的 bridge runtime，后续可本地读取的媒体会优先以 base64:// 形式发送。'
+      : '当前保持路径传输；保存后会立即重建运行中的 bridge runtime，后续媒体会继续沿用现有路径模式。';
+  }
 
   if (elements.settingsWebuiPasswordInput) {
     elements.settingsWebuiPasswordInput.value = '';
@@ -484,6 +492,9 @@ function renderSettings(payload) {
   }
   if (elements.settingsMessageIndexMaxEntriesInput) {
     elements.settingsMessageIndexMaxEntriesInput.value = String(settings.message_index_max_entries || 1000);
+  }
+  if (elements.settingsBase64MediaTransportInput) {
+    elements.settingsBase64MediaTransportInput.checked = Boolean(settings.enable_base64_media_transport);
   }
 }
 
@@ -1164,6 +1175,23 @@ async function saveMessageIndexSettings() {
   showToast('消息映射窗口条数上限已保存，现有映射窗口已按新规则整理', 'success');
 }
 
+async function saveBase64MediaTransportSettings() {
+  const enabled = Boolean(elements.settingsBase64MediaTransportInput?.checked);
+
+  const payload = await requestJson('/api/settings', {
+    method: 'PUT',
+    body: JSON.stringify({ enable_base64_media_transport: enabled }),
+  });
+  state.settings.loaded = true;
+  renderSettings(payload);
+  showToast(
+    enabled
+      ? 'Base64 媒体传输已开启，运行中的 bridge runtime 已立即重载'
+      : 'Base64 媒体传输已关闭，运行中的 bridge runtime 已恢复路径模式',
+    'success',
+  );
+}
+
 function summarizeMessageIndexResult(result) {
   const botCount = Number(result?.bot_count) || 0;
   const changedBotCount = Number(result?.changed_bot_count) || 0;
@@ -1434,6 +1462,13 @@ elements.settingsPortSaveButton?.addEventListener('click', async () => {
 elements.settingsMessageIndexSaveButton?.addEventListener('click', async () => {
   try {
     await saveMessageIndexSettings();
+  } catch (error) {
+    showToast(error.message || '设置保存失败', 'error');
+  }
+});
+elements.settingsBase64MediaSaveButton?.addEventListener('click', async () => {
+  try {
+    await saveBase64MediaTransportSettings();
   } catch (error) {
     showToast(error.message || '设置保存失败', 'error');
   }

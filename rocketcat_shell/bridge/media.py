@@ -61,6 +61,68 @@ class RocketChatMediaBridge:
             return suffix
         return f"{host_base}{separator}{suffix}"
 
+    def _is_base64_media_transport_enabled(self) -> bool:
+        return bool(getattr(self.client, "enable_base64_media_transport", False))
+
+    def _encode_media_file_to_base64(self, file_path: str) -> str | None:
+        candidate = str(file_path or "").strip()
+        if not candidate:
+            return None
+
+        try:
+            with open(candidate, "rb") as fp:
+                return f"base64://{base64.b64encode(fp.read()).decode('ascii')}"
+        except Exception as exc:
+            logger.warning(
+                "[RocketChatOneBotBridge] Base64 媒体编码失败，已回退到路径模式: %s error=%r",
+                candidate,
+                exc,
+            )
+            return None
+
+    def resolve_onebot_media_file_ref(self, media: dict[str, Any]) -> str:
+        file_ref = str(media.get("path") or media.get("url") or "")
+        if not file_ref:
+            return ""
+
+        local_path = str(media.get("path") or "").strip()
+        if self._is_base64_media_transport_enabled() and local_path:
+            base64_ref = self._encode_media_file_to_base64(local_path)
+            if base64_ref:
+                return base64_ref
+
+        return self.translate_shared_media_path_to_host(file_ref)
+
+    def build_onebot_segment_from_descriptor(self, media: dict[str, Any]) -> dict[str, Any] | None:
+        kind = str(media.get("kind") or "")
+        file_ref = self.resolve_onebot_media_file_ref(media)
+        if not file_ref:
+            return None
+
+        if kind == "image":
+            return {"type": "image", "data": {"file": file_ref}}
+        if kind == "audio":
+            return {"type": "record", "data": {"file": file_ref}}
+        if kind == "video":
+            return {"type": "video", "data": {"file": file_ref}}
+
+        name = str(media.get("name") or "attachment")
+        if media.get("path"):
+            return {
+                "type": "text",
+                "data": {
+                    "text": f"[加密文件] {name}",
+                },
+            }
+        return {
+            "type": "file",
+            "data": {
+                "url": file_ref,
+                "file_name": name,
+                "name": name,
+            },
+        }
+
     def classify_file_kind(self, file_obj: dict[str, Any]) -> str:
         candidates: list[str] = []
 
@@ -240,61 +302,16 @@ class RocketChatMediaBridge:
         seen: set[tuple[str, str]] = set()
 
         for media in media_descriptors:
-            kind = str(media.get("kind") or "")
-            file_ref = str(media.get("path") or media.get("url") or "")
-            if not file_ref:
+            segment = self.build_onebot_segment_from_descriptor(media)
+            if not segment:
                 continue
-            file_ref = self.translate_shared_media_path_to_host(file_ref)
-
-            if kind == "image":
-                key = ("image", file_ref)
-                if key in seen:
-                    continue
-                seen.add(key)
-                segments.append({"type": "image", "data": {"file": file_ref}})
-                continue
-
-            if kind == "audio":
-                key = ("record", file_ref)
-                if key in seen:
-                    continue
-                seen.add(key)
-                segments.append({"type": "record", "data": {"file": file_ref}})
-                continue
-
-            if kind == "video":
-                key = ("video", file_ref)
-                if key in seen:
-                    continue
-                seen.add(key)
-                segments.append({"type": "video", "data": {"file": file_ref}})
-                continue
-
-            key = ("file", file_ref)
-            if key in seen:
+            data = segment.get("data") or {}
+            file_ref = str(data.get("file") or data.get("url") or "")
+            key = (str(segment.get("type") or ""), file_ref)
+            if not file_ref or key in seen:
                 continue
             seen.add(key)
-            name = str(media.get("name") or "attachment")
-            if media.get("path"):
-                segments.append(
-                    {
-                        "type": "text",
-                        "data": {
-                            "text": f"[加密文件] {name}",
-                        },
-                    }
-                )
-                continue
-            segments.append(
-                {
-                    "type": "file",
-                    "data": {
-                        "url": file_ref,
-                        "file_name": name,
-                        "name": name,
-                    },
-                }
-            )
+            segments.append(segment)
 
         return segments
 

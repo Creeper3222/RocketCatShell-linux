@@ -722,35 +722,7 @@ class InboundTranslator:
         return segments
 
     def _build_media_segment_from_descriptor(self, media: dict[str, Any]) -> dict[str, Any] | None:
-        kind = str(media.get("kind") or "")
-        file_ref = str(media.get("path") or media.get("url") or "")
-        if not file_ref:
-            return None
-        file_ref = self._rocketchat.media.translate_shared_media_path_to_host(file_ref)
-
-        if kind == "image":
-            return {"type": "image", "data": {"file": file_ref}}
-        if kind == "audio":
-            return {"type": "record", "data": {"file": file_ref}}
-        if kind == "video":
-            return {"type": "video", "data": {"file": file_ref}}
-
-        name = str(media.get("name") or "attachment")
-        if media.get("path"):
-            return {
-                "type": "text",
-                "data": {
-                    "text": f"[加密文件] {name}",
-                },
-            }
-        return {
-            "type": "file",
-            "data": {
-                "url": file_ref,
-                "file_name": name,
-                "name": name,
-            },
-        }
+        return self._rocketchat.media.build_onebot_segment_from_descriptor(media)
 
     async def _extract_context_media_descriptors(
         self,

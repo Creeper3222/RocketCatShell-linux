@@ -37,6 +37,7 @@ class BridgeRuntime:
         data_dir: Path | None = None,
         instance_name: str = "bridge",
         message_index_max_entries: int = DurableIdMap._DEFAULT_MESSAGE_WINDOW_SIZE,
+        enable_base64_media_transport: bool = False,
         disable_callback: DisableCallback | None = None,
         plugin_manager: RocketCatPluginManager | None = None,
     ):
@@ -50,6 +51,7 @@ class BridgeRuntime:
         self.message_index_max_entries = DurableIdMap.normalize_message_window_size(
             message_index_max_entries
         )
+        self.enable_base64_media_transport = bool(enable_base64_media_transport)
         self._disable_callback = disable_callback
         self._plugin_manager = plugin_manager
 
@@ -243,6 +245,7 @@ class BridgeRuntime:
 
         self.rocketchat = RocketChatClient(
             self.config,
+            enable_base64_media_transport=self.enable_base64_media_transport,
             on_message=self._handle_rocketchat_message,
             on_reconnect_exhausted=self._handle_reconnect_exhausted,
         )

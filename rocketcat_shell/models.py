@@ -17,6 +17,7 @@ DEFAULT_ROOM_INFO_CACHE_TTL_SECONDS = 300.0
 DEFAULT_PERF_TRACE_ENABLED = False
 DEFAULT_SKIP_OWN_MESSAGES = True
 DEFAULT_DEBUG = False
+DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT = False
 DEFAULT_START_SELF_ID = 910001
 
 
@@ -79,6 +80,7 @@ class ShellSettings:
     default_remote_media_max_size: int = DEFAULT_REMOTE_MEDIA_MAX_SIZE
     default_skip_own_messages: bool = DEFAULT_SKIP_OWN_MESSAGES
     default_debug: bool = DEFAULT_DEBUG
+    enable_base64_media_transport: bool = DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT
     next_onebot_self_id: int = DEFAULT_START_SELF_ID
 
     @classmethod
@@ -120,6 +122,10 @@ class ShellSettings:
                 DEFAULT_SKIP_OWN_MESSAGES,
             ),
             default_debug=_coerce_bool(data.get("default_debug", DEFAULT_DEBUG), DEFAULT_DEBUG),
+            enable_base64_media_transport=_coerce_bool(
+                data.get("enable_base64_media_transport", DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT),
+                DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT,
+            ),
             next_onebot_self_id=_coerce_int(
                 data.get("next_onebot_self_id", DEFAULT_START_SELF_ID),
                 DEFAULT_START_SELF_ID,
@@ -142,6 +148,7 @@ class ShellSettings:
             "default_remote_media_max_size": self.default_remote_media_max_size,
             "default_skip_own_messages": self.default_skip_own_messages,
             "default_debug": self.default_debug,
+            "enable_base64_media_transport": self.enable_base64_media_transport,
             "next_onebot_self_id": self.next_onebot_self_id,
         }
 

@@ -48,10 +48,12 @@ class RocketChatClient:
     def __init__(
         self,
         config: BridgeConfig,
+        enable_base64_media_transport: bool = False,
         on_message: MessageCallback | None = None,
         on_reconnect_exhausted: FailureCallback | None = None,
     ):
         self.config = config
+        self.enable_base64_media_transport = bool(enable_base64_media_transport)
         self._on_message = on_message
         self._on_reconnect_exhausted = on_reconnect_exhausted
         self._http_session: aiohttp.ClientSession | None = None
