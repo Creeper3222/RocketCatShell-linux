@@ -33,6 +33,34 @@ class RocketChatMediaBridge:
             dir=self._resolve_shared_media_dir(),
         )
 
+    def translate_shared_media_path_to_host(self, file_ref: str) -> str:
+        candidate = str(file_ref or "").strip()
+        if not candidate:
+            return ""
+
+        host_dir = str(os.environ.get("ROCKETCAT_SHARED_MEDIA_HOST_DIR") or "").strip()
+        if not host_dir:
+            return candidate
+
+        container_dir = self._resolve_shared_media_dir().replace("\\", "/").rstrip("/")
+        normalized_candidate = candidate.replace("\\", "/")
+        if normalized_candidate == container_dir:
+            relative_path = ""
+        elif normalized_candidate.startswith(container_dir + "/"):
+            relative_path = normalized_candidate[len(container_dir) + 1 :]
+        else:
+            return candidate
+
+        host_base = host_dir.rstrip("/\\")
+        if not relative_path:
+            return host_base or host_dir
+
+        separator = "\\" if "\\" in host_dir and "/" not in host_dir else "/"
+        suffix = relative_path.replace("/", separator)
+        if not host_base:
+            return suffix
+        return f"{host_base}{separator}{suffix}"
+
     def classify_file_kind(self, file_obj: dict[str, Any]) -> str:
         candidates: list[str] = []
 
@@ -216,6 +244,7 @@ class RocketChatMediaBridge:
             file_ref = str(media.get("path") or media.get("url") or "")
             if not file_ref:
                 continue
+            file_ref = self.translate_shared_media_path_to_host(file_ref)
 
             if kind == "image":
                 key = ("image", file_ref)

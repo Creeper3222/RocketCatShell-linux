@@ -726,6 +726,7 @@ class InboundTranslator:
         file_ref = str(media.get("path") or media.get("url") or "")
         if not file_ref:
             return None
+        file_ref = self._rocketchat.media.translate_shared_media_path_to_host(file_ref)
 
         if kind == "image":
             return {"type": "image", "data": {"file": file_ref}}
