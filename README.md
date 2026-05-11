@@ -298,7 +298,7 @@ pip install -r requirements.txt
 docker compose up -d --build
 ```
 
-默认会把持久化目录挂到 `/opt/rocketcatshell/...`；如果你要改宿主机挂载位置，优先修改 `.env` 里的 `ROCKETCAT_*_DIR` 和 `ROCKETCAT_SHARED_MEDIA_HOST_DIR`。
+默认会把持久化目录挂到项目目录下的 `./config`、`./data/...` 和 `./logs`，共享图片缓存目录会显式挂到 `./data/bots/_shared_media`；如果你要改宿主机挂载位置，优先修改 `.env` 里的 `ROCKETCAT_*_DIR` 和 `ROCKETCAT_SHARED_MEDIA_HOST_DIR`。
 
 
 
