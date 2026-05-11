@@ -19,6 +19,20 @@ class RocketChatMediaBridge:
     def __init__(self, client: Any) -> None:
         self.client = client
 
+    def _resolve_shared_media_dir(self) -> str:
+        target_dir = str(os.environ.get("ROCKETCAT_SHARED_MEDIA_DIR") or "").strip()
+        if not target_dir:
+            target_dir = "/app/data/bots/_shared_media"
+        os.makedirs(target_dir, exist_ok=True)
+        return target_dir
+
+    def _create_shared_media_temp_file(self, suffix: str):
+        return tempfile.NamedTemporaryFile(
+            suffix=suffix,
+            delete=False,
+            dir=self._resolve_shared_media_dir(),
+        )
+
     def classify_file_kind(self, file_obj: dict[str, Any]) -> str:
         candidates: list[str] = []
 
@@ -404,7 +418,7 @@ class RocketChatMediaBridge:
         return default_suffix
 
     def _write_temp_media_file(self, raw: bytes, suffix: str) -> str:
-        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        tmp = self._create_shared_media_temp_file(suffix)
         try:
             tmp.write(raw)
             tmp.close()
@@ -832,7 +846,7 @@ class RocketChatMediaBridge:
                     )
                     return None, None
 
-                tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+                tmp = self._create_shared_media_temp_file(suffix)
                 tmp_path = tmp.name
                 try:
                     downloaded = 0
@@ -885,7 +899,7 @@ class RocketChatMediaBridge:
             )
             return None, None
 
-        tmp = tempfile.NamedTemporaryFile(suffix=default_suffix, delete=False)
+        tmp = self._create_shared_media_temp_file(default_suffix)
         try:
             tmp.write(raw)
             tmp.close()
