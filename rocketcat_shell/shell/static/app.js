@@ -480,8 +480,8 @@ function renderSettings(payload) {
   }
   if (elements.settingsBase64MediaHint) {
     elements.settingsBase64MediaHint.textContent = settings.enable_base64_media_transport
-      ? '当前已启用 Base64 传输媒体；保存后会立即重建运行中的 bridge runtime，后续可本地读取的媒体会优先以 base64:// 形式发送。'
-      : '当前保持路径传输；保存后会立即重建运行中的 bridge runtime，后续媒体会继续沿用现有路径模式。';
+      ? '当前已启用 Base64 传输；保存后会立即重建运行中的 bridge runtime。启用 Base64 传输能更好地适配上游在 Docker 部署的情况，但对 Base64 的编/解码会增加花销，略微降低性能；若上游直接部署在宿主机上，推荐关闭。'
+      : '当前保持路径传输；保存后会立即重建运行中的 bridge runtime。启用 Base64 传输能更好地适配上游在 Docker 部署的情况，但对 Base64 的编/解码会增加花销，略微降低性能；若上游直接部署在宿主机上，推荐关闭。';
   }
 
   if (elements.settingsWebuiPasswordInput) {
