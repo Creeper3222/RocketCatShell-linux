@@ -558,6 +558,43 @@ class RocketChatClient:
             return False
         return True
 
+    async def set_room_typing(
+        self,
+        room_id: str,
+        *,
+        is_typing: bool,
+    ) -> bool:
+        normalized_room_id = str(room_id or "").strip()
+        if not normalized_room_id:
+            raise ValueError("room_id 不能为空")
+
+        actor_name = str(
+            self.bot_profile.get("name")
+            or self.bot_username
+            or self.config.username
+            or ""
+        ).strip()
+        if not actor_name:
+            logger.error("[RocketChatOneBotBridge] Rocket.Chat typing 发送失败: 缺少 bot 身份名称")
+            return False
+
+        activities = ["user-typing"] if is_typing else []
+        try:
+            await self._ddp_call(
+                "stream-notify-room",
+                [f"{normalized_room_id}/user-activity", actor_name, activities, {}],
+                timeout=10.0,
+            )
+        except Exception as exc:
+            logger.error(
+                "[RocketChatOneBotBridge] Rocket.Chat typing 发送失败: room_id=%s is_typing=%s err=%r",
+                normalized_room_id,
+                is_typing,
+                exc,
+            )
+            return False
+        return True
+
     async def _post_json_message(self, url: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         data = await self._request_json(
             "POST",

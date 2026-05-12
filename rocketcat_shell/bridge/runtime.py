@@ -226,6 +226,15 @@ class BridgeRuntime:
                 if trace is not None:
                     trace.finish(status="dropped")
                 return
+            suppressed_by_plugin = False
+            try:
+                suppressed_by_plugin = await self._dispatch_inbound_message_plugins(raw_msg, event)
+            except Exception:
+                logger.exception("[BridgeRuntime] inbound message plugin dispatch failed")
+            if suppressed_by_plugin:
+                if trace is not None:
+                    trace.finish(status="intercepted_by_plugin")
+                return
             with perf_stage(trace, "emit_event"):
                 await self.onebot.emit_event(event)
             if trace is not None:
@@ -234,6 +243,44 @@ class BridgeRuntime:
             if trace is not None:
                 trace.finish(status="error")
             raise
+
+    async def _dispatch_inbound_message_plugins(
+        self,
+        raw_msg: dict[str, Any],
+        event: dict[str, Any],
+    ) -> bool:
+        if not self._runtime_plugins or self._plugin_runtime_context is None:
+            return False
+
+        for binding in self._runtime_plugins:
+            plugin = binding.instance
+            if not plugin.enabled:
+                continue
+            try:
+                result = await asyncio.wait_for(
+                    plugin.on_inbound_message(
+                        dict(event),
+                        dict(raw_msg),
+                        self._plugin_runtime_context,
+                    ),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[RocketCatShell] 插件 %s 处理入站消息超时。",
+                    binding.descriptor.plugin_id,
+                )
+                continue
+            except Exception as exc:
+                logger.error(
+                    "[RocketCatShell] 插件 %s 处理入站消息失败: %r",
+                    binding.descriptor.plugin_id,
+                    exc,
+                )
+                continue
+            if result is False:
+                return True
+        return False
 
     def _reload_config_snapshot(self) -> None:
         self.config = BridgeConfig.from_mapping(self.raw_config)

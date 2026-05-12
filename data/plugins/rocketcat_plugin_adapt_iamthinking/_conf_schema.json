@@ -4,6 +4,16 @@
     "type": "bool",
     "default": true
   },
+  "enable_reactions": {
+    "description": "启用贴表情",
+    "type": "bool",
+    "default": true
+  },
+  "enable_typing_indicator": {
+    "description": "启用typing指示器",
+    "type": "bool",
+    "default": true
+  },
   "llm_thinking_reaction": {
     "description": "LLM 思考中贴表情shortcode",
     "hint": "不维护完整 QQ 表情映射表，只把思考中阶段归一为一个可配置的 Rocket.Chat shortcode。默认值为 :heart:。",

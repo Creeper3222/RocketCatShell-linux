@@ -7,15 +7,29 @@
 
 本项目的目标不是继续做一个“宿主里的桥接插件”，而是把 RocketCat 发展成一套真正独立的 `Rocket.Chat <-> OneBot v11` 桥接软件。
 
-这个 live 目录对应的是 RocketCatShell 的 Linux / Docker 迁移版：核心功能现已与 Windows `v0.1.4` rebuild 对齐，同时保留容器初始化、外部挂载目录和内置插件自动补种等 docker 化包装层。
+这个 live 目录对应的是 RocketCatShell 的 Linux / Docker 迁移版：核心功能现已与 Windows `v0.1.5` rebuild 对齐，同时保留容器初始化、外部挂载目录、内置插件自动补种，以及 Docker 专属共享媒体路径翻译 / Base64 兼容策略等 docker 化包装层。
 
-> 当前 README 对应版本为 `v0.1.4`。`v0.1.3` 是破坏性架构重构基线；本次 P0 / P1 / P2 三轮“最佳性能”优化统一归入 `v0.1.4` 更新。
+> 当前 README 对应版本为 `v0.1.5`。`v0.1.3` 是破坏性架构重构基线，`v0.1.4` 统一收口性能优化，而 `v0.1.5` 继续补齐内置指令、本地 typing 指示器适配和单实例启动保护。
 
 这意味着：
 
 - RocketCatShell 自己拥有 `config/`、`data/`、`logs/` 目录边界。
 - RocketCatShell 自己提供本地 WebUI、登录认证、Bot 管理和插件管理。
 - RocketCatShell 仍然可以作为 OneBot reverse WebSocket 客户端与 AstrBot 协同，但不再依赖 AstrBot 插件宿主才能运行。
+
+---
+
+## v0.1.5（内置指令与运维增强更新）
+
+`v0.1.5` 建立在 `v0.1.4` 的独立 Shell、热存储 runtime 和本地插件系统之上，重点不再是继续压热路径性能，而是补齐一层更适合日常使用与正式发布的本地控制能力。
+
+- 新增本地内置指令插件 `rocketcat_plugin_built_in_command`。它通过 Shell 插件系统直接拦截 Rocket.Chat 入站精确纯文本指令，目前实现 `#rocketcat` 与 `#system` 两条命令，不再要求上游 AstrBot 侧参与处理。
+- `#rocketcat` 用于返回当前桥接 Bot 的基础信息：包括客户端显示名、登录账号、显示昵称、OneBot self_id、连接状态和 Rocket.Chat 服务器地址，并追加发送 bot 头像与服务器 branding 头像，方便在房间内快速确认“当前是谁、连的是哪台、状态是否正常”。
+- `#system` 用于返回当前 RocketCatShell 进程所在环境的系统快照：包括版本号、Python 版本、主机名、系统信息、CPU 型号 / 核心数 / 主频 / 系统占用 / Shell 进程占用，以及内存总量 / 已用 / 可用 / 当前进程占用。Docker 版这里反映的是当前容器运行环境；该命令依赖新增运行依赖 `psutil`。
+- `rocketcat_plugin_adapt_iamthinking` 不再只做 reaction 映射。现在它可以在继续兼容 `set_msg_emoji_like` 的同时，把“思考中 / 已完成”阶段独立映射为 Rocket.Chat typing 指示器；reaction 与 typing 在插件设置页可分别开关，长时间思考还会自动续期 typing 心跳。
+- Shell 启动层新增单实例锁：同一项目目录下的第二个 RocketCatShell 会在 runtime 初始化之前直接退出，不再像旧行为那样因为 WebUI 端口回退而悄悄拉起第二份 runtime，从根源上避免重复订阅和重复上报。
+
+升级到 `v0.1.5` 不需要迁移 `v0.1.4` 的配置目录或 runtime 数据；Docker / Linux 版在更新源码后重新构建镜像，或直接运行 `launcher.sh` 时，会按 `requirements.txt` 自动检查并补装包括 `psutil` 在内的新增依赖。
 
 ---
 
@@ -54,11 +68,11 @@
 
 ## Linux / Docker 补充说明
 
-- `launcher.sh` 会先调用 `tools/check_requirements.py` 检查依赖，再在缺失或版本不兼容时自动安装并复检。
+- `launcher.sh` 会先调用 `tools/check_requirements.py` 检查依赖，再在缺失或版本不兼容时自动安装并复检；`v0.1.5` 新增的 `psutil` 也包含在这条自动补装链路里。
 - `Dockerfile` 会把 `tools/` 一并打进镜像，保证容器内和宿主机目录里的工具链一致。
-- `docker/entrypoint.sh` 仍负责容器首次启动时写入 `config/shell.json` 默认值，并在外部 volume 为空时补种内置插件。
+- `docker/entrypoint.sh` 仍负责容器首次启动时写入 `config/shell.json` 默认值，并在外部 volume 为空时补种内置插件；`rocketcat_plugin_built_in_command` 与 `rocketcat_plugin_adapt_iamthinking` 都会随镜像自动补种到外挂插件目录。
 - `docker-compose.yml`、`.env` 和 `.env.example` 已改为 Linux 风格的默认持久化路径 `/opt/rocketcatshell/...`，不再使用旧的 Windows `D:/docker/...` 示例。
-- 共享媒体导出仍保留在 Docker 版里：默认继续使用 `ROCKETCAT_SHARED_MEDIA_HOST_DIR` 路径传输，减少容器内临时文件与 Base64 膨胀；如果 AstrBot 和 RocketCatShell 同为 Docker 且更适合直接传 Base64，可在基础设置页启用 `enable_base64_media_transport`，或在首次启动前把 `.env` 里的 `ROCKETCAT_DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT=true`。
+- 共享媒体导出仍保留在 Docker 版里：默认继续使用 `ROCKETCAT_SHARED_MEDIA_HOST_DIR` 路径传输，把容器内共享媒体目录翻译为宿主机可见路径；只有在路径对上游不可见，或 AstrBot 与 RocketCatShell 同为 Docker、更适合直接传 Base64 时，才建议启用 `enable_base64_media_transport`，或在首次启动前把 `.env` 里的 `ROCKETCAT_DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT=true`。Base64 是兼容兜底，不是 Docker 版默认快路径。
 
 ---
 
@@ -108,7 +122,12 @@ AstrBot or other compatible OneBot-side workflow
 - 支持远端媒体下载、大小限制控制、本地临时文件落地和 Base64 媒体上传。
 - 支持 Rocket.Chat 官方 E2EE 私聊 / 私有群组文本与媒体收发。
 - 支持本地插件系统，可发现、启停、重载、卸载本地插件，并在运行时接管 OneBot action。
+- 支持内置指令系统插件 `rocketcat_plugin_built_in_command`，当前提供精确纯文本 `#rocketcat` 与 `#system` 两条本地命令。
+- `#rocketcat` 可在 Rocket.Chat 房间内直接返回当前桥接 Bot 基础信息、连接状态、OneBot self_id、bot 头像和服务器 branding 信息。
+- `#system` 可在 Rocket.Chat 房间内直接返回当前 Shell 环境的系统快照，用于快速查看版本、CPU、内存与进程占用状态。
 - [I Am Thinking](https://github.com/sssn-tech/astrbot_plugin_iamthinking) 适配能力已从核心桥接层剥离为本地插件 `rocketcat_plugin_adapt_iamthinking`。
+- `rocketcat_plugin_adapt_iamthinking` 现已支持把 `set_msg_emoji_like` 独立映射为 Rocket.Chat 贴表情与 typing 指示器，并允许分别开关。
+- 支持项目级单实例启动保护，阻止同一目录下重复拉起多份 RocketCatShell runtime。
 
 ---
 
@@ -125,7 +144,7 @@ AstrBot or other compatible OneBot-side workflow
 - `get_group_member_list`
 - `get_stranger_info`
 - `get_login_info`
-- `set_msg_emoji_like`：由本地插件决定是否处理；核心本身不再硬编码 I Am Thinking 逻辑
+- `set_msg_emoji_like`：由本地插件决定是否处理；当前 `rocketcat_plugin_adapt_iamthinking` 可把该动作映射为 Rocket.Chat reaction 与可选 typing 指示器
 
 ### 当前不支持的 OneBot 动作
 
@@ -254,7 +273,10 @@ RocketCatShell 当前已经拥有自己的本地插件系统，而不再只是�
 - 运行时重载插件
 - 卸载插件本体，并可选删除插件主配置与插件持久化数据
 
-当前 `rocketcat_plugin_adapt_iamthinking` 已作为本地插件存在，用于接管 `set_msg_emoji_like` 并把思考中 / 已完成态映射为 Rocket.Chat reaction shortcode。
+当前内置示例包括：
+
+- `rocketcat_plugin_built_in_command`：RocketCatShell 自有的内置指令系统插件。当前精确拦截 `#rocketcat` 与 `#system`，在本地直接回复，不再把命令正文继续交给上游；插件回复也会在入站侧抑制自回显再次上报。
+- `rocketcat_plugin_adapt_iamthinking`：用于接管 `set_msg_emoji_like`。除 reaction shortcode 映射外，现在还支持独立的 typing 指示器开关；bot 进入思考阶段时会触发 Rocket.Chat typing，应答结束时主动清除，长时间思考会自动续期心跳。
 
 ---
 
@@ -263,7 +285,7 @@ RocketCatShell 当前已经拥有自己的本地插件系统，而不再只是�
 | 项目 | 要求 |
 |------|------|
 | Python | `>= 3.11` |
-| 运行依赖 | `aiohttp`, `cryptography`, `fastapi`, `uvicorn`, `PyYAML` |
+| 运行依赖 | `aiohttp`, `cryptography`, `fastapi`, `orjson`, `psutil`, `uvicorn`, `PyYAML` |
 | Rocket.Chat | 需要可用的 REST API、DDP/WebSocket 和 E2EE 接口（如使用加密功能） |
 | OneBot 上游 | 需要可用的 OneBot v11 reverse WebSocket 服务 |
 
@@ -298,7 +320,7 @@ pip install -r requirements.txt
 docker compose up -d --build
 ```
 
-默认会把持久化目录挂到项目目录下的 `./config`、`./data/...` 和 `./logs`，共享图片缓存目录会显式挂到 `./data/bots/_shared_media`；如果你要改宿主机挂载位置，优先修改 `.env` 里的 `ROCKETCAT_*_DIR` 和 `ROCKETCAT_SHARED_MEDIA_HOST_DIR`。
+默认会把持久化目录挂到 `/opt/rocketcatshell/...`；如果你要改宿主机挂载位置，优先修改 `.env` 里的 `ROCKETCAT_*_DIR` 和 `ROCKETCAT_SHARED_MEDIA_HOST_DIR`。
 
 Docker 首次启动时，“基础设置”里的“启用 Base64 传输媒体”默认关闭；如果你希望新安装首次生成的 `shell.json` 直接开启它，可以在 `.env` 中把 `ROCKETCAT_DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT=true`。
 

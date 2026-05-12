@@ -1,0 +1,8 @@
+{
+  "enabled": {
+    "description": "启用内置指令",
+    "hint": "关闭后，RocketCatShell 不再拦截并处理 #rocketcat 与 #system 内置指令，消息将继续按原流程发送给下游。",
+    "type": "bool",
+    "default": true
+  }
+}
