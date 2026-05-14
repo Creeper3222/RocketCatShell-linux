@@ -429,6 +429,17 @@ class RocketChatClient:
             return ""
         return f"{normalized_server}/avatar/{quote(normalized_username, safe='')}"
 
+    def resolve_avatar_url(
+        self,
+        user_info: dict[str, Any] | None = None,
+        username: str | None = None,
+    ) -> str:
+        if isinstance(user_info, dict):
+            avatar_url = str(user_info.get("avatarUrl") or "").strip()
+            if avatar_url:
+                return avatar_url
+        return self.build_avatar_url(username)
+
     def build_server_logo_url(self) -> str:
         normalized_server = str(self.config.server_url or "").strip().rstrip("/")
         if not normalized_server:
@@ -778,8 +789,16 @@ class RocketChatClient:
         image_url: str,
         text: str = "",
         tmid: str | None = None,
+        *,
+        require_mappable_message: bool = True,
     ) -> dict[str, Any] | None:
-        return await self.media.send_image_url(room_id, image_url, text=text, tmid=tmid)
+        return await self.media.send_image_url(
+            room_id,
+            image_url,
+            text=text,
+            tmid=tmid,
+            require_mappable_message=require_mappable_message,
+        )
 
     async def send_image_file(
         self,
@@ -787,8 +806,16 @@ class RocketChatClient:
         file_path: str,
         description: str = "",
         tmid: str | None = None,
+        *,
+        require_mappable_message: bool = True,
     ) -> dict[str, Any] | None:
-        return await self.media.send_image_file(room_id, file_path, description=description, tmid=tmid)
+        return await self.media.send_image_file(
+            room_id,
+            file_path,
+            description=description,
+            tmid=tmid,
+            require_mappable_message=require_mappable_message,
+        )
 
     async def send_file(
         self,
@@ -797,6 +824,8 @@ class RocketChatClient:
         filename: str | None = None,
         description: str = "",
         tmid: str | None = None,
+        *,
+        require_mappable_message: bool = True,
     ) -> dict[str, Any] | None:
         return await self.media.send_file(
             room_id,
@@ -804,6 +833,7 @@ class RocketChatClient:
             filename=filename,
             description=description,
             tmid=tmid,
+            require_mappable_message=require_mappable_message,
         )
 
     async def send_remote_media_fallback(

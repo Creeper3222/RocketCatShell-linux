@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+import aiohttp
+
 from ..__init__ import __version__
 from ..bridge.hot_storage import build_runtime_hot_stores
 from ..bridge.id_map import DurableIdMap
@@ -614,6 +616,7 @@ class ShellManager:
         if runtime is not None:
             summary = await runtime.get_basic_info_summary()
             if summary is not None:
+                summary["avatar_url"] = self._build_basic_info_avatar_proxy_url(bot.bot_id)
                 return summary
 
         username = str(bot.username or "").strip()
@@ -639,6 +642,75 @@ class ShellManager:
         if not normalized_server or not normalized_username:
             return ""
         return f"{normalized_server}/avatar/{quote(normalized_username, safe='')}"
+
+    def _build_basic_info_avatar_proxy_url(self, bot_id: str) -> str:
+        normalized_bot_id = str(bot_id or "").strip()
+        if not normalized_bot_id:
+            return ""
+        return f"/api/basic-info/avatar?bot_id={quote(normalized_bot_id, safe='')}"
+
+    async def get_basic_info_avatar_content(self, bot_id: str) -> tuple[bytes, str] | None:
+        normalized_bot_id = str(bot_id or "").strip()
+        if not normalized_bot_id:
+            return None
+
+        runtime = self.runtimes.get(normalized_bot_id)
+        if runtime is None or runtime.rocketchat is None:
+            return None
+
+        client = runtime.rocketchat
+        if client._http_session is None:
+            return None
+
+        try:
+            user_info = await client.get_current_user_info()
+        except Exception as exc:
+            logger.warning(
+                "[RocketCatShell] 读取基础信息头像用户资料失败: bot_id=%s err=%r",
+                normalized_bot_id,
+                exc,
+            )
+            user_info = {}
+
+        username = str(
+            (user_info or {}).get("username")
+            or client.bot_username
+            or client.config.username
+            or ""
+        ).strip()
+        avatar_url = client.resolve_avatar_url(user_info if isinstance(user_info, dict) else None, username)
+        if not avatar_url:
+            return None
+
+        fetch_url = await client._normalize_media_url(avatar_url)
+        try:
+            async with client._http_session.get(
+                fetch_url,
+                timeout=aiohttp.ClientTimeout(total=15, connect=5),
+                allow_redirects=True,
+                max_redirects=3,
+            ) as resp:
+                if resp.status >= 400:
+                    logger.warning(
+                        "[RocketCatShell] 获取基础信息头像失败: bot_id=%s status=%s url=%s",
+                        normalized_bot_id,
+                        resp.status,
+                        avatar_url,
+                    )
+                    return None
+                content = await resp.read()
+                if not content:
+                    return None
+                content_type = str(resp.headers.get("Content-Type") or "application/octet-stream")
+                return content, content_type
+        except Exception as exc:
+            logger.warning(
+                "[RocketCatShell] 获取基础信息头像异常: bot_id=%s url=%s err=%r",
+                normalized_bot_id,
+                avatar_url,
+                exc,
+            )
+            return None
 
     def _should_fill_default_self_id(self, payload: dict[str, Any]) -> bool:
         if "onebot_self_id" not in payload:

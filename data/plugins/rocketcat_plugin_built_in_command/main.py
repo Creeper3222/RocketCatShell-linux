@@ -25,12 +25,14 @@ from rocketcat_shell.plugin_system.base import PluginExecutionContext, RocketCat
 _ROCKETCAT_COMMAND = "#rocketcat"
 _SYSTEM_COMMAND = "#system"
 _SYSTEM_CPU_SAMPLE_SECONDS = 0.2
+_SELF_ECHO_SUPPRESSION_TTL_SECONDS = 30.0
 
 
 class Plugin(RocketCatPlugin):
     def __init__(self, context, config: dict[str, Any]):
         super().__init__(context, config)
-        self._suppressed_self_echo_message_ids: set[str] = set()
+        self._suppressed_self_echo_message_ids: dict[str, float] = {}
+        self._suppressed_self_echo_signatures: dict[str, float] = {}
 
     async def on_load(self, runtime: PluginExecutionContext) -> None:
         logger.info(
@@ -41,6 +43,7 @@ class Plugin(RocketCatPlugin):
 
     async def on_unload(self, runtime: PluginExecutionContext) -> None:
         self._suppressed_self_echo_message_ids.clear()
+        self._suppressed_self_echo_signatures.clear()
         logger.info(
             "[RocketCatShell][Plugin:%s] 已从运行时 %s 卸载。",
             self.context.plugin_id,
@@ -53,7 +56,7 @@ class Plugin(RocketCatPlugin):
         raw_msg: dict[str, Any],
         runtime: PluginExecutionContext,
     ) -> bool | None:
-        if self._consume_suppressed_self_echo(raw_msg):
+        if self._consume_suppressed_self_echo(raw_msg, runtime):
             logger.info(
                 "[RocketCatShell][Plugin:%s] 已拦截内置指令回显上报。",
                 self.context.plugin_id,
@@ -192,7 +195,7 @@ class Plugin(RocketCatPlugin):
         normalized_nickname = nickname or normalized_login_username or client_name or "-"
         normalized_self_id = str(runtime.bridge_config.onebot_self_id or "").strip() or "-"
         normalized_server_url = str(runtime.bridge_config.server_url or "").strip() or "-"
-        bot_avatar_url = str(runtime.rocketchat.build_avatar_url(login_username) or "").strip()
+        bot_avatar_url = str(runtime.rocketchat.resolve_avatar_url(user_info, login_username) or "").strip()
 
         server_avatar_url = ""
         try:
@@ -501,6 +504,7 @@ class Plugin(RocketCatPlugin):
                     room_id,
                     normalized_image_url,
                     text=text,
+                    require_mappable_message=False,
                 )
             except Exception as exc:
                 logger.warning(
@@ -511,7 +515,7 @@ class Plugin(RocketCatPlugin):
                 )
             else:
                 if sent_message is not None:
-                    return sent_message
+                    return self._annotate_suppression_candidate(sent_message, room_id, text)
                 logger.warning(
                     "[RocketCatShell][Plugin:%s] 发送 %s 图文消息失败，准备降级为纯文本。",
                     self.context.plugin_id,
@@ -519,7 +523,10 @@ class Plugin(RocketCatPlugin):
                 )
 
         try:
-            return await runtime.rocketchat.send_text(room_id, text)
+            sent_message = await runtime.rocketchat.send_text(room_id, text)
+            if sent_message is None:
+                return None
+            return self._annotate_suppression_candidate(sent_message, room_id, text)
         except Exception as exc:
             logger.warning(
                 "[RocketCatShell][Plugin:%s] 发送 %s 纯文本消息失败: %r",
@@ -554,11 +561,84 @@ class Plugin(RocketCatPlugin):
             ]
         )
 
+    def _normalize_suppression_text(self, message_text: str) -> str:
+        normalized_message_text = str(message_text or "").replace("\r\n", "\n").replace("\r", "\n")
+        lines = [line.rstrip() for line in normalized_message_text.split("\n")]
+        return "\n".join(lines).strip()
+
+    def _build_suppression_signature(self, room_id: str, message_text: str) -> str:
+        normalized_room_id = str(room_id or "").strip()
+        normalized_message_text = self._normalize_suppression_text(message_text)
+        if not normalized_room_id or not normalized_message_text:
+            return ""
+        return f"{normalized_room_id}\n{normalized_message_text}"
+
+    def _is_runtime_self_message(
+        self,
+        raw_msg: dict[str, Any],
+        runtime: PluginExecutionContext,
+    ) -> bool:
+        sender = raw_msg.get("u") or {}
+        sender_id = str(sender.get("_id") or raw_msg.get("uid") or "").strip()
+        runtime_user_id = str(runtime.rocketchat.user_id or "").strip()
+        if sender_id and runtime_user_id and sender_id != runtime_user_id:
+            return False
+
+        sender_username = str(sender.get("username") or "").strip()
+        runtime_username = str(
+            runtime.rocketchat.bot_username
+            or runtime.bridge_config.username
+            or ""
+        ).strip()
+        if sender_username and runtime_username and sender_username != runtime_username:
+            return False
+
+        return True
+
+    def _prune_suppressed_self_echoes(self) -> None:
+        now = time.monotonic()
+        self._suppressed_self_echo_message_ids = {
+            source_id: expires_at
+            for source_id, expires_at in self._suppressed_self_echo_message_ids.items()
+            if expires_at > now
+        }
+        self._suppressed_self_echo_signatures = {
+            signature: expires_at
+            for signature, expires_at in self._suppressed_self_echo_signatures.items()
+            if expires_at > now
+        }
+
+    def _annotate_suppression_candidate(
+        self,
+        sent_message: dict[str, Any],
+        room_id: str,
+        message_text: str,
+    ) -> dict[str, Any]:
+        candidate = dict(sent_message or {})
+        candidate.setdefault("rid", room_id)
+        candidate["_rocketcat_expected_room_id"] = room_id
+        candidate["_rocketcat_expected_text"] = message_text
+        return candidate
+
     def _remember_suppressed_self_echoes(self, sent_messages: list[dict[str, Any]]) -> None:
+        self._prune_suppressed_self_echoes()
+        expires_at = time.monotonic() + _SELF_ECHO_SUPPRESSION_TTL_SECONDS
         for sent_message in sent_messages:
+            remembered = False
             source_message_id = str(sent_message.get("_id") or "").strip()
             if source_message_id:
-                self._suppressed_self_echo_message_ids.add(source_message_id)
+                self._suppressed_self_echo_message_ids[source_message_id] = expires_at
+                remembered = True
+
+            signature = self._build_suppression_signature(
+                str(sent_message.get("_rocketcat_expected_room_id") or sent_message.get("rid") or "").strip(),
+                str(sent_message.get("_rocketcat_expected_text") or sent_message.get("msg") or "").strip(),
+            )
+            if signature:
+                self._suppressed_self_echo_signatures[signature] = expires_at
+                remembered = True
+
+            if remembered:
                 continue
             logger.warning(
                 "[RocketCatShell][Plugin:%s] 内置指令回复缺少 source_id，无法抑制回显上报。",
@@ -580,11 +660,28 @@ class Plugin(RocketCatPlugin):
             return "✅"
         return "❌"
 
-    def _consume_suppressed_self_echo(self, raw_msg: dict[str, Any]) -> bool:
+    def _consume_suppressed_self_echo(
+        self,
+        raw_msg: dict[str, Any],
+        runtime: PluginExecutionContext,
+    ) -> bool:
+        if not self._is_runtime_self_message(raw_msg, runtime):
+            return False
+        self._prune_suppressed_self_echoes()
         source_message_id = str(raw_msg.get("_id") or "").strip()
-        if not source_message_id:
+        now = time.monotonic()
+        expires_at = self._suppressed_self_echo_message_ids.get(source_message_id)
+        if expires_at is not None and expires_at > now:
+            return True
+
+        signature = self._build_suppression_signature(
+            str(raw_msg.get("rid") or "").strip(),
+            str(raw_msg.get("msg") or raw_msg.get("text") or "").strip(),
+        )
+        signature_expires_at = self._suppressed_self_echo_signatures.get(signature)
+        if signature_expires_at is None or signature_expires_at <= now:
             return False
-        if source_message_id not in self._suppressed_self_echo_message_ids:
-            return False
-        self._suppressed_self_echo_message_ids.discard(source_message_id)
+
+        if source_message_id:
+            self._suppressed_self_echo_message_ids[source_message_id] = signature_expires_at
         return True

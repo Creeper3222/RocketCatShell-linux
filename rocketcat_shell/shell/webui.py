@@ -13,7 +13,7 @@ from typing import Any
 
 import uvicorn
 from fastapi import Body, FastAPI, HTTPException, Query, Request, status
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from ..logger import logger
@@ -133,7 +133,7 @@ class ShellWebUI:
         self._bound_socket: socket.socket | None = None
         self._log_buffer = BridgeLogBuffer(max_entries=5000)
         self._log_handler = BridgeLogHandler(self._log_buffer)
-        self._app = FastAPI(title="RocketCat Shell", version="v0.1.4")
+        self._app = FastAPI(title="RocketCat Shell", version="v0.1.5")
         self._static_dir = Path(__file__).resolve().parent / "static"
         self._login_file = self._static_dir / "login.html"
         self._setup_routes()
@@ -174,6 +174,7 @@ class ShellWebUI:
         self._app.add_api_route("/api/login", self._handle_login, methods=["POST"])
         self._app.add_api_route("/api/logout", self._handle_logout, methods=["POST"])
         self._app.add_api_route("/api/basic-info", self._handle_basic_info, methods=["GET"])
+        self._app.add_api_route("/api/basic-info/avatar", self._handle_basic_info_avatar, methods=["GET"])
         self._app.add_api_route("/api/settings", self._handle_settings, methods=["GET"])
         self._app.add_api_route("/api/settings", self._handle_update_settings, methods=["PUT"])
         self._app.add_api_route(
@@ -507,6 +508,13 @@ class ShellWebUI:
 
     async def _handle_basic_info(self) -> dict[str, Any]:
         return await self.manager.get_basic_info_state()
+
+    async def _handle_basic_info_avatar(self, bot_id: str = Query(default="")) -> Response:
+        avatar = await self.manager.get_basic_info_avatar_content(bot_id)
+        if avatar is None:
+            raise HTTPException(status_code=404, detail="基础信息头像不存在")
+        content, content_type = avatar
+        return Response(content=content, media_type=content_type)
 
     async def _handle_settings(self) -> dict[str, Any]:
         return await self.manager.get_settings_state()

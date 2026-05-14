@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Awaitable, Callable
 
+from rocketcat_shell.logger import logger
+
 from .config import BridgeConfig
 from .id_map import DurableIdMap
 from .rocketchat_client import RocketChatClient
@@ -16,6 +18,19 @@ def _ok(data: Any = None) -> dict[str, Any]:
 
 def _failed(wording: str, retcode: int = 1400) -> dict[str, Any]:
     return {"status": "failed", "retcode": retcode, "data": None, "wording": wording}
+
+
+def _describe_mapping_candidate(raw_message: Any) -> str:
+    if not isinstance(raw_message, dict):
+        return repr(raw_message)
+
+    return (
+        f"_id={str(raw_message.get('_id') or '-')} "
+        f"rid={str(raw_message.get('rid') or '-')} "
+        f"tmid={str(raw_message.get('tmid') or '-')} "
+        f"upload_file_id={str(raw_message.get('_upload_file_id') or '-')} "
+        f"keys={','.join(sorted(str(key) for key in raw_message.keys())) or '-'}"
+    )
 
 
 PluginActionDispatcher = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any] | None]]
@@ -145,6 +160,11 @@ class OneBotActionHandler:
 
             echoed_raw_message = await self._rocketchat.await_sent_message_echo(room_id)
             if not echoed_raw_message:
+                logger.warning(
+                    "[RocketChatOneBotBridge] 已发送消息未直接返回可映射 source_id，且等待自回显超时: room_id=%s candidate=%s",
+                    room_id,
+                    _describe_mapping_candidate(raw_message),
+                )
                 continue
 
             echoed_event = await self._inbound.translate(echoed_raw_message)
@@ -158,6 +178,11 @@ class OneBotActionHandler:
                 last_message_id = mapping.surrogate_id
 
         if last_message_id is None:
+            logger.error(
+                "[RocketChatOneBotBridge] 未能为已发送消息建立映射: room_id=%s candidates=%s",
+                room_id,
+                " | ".join(_describe_mapping_candidate(raw_message) for raw_message in raw_messages) or "-",
+            )
             raise RuntimeError("未能为已发送消息建立映射")
         return _ok({"message_id": last_message_id})
 

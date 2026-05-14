@@ -16,8 +16,14 @@ from .json_codec import json_dumps_compact, json_loads
 
 
 class RocketChatMediaBridge:
+    _PLAIN_UPLOAD_LEGACY_ENDPOINT = "rooms.upload"
+    _PLAIN_UPLOAD_MODERN_ENDPOINT = "rooms.media"
+    _ENDPOINT_COMPATIBILITY_FAILURE_STATUSES = {404, 405, 410, 501}
+    _UPLOAD_MESSAGE_ECHO_TIMEOUT = 5.0
+
     def __init__(self, client: Any) -> None:
         self.client = client
+        self._plain_upload_endpoint_preference: str | None = None
 
     def _resolve_shared_media_dir(self) -> str:
         target_dir = str(os.environ.get("ROCKETCAT_SHARED_MEDIA_DIR") or "").strip()
@@ -592,28 +598,257 @@ class RocketChatMediaBridge:
 
         return "application/octet-stream"
 
-    async def post_multipart_json(
+    def _normalize_plain_upload_endpoint(self, endpoint_name: str | None) -> str:
+        if endpoint_name == self._PLAIN_UPLOAD_MODERN_ENDPOINT:
+            return self._PLAIN_UPLOAD_MODERN_ENDPOINT
+        return self._PLAIN_UPLOAD_LEGACY_ENDPOINT
+
+    def _alternate_plain_upload_endpoint(self, endpoint_name: str | None) -> str:
+        normalized_endpoint = self._normalize_plain_upload_endpoint(endpoint_name)
+        if normalized_endpoint == self._PLAIN_UPLOAD_MODERN_ENDPOINT:
+            return self._PLAIN_UPLOAD_LEGACY_ENDPOINT
+        return self._PLAIN_UPLOAD_MODERN_ENDPOINT
+
+    def _build_plain_upload_url(self, endpoint_name: str | None, room_id: str) -> str:
+        normalized_endpoint = self._normalize_plain_upload_endpoint(endpoint_name)
+        return f"{self.client.config.server_url}/api/v1/{normalized_endpoint}/{room_id}"
+
+    def _summarize_response_body(self, body_text: str, limit: int = 240) -> str:
+        normalized = " ".join(str(body_text or "").split())
+        if not normalized:
+            return "-"
+        if len(normalized) <= limit:
+            return normalized
+        return f"{normalized[: limit - 3]}..."
+
+    def _is_plain_upload_endpoint_incompatible(self, result: dict[str, Any]) -> bool:
+        status = result.get("status")
+        if status in self._ENDPOINT_COMPATIBILITY_FAILURE_STATUSES:
+            return True
+
+        if result.get("ok"):
+            return False
+
+        content_type = str(result.get("content_type") or "").lower()
+        response_preview = self._summarize_response_body(str(result.get("text") or "")).lower()
+        if status == 404 and "not found" in response_preview:
+            return True
+        if status and status >= 400 and "text/plain" in content_type and "not found" in response_preview:
+            return True
+        return False
+
+    async def post_multipart_json_result(
         self,
         url: str,
         form: aiohttp.FormData,
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "ok": False,
+            "status": None,
+            "content_type": "",
+            "data": None,
+            "text": "",
+            "error": None,
+        }
         headers = {
             "X-Auth-Token": self.client.auth_token,
             "X-User-Id": self.client.user_id,
         }
         if self.client._http_session is None:
-            return None
+            result["error"] = "Rocket.Chat HTTP session 尚未初始化"
+            return result
 
         try:
             async with self.client._http_session.post(url, data=form, headers=headers) as resp:
-                data = await resp.json(content_type=None, loads=json_loads)
-                if resp.status >= 400 or not data.get("success", resp.status < 400):
-                    logger.error(f"[RocketChatOneBotBridge] 上传请求失败: status={resp.status} data={data}")
-                    return None
-                return data
+                result["status"] = resp.status
+                result["content_type"] = str(resp.headers.get("Content-Type") or "")
+                response_text = await resp.text()
+                result["text"] = response_text
+
+                parsed_data: dict[str, Any] | None = None
+                if response_text:
+                    try:
+                        candidate = json_loads(response_text)
+                    except Exception as exc:
+                        result["error"] = repr(exc)
+                    else:
+                        if isinstance(candidate, dict):
+                            parsed_data = candidate
+                        else:
+                            result["error"] = (
+                                f"unexpected JSON payload type: {type(candidate).__name__}"
+                            )
+                elif "json" in str(result["content_type"]).lower():
+                    result["error"] = "empty JSON response body"
+
+                result["data"] = parsed_data
+                if resp.status < 400 and isinstance(parsed_data, dict) and parsed_data.get("success", True):
+                    result["ok"] = True
+                    return result
+
+                if isinstance(parsed_data, dict):
+                    logger.error(
+                        "[RocketChatOneBotBridge] 上传请求失败: status=%s content_type=%s data=%s",
+                        resp.status,
+                        result["content_type"] or "-",
+                        parsed_data,
+                    )
+                else:
+                    logger.error(
+                        "[RocketChatOneBotBridge] 上传请求失败: status=%s content_type=%s body=%s parse_error=%s",
+                        resp.status,
+                        result["content_type"] or "-",
+                        self._summarize_response_body(response_text),
+                        result["error"] or "-",
+                    )
+                return result
         except Exception as exc:
+            result["error"] = repr(exc)
             logger.error(f"[RocketChatOneBotBridge] 上传请求异常: {exc!r}")
+            return result
+
+    async def post_multipart_json(
+        self,
+        url: str,
+        form: aiohttp.FormData,
+    ) -> Optional[dict[str, Any]]:
+        result = await self.post_multipart_json_result(url, form)
+        data = result.get("data")
+        if result.get("ok") and isinstance(data, dict):
+            return data
+        return None
+
+    async def _upload_plain_file_via_endpoint(
+        self,
+        endpoint_name: str,
+        room_id: str,
+        file_path: str,
+        resolved_name: str,
+        description: str = "",
+        tmid: Optional[str] = None,
+    ) -> dict[str, Any]:
+        url = self._build_plain_upload_url(endpoint_name, room_id)
+        with open(file_path, "rb") as fp:
+            form = aiohttp.FormData()
+            content_type = self.infer_upload_content_type(file_path, resolved_name)
+            form.add_field("file", fp, filename=resolved_name, content_type=content_type)
+            if description:
+                if endpoint_name == self._PLAIN_UPLOAD_LEGACY_ENDPOINT:
+                    form.add_field("msg", description)
+                else:
+                    form.add_field("description", description)
+                    form.add_field("msg", description)
+            if tmid:
+                form.add_field("tmid", tmid)
+            return await self.post_multipart_json_result(url, form)
+
+    def _build_plain_media_confirm_payload(
+        self,
+        *,
+        description: str = "",
+        tmid: Optional[str] = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if description:
+            payload["msg"] = description
+        if tmid:
+            payload["tmid"] = tmid
+        return payload
+
+    def _guess_suffix_from_content_type(
+        self,
+        content_type: str,
+        default_suffix: str,
+    ) -> str:
+        normalized_content_type = str(content_type or "").split(";", 1)[0].strip().lower()
+        if not normalized_content_type:
+            return default_suffix
+
+        if normalized_content_type == "image/svg+xml":
+            return ".svg"
+        if normalized_content_type == "image/jpeg":
+            return ".jpg"
+
+        guessed_suffix = mimetypes.guess_extension(normalized_content_type, strict=False)
+        if guessed_suffix:
+            return guessed_suffix
+        return default_suffix
+
+    async def _confirm_plain_uploaded_file(
+        self,
+        room_id: str,
+        upload_data: dict[str, Any],
+        *,
+        description: str = "",
+        tmid: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        uploaded_file = upload_data.get("file") or {}
+        if not isinstance(uploaded_file, dict):
+            logger.error(
+                "[RocketChatOneBotBridge] plain media upload 响应缺少 file 对象，无法继续 mediaConfirm: room_id=%s data=%s",
+                room_id,
+                upload_data,
+            )
             return None
+
+        file_id = str(uploaded_file.get("_id") or "").strip()
+        if not file_id:
+            logger.error(
+                "[RocketChatOneBotBridge] plain media upload 响应缺少 file._id，无法继续 mediaConfirm: room_id=%s data=%s",
+                room_id,
+                upload_data,
+            )
+            return None
+
+        payload = self._build_plain_media_confirm_payload(
+            description=description,
+            tmid=tmid,
+        )
+        data = await self.client._post_json_message(
+            f"{self.client.config.server_url}/api/v1/rooms.mediaConfirm/{room_id}/{file_id}",
+            payload,
+        )
+        if not data:
+            logger.warning(
+                "[RocketChatOneBotBridge] plain mediaConfirm 失败，准备回退到自回显兜底: room_id=%s file_id=%s",
+                room_id,
+                file_id,
+            )
+            return None
+
+        message = self._extract_uploaded_message(data)
+        if message is not None:
+            return message
+
+        logger.warning(
+            "[RocketChatOneBotBridge] plain mediaConfirm 成功但未直接返回消息，准备回退到自回显兜底: room_id=%s file_id=%s keys=%s",
+            room_id,
+            file_id,
+            ",".join(sorted(str(key) for key in data.keys())) or "-",
+        )
+        return data
+
+    async def _finalize_plain_upload_response(
+        self,
+        endpoint_name: str,
+        room_id: str,
+        upload_data: dict[str, Any],
+        *,
+        description: str = "",
+        tmid: Optional[str] = None,
+    ) -> dict[str, Any]:
+        if endpoint_name != self._PLAIN_UPLOAD_MODERN_ENDPOINT:
+            return upload_data
+        if self._extract_uploaded_message(upload_data) is not None:
+            return upload_data
+
+        confirmed_data = await self._confirm_plain_uploaded_file(
+            room_id,
+            upload_data,
+            description=description,
+            tmid=tmid,
+        )
+        return confirmed_data or upload_data
 
     async def upload_plain_file(
         self,
@@ -623,16 +858,65 @@ class RocketChatMediaBridge:
         description: str = "",
         tmid: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
-        url = f"{self.client.config.server_url}/api/v1/rooms.upload/{room_id}"
-        with open(file_path, "rb") as fp:
-            form = aiohttp.FormData()
-            content_type = self.infer_upload_content_type(file_path, resolved_name)
-            form.add_field("file", fp, filename=resolved_name, content_type=content_type)
-            if description:
-                form.add_field("description", description)
-            if tmid:
-                form.add_field("tmid", tmid)
-            return await self.post_multipart_json(url, form)
+        primary_endpoint = self._normalize_plain_upload_endpoint(self._plain_upload_endpoint_preference)
+        primary_result = await self._upload_plain_file_via_endpoint(
+            primary_endpoint,
+            room_id,
+            file_path,
+            resolved_name,
+            description=description,
+            tmid=tmid,
+        )
+        primary_data = primary_result.get("data")
+        if primary_result.get("ok") and isinstance(primary_data, dict):
+            self._plain_upload_endpoint_preference = primary_endpoint
+            return await self._finalize_plain_upload_response(
+                primary_endpoint,
+                room_id,
+                primary_data,
+                description=description,
+                tmid=tmid,
+            )
+
+        if not self._is_plain_upload_endpoint_incompatible(primary_result):
+            return None
+
+        fallback_endpoint = self._alternate_plain_upload_endpoint(primary_endpoint)
+        logger.warning(
+            "[RocketChatOneBotBridge] 检测到 plain upload 端点不兼容，准备回退: server=%s endpoint=%s status=%s content_type=%s body=%s",
+            self.client.config.server_url,
+            primary_endpoint,
+            primary_result.get("status") or "-",
+            primary_result.get("content_type") or "-",
+            self._summarize_response_body(str(primary_result.get("text") or "")),
+        )
+        fallback_result = await self._upload_plain_file_via_endpoint(
+            fallback_endpoint,
+            room_id,
+            file_path,
+            resolved_name,
+            description=description,
+            tmid=tmid,
+        )
+        fallback_data = fallback_result.get("data")
+        if fallback_result.get("ok") and isinstance(fallback_data, dict):
+            previous_endpoint = self._plain_upload_endpoint_preference
+            self._plain_upload_endpoint_preference = fallback_endpoint
+            if previous_endpoint != fallback_endpoint:
+                logger.info(
+                    "[RocketChatOneBotBridge] plain upload 端点已切换: server=%s from=%s to=%s",
+                    self.client.config.server_url,
+                    previous_endpoint or primary_endpoint,
+                    fallback_endpoint,
+                )
+            return await self._finalize_plain_upload_response(
+                fallback_endpoint,
+                room_id,
+                fallback_data,
+                description=description,
+                tmid=tmid,
+            )
+        return None
 
     async def upload_local_file(
         self,
@@ -658,6 +942,98 @@ class RocketChatMediaBridge:
             description=description,
             tmid=tmid,
         )
+
+    def _is_message_payload(self, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        source_id = str(payload.get("_id") or "").strip()
+        if not source_id:
+            return False
+        if str(payload.get("rid") or "").strip():
+            return True
+        if isinstance(payload.get("u"), dict):
+            return True
+        if payload.get("attachments") or payload.get("msg"):
+            return True
+        if str(payload.get("tmid") or "").strip():
+            return True
+        return False
+
+    def _extract_uploaded_message(self, upload_data: Any) -> Optional[dict[str, Any]]:
+        if self._is_message_payload(upload_data):
+            return upload_data
+        if not isinstance(upload_data, dict):
+            return None
+        nested_message = upload_data.get("message")
+        if self._is_message_payload(nested_message):
+            return nested_message
+        return None
+
+    def _build_unmapped_upload_placeholder(
+        self,
+        room_id: str,
+        upload_data: Any,
+        *,
+        tmid: Optional[str] = None,
+    ) -> dict[str, Any]:
+        placeholder: dict[str, Any] = {"rid": room_id}
+        if tmid:
+            placeholder["tmid"] = tmid
+        if isinstance(upload_data, dict):
+            uploaded_file = upload_data.get("file")
+            if isinstance(uploaded_file, dict):
+                file_id = str(uploaded_file.get("_id") or "").strip()
+                if file_id:
+                    placeholder["_upload_file_id"] = file_id
+        return placeholder
+
+    async def _resolve_uploaded_message(
+        self,
+        room_id: str,
+        upload_data: Any,
+        *,
+        media_kind: str,
+        tmid: Optional[str] = None,
+        require_mappable_message: bool = True,
+    ) -> Optional[dict[str, Any]]:
+        message = self._extract_uploaded_message(upload_data)
+        if message is not None:
+            return message
+        if upload_data is None:
+            return None
+
+        if not require_mappable_message:
+            if isinstance(upload_data, dict):
+                return upload_data
+            return self._build_unmapped_upload_placeholder(room_id, upload_data, tmid=tmid)
+
+        logger.info(
+            "[RocketChatOneBotBridge] %s发送结果未直接返回消息，等待自回显补全映射: room_id=%s",
+            media_kind,
+            room_id,
+        )
+        echoed_message = await self.client.await_sent_message_echo(
+            room_id,
+            timeout=self._UPLOAD_MESSAGE_ECHO_TIMEOUT,
+        )
+        if echoed_message is not None:
+            return echoed_message
+
+        if isinstance(upload_data, dict):
+            logger.warning(
+                "[RocketChatOneBotBridge] %s上传成功但未返回可映射消息，等待自回显超时: room_id=%s keys=%s",
+                media_kind,
+                room_id,
+                ",".join(sorted(str(key) for key in upload_data.keys())) or "-",
+            )
+        else:
+            logger.warning(
+                "[RocketChatOneBotBridge] %s上传成功但返回值不可映射，等待自回显超时: room_id=%s upload_data=%r",
+                media_kind,
+                room_id,
+                upload_data,
+            )
+        return self._build_unmapped_upload_placeholder(room_id, upload_data, tmid=tmid)
 
     def _is_e2ee_room_info(self, room_info: dict[str, Any]) -> bool:
         return bool(room_info.get("encrypted") and room_info.get("t") in {"d", "p"})
@@ -770,6 +1146,8 @@ class RocketChatMediaBridge:
         image_url: str,
         text: str = "",
         tmid: Optional[str] = None,
+        *,
+        require_mappable_message: bool = True,
     ) -> Optional[dict[str, Any]]:
         local_path, cleanup = await self.download_remote_media(image_url, ".png")
         if not local_path:
@@ -803,6 +1181,7 @@ class RocketChatMediaBridge:
                 local_path,
                 description=text,
                 tmid=tmid,
+                require_mappable_message=require_mappable_message,
             )
         finally:
             if cleanup:
@@ -814,6 +1193,8 @@ class RocketChatMediaBridge:
         file_path: str,
         description: str = "",
         tmid: Optional[str] = None,
+        *,
+        require_mappable_message: bool = True,
     ) -> Optional[dict[str, Any]]:
         try:
             filename = os.path.basename(file_path) or "image.png"
@@ -824,7 +1205,13 @@ class RocketChatMediaBridge:
                 description=description,
                 tmid=tmid,
             )
-            return (data or {}).get("message") or data
+            return await self._resolve_uploaded_message(
+                room_id,
+                data,
+                media_kind="图片",
+                tmid=tmid,
+                require_mappable_message=require_mappable_message,
+            )
         except FileNotFoundError:
             logger.error(f"[RocketChatOneBotBridge] 图片文件不存在: {file_path}")
             return None
@@ -839,6 +1226,8 @@ class RocketChatMediaBridge:
         filename: Optional[str] = None,
         description: str = "",
         tmid: Optional[str] = None,
+        *,
+        require_mappable_message: bool = True,
     ) -> Optional[dict[str, Any]]:
         try:
             resolved_name = filename or os.path.basename(file_path) or "attachment"
@@ -849,7 +1238,13 @@ class RocketChatMediaBridge:
                 description=description,
                 tmid=tmid,
             )
-            return (data or {}).get("message") or data
+            return await self._resolve_uploaded_message(
+                room_id,
+                data,
+                media_kind="文件",
+                tmid=tmid,
+                require_mappable_message=require_mappable_message,
+            )
         except FileNotFoundError:
             logger.error(f"[RocketChatOneBotBridge] 文件不存在: {file_path}")
             return None
@@ -862,6 +1257,7 @@ class RocketChatMediaBridge:
         url: str,
         default_suffix: str,
     ) -> tuple[str | None, Callable[[], None] | None]:
+        url = await self.client._normalize_media_url(url)
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"}:
             logger.warning(f"[RocketChatOneBotBridge] 鎷掔粷涓嬭浇涓嶆敮鎸佺殑濯掍綋鍗忚: {url}")
@@ -891,6 +1287,12 @@ class RocketChatMediaBridge:
                         f"[RocketChatOneBotBridge] 涓嬭浇濯掍綋澶辫触锛屾枃浠惰繃澶? {content_length} > {limit} ({url})"
                     )
                     return None, None
+
+                if not ext:
+                    suffix = self._guess_suffix_from_content_type(
+                        str(resp.headers.get("Content-Type") or ""),
+                        default_suffix,
+                    )
 
                 tmp = self._create_shared_media_temp_file(suffix)
                 tmp_path = tmp.name

@@ -9,7 +9,7 @@
 
 这个 live 目录对应的是 RocketCatShell 的 Linux / Docker 迁移版：核心功能现已与 Windows `v0.1.5` rebuild 对齐，同时保留容器初始化、外部挂载目录、内置插件自动补种，以及 Docker 专属共享媒体路径翻译 / Base64 兼容策略等 docker 化包装层。
 
-> 当前 README 对应版本为 `v0.1.5`。`v0.1.3` 是破坏性架构重构基线，`v0.1.4` 统一收口性能优化，而 `v0.1.5` 继续补齐内置指令、本地 typing 指示器适配和单实例启动保护。
+> 当前 README 对应版本为 `v0.1.5`。`v0.1.3` 是破坏性架构重构基线，`v0.1.4` 统一收口性能优化，而 `v0.1.5` 继续补齐内置指令、本地 typing 指示器适配、单实例启动保护，以及 Rocket.Chat 旧版 / 8.x 媒体上传兼容与 `#rocketcat` 新旧服兼容收口。
 
 这意味着：
 
@@ -21,10 +21,13 @@
 
 ## v0.1.5（内置指令与运维增强更新）
 
-`v0.1.5` 建立在 `v0.1.4` 的独立 Shell、热存储 runtime 和本地插件系统之上，重点不再是继续压热路径性能，而是补齐一层更适合日常使用与正式发布的本地控制能力。
+`v0.1.5` 建立在 `v0.1.4` 的独立 Shell、热存储 runtime 和本地插件系统之上，重点不再是继续压热路径性能，而是补齐一层更适合日常使用与正式发布的本地控制能力，并补上 Rocket.Chat 新旧上传接口并存时期的兼容缺口。
 
 - 新增本地内置指令插件 `rocketcat_plugin_built_in_command`。它通过 Shell 插件系统直接拦截 Rocket.Chat 入站精确纯文本指令，目前实现 `#rocketcat` 与 `#system` 两条命令，不再要求上游 AstrBot 侧参与处理。
 - `#rocketcat` 用于返回当前桥接 Bot 的基础信息：包括客户端显示名、登录账号、显示昵称、OneBot self_id、连接状态和 Rocket.Chat 服务器地址，并追加发送 bot 头像与服务器 branding 头像，方便在房间内快速确认“当前是谁、连的是哪台、状态是否正常”。
+- 媒体上传链路新增 plain upload 端点自适应：继续兼容旧版 Rocket.Chat 的 `rooms.upload/:rid`，并可在 `8.0.0+` 环境下自动回退到 `rooms.media/:rid`，修复 `#rocketcat` 中 bot 头像与 server branding 在 Rocket.Chat 8.0.1 等新服上退化为纯文本的问题。
+- Rocket.Chat 8.x 的 `rooms.media/:rid` 不再像旧 `rooms.upload/:rid` 那样直接完成发图消息创建，因此 plain 媒体上传现在会在上传成功后继续调用 `rooms.mediaConfirm/:rid/:fileId`，真正把图片或文件发进房间，并恢复后续消息映射链路；同时对同服远端媒体会自动补 `rc_uid/rc_token` 登录态并按响应 `Content-Type` 选择正确后缀，修复 `#rocketcat` 与 WebUI 基础信息页拿不到 bot 头像、或把默认 SVG 头像误当作 PNG 上传后显示损坏的问题。
+- `#rocketcat` 的插件直发媒体链路现在会在不需要 OneBot 映射时跳过 5 秒自回显等待，并把内置指令自回显抑制从一次性 `source_id` 扩展为短 TTL 的 `source_id + 房间/正文签名` 匹配，修复新旧服混跑时加密房间第二段回复超时和旧服非加密房间重复回显的问题。
 - `#system` 用于返回当前 RocketCatShell 进程所在环境的系统快照：包括版本号、Python 版本、主机名、系统信息、CPU 型号 / 核心数 / 主频 / 系统占用 / Shell 进程占用，以及内存总量 / 已用 / 可用 / 当前进程占用。Docker 版这里反映的是当前容器运行环境；该命令依赖新增运行依赖 `psutil`。
 - `rocketcat_plugin_adapt_iamthinking` 不再只做 reaction 映射。现在它可以在继续兼容 `set_msg_emoji_like` 的同时，把“思考中 / 已完成”阶段独立映射为 Rocket.Chat typing 指示器；reaction 与 typing 在插件设置页可分别开关，长时间思考还会自动续期 typing 心跳。
 - Shell 启动层新增单实例锁：同一项目目录下的第二个 RocketCatShell 会在 runtime 初始化之前直接退出，不再像旧行为那样因为 WebUI 端口回退而悄悄拉起第二份 runtime，从根源上避免重复订阅和重复上报。
