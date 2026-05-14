@@ -43,15 +43,48 @@ config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
 PY
 fi
 
-for plugin_dir in "$BUILTIN_PLUGINS_DIR"/*; do
-    if [ ! -d "$plugin_dir" ]; then
+python - <<'PY'
+import hashlib
+import shutil
+from pathlib import Path
+
+builtin_root = Path("/opt/rocketcat/builtin_plugins")
+plugins_root = Path("/app/data/plugins")
+
+
+def digest_dir(path: Path) -> str:
+    if not path.exists() or not path.is_dir():
+        return ""
+
+    digest = hashlib.sha256()
+    for file_path in sorted(item for item in path.rglob("*") if item.is_file()):
+        digest.update(file_path.relative_to(path).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(file_path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+for plugin_dir in builtin_root.iterdir():
+    if not plugin_dir.is_dir():
         continue
-    fi
-    plugin_name=$(basename "$plugin_dir")
-    if [ ! -e "$PLUGINS_DIR/$plugin_name" ]; then
-        cp -R "$plugin_dir" "$PLUGINS_DIR/$plugin_name"
-    fi
-done
+
+    target_dir = plugins_root / plugin_dir.name
+    if not target_dir.exists():
+        shutil.copytree(plugin_dir, target_dir)
+        print(f"[entrypoint] seeded builtin plugin: {plugin_dir.name}")
+        continue
+
+    if digest_dir(plugin_dir) == digest_dir(target_dir):
+        continue
+
+    if target_dir.is_dir():
+        shutil.rmtree(target_dir)
+    else:
+        target_dir.unlink()
+    shutil.copytree(plugin_dir, target_dir)
+    print(f"[entrypoint] refreshed builtin plugin: {plugin_dir.name}")
+PY
 
 if [ "$#" -eq 0 ]; then
     set -- python -m rocketcat_shell --no-browser

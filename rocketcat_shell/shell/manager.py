@@ -617,6 +617,8 @@ class ShellManager:
             summary = await runtime.get_basic_info_summary()
             if summary is not None:
                 summary["avatar_url"] = self._build_basic_info_avatar_proxy_url(bot.bot_id)
+                if summary.get("server_avatar_url"):
+                    summary["server_avatar_url"] = self._build_basic_info_server_avatar_proxy_url(bot.bot_id)
                 return summary
 
         username = str(bot.username or "").strip()
@@ -649,7 +651,13 @@ class ShellManager:
             return ""
         return f"/api/basic-info/avatar?bot_id={quote(normalized_bot_id, safe='')}"
 
-    async def get_basic_info_avatar_content(self, bot_id: str) -> tuple[bytes, str] | None:
+    def _build_basic_info_server_avatar_proxy_url(self, bot_id: str) -> str:
+        normalized_bot_id = str(bot_id or "").strip()
+        if not normalized_bot_id:
+            return ""
+        return f"/api/basic-info/server-avatar?bot_id={quote(normalized_bot_id, safe='')}"
+
+    def _get_basic_info_runtime_client(self, bot_id: str):
         normalized_bot_id = str(bot_id or "").strip()
         if not normalized_bot_id:
             return None
@@ -660,6 +668,64 @@ class ShellManager:
 
         client = runtime.rocketchat
         if client._http_session is None:
+            return None
+        return client
+
+    async def _fetch_basic_info_media_content(
+        self,
+        bot_id: str,
+        media_url: str,
+        *,
+        asset_label: str,
+    ) -> tuple[bytes, str] | None:
+        normalized_bot_id = str(bot_id or "").strip()
+        client = self._get_basic_info_runtime_client(normalized_bot_id)
+        if client is None:
+            return None
+
+        normalized_media_url = str(media_url or "").strip()
+        if not normalized_media_url:
+            return None
+
+        fetch_url = await client._normalize_media_url(normalized_media_url)
+        try:
+            async with client._http_session.get(
+                fetch_url,
+                timeout=aiohttp.ClientTimeout(total=15, connect=5),
+                allow_redirects=True,
+                max_redirects=3,
+            ) as resp:
+                if resp.status >= 400:
+                    logger.warning(
+                        "[RocketCatShell] 获取基础信息%s失败: bot_id=%s status=%s url=%s",
+                        asset_label,
+                        normalized_bot_id,
+                        resp.status,
+                        normalized_media_url,
+                    )
+                    return None
+                content = await resp.read()
+                if not content:
+                    return None
+                content_type = str(resp.headers.get("Content-Type") or "application/octet-stream")
+                return content, content_type
+        except Exception as exc:
+            logger.warning(
+                "[RocketCatShell] 获取基础信息%s异常: bot_id=%s url=%s err=%r",
+                asset_label,
+                normalized_bot_id,
+                normalized_media_url,
+                exc,
+            )
+            return None
+
+    async def get_basic_info_avatar_content(self, bot_id: str) -> tuple[bytes, str] | None:
+        normalized_bot_id = str(bot_id or "").strip()
+        if not normalized_bot_id:
+            return None
+
+        client = self._get_basic_info_runtime_client(normalized_bot_id)
+        if client is None:
             return None
 
         try:
@@ -682,35 +748,44 @@ class ShellManager:
         if not avatar_url:
             return None
 
-        fetch_url = await client._normalize_media_url(avatar_url)
+        return await self._fetch_basic_info_media_content(
+            normalized_bot_id,
+            avatar_url,
+            asset_label="头像",
+        )
+
+    async def get_basic_info_server_avatar_content(self, bot_id: str) -> tuple[bytes, str] | None:
+        normalized_bot_id = str(bot_id or "").strip()
+        if not normalized_bot_id:
+            return None
+
+        client = self._get_basic_info_runtime_client(normalized_bot_id)
+        if client is None:
+            return None
+
         try:
-            async with client._http_session.get(
-                fetch_url,
-                timeout=aiohttp.ClientTimeout(total=15, connect=5),
-                allow_redirects=True,
-                max_redirects=3,
-            ) as resp:
-                if resp.status >= 400:
-                    logger.warning(
-                        "[RocketCatShell] 获取基础信息头像失败: bot_id=%s status=%s url=%s",
-                        normalized_bot_id,
-                        resp.status,
-                        avatar_url,
-                    )
-                    return None
-                content = await resp.read()
-                if not content:
-                    return None
-                content_type = str(resp.headers.get("Content-Type") or "application/octet-stream")
-                return content, content_type
+            server_branding_summary = await client.get_server_branding_summary()
         except Exception as exc:
             logger.warning(
-                "[RocketCatShell] 获取基础信息头像异常: bot_id=%s url=%s err=%r",
+                "[RocketCatShell] 读取基础信息服务器头像品牌信息失败: bot_id=%s err=%r",
                 normalized_bot_id,
-                avatar_url,
                 exc,
             )
+            server_branding_summary = None
+
+        server_avatar_url = ""
+        if server_branding_summary:
+            server_avatar_url = str(server_branding_summary.get("avatar_url") or "").strip()
+        if not server_avatar_url:
+            server_avatar_url = str(client.build_server_logo_url() or "").strip()
+        if not server_avatar_url:
             return None
+
+        return await self._fetch_basic_info_media_content(
+            normalized_bot_id,
+            server_avatar_url,
+            asset_label="服务器头像",
+        )
 
     def _should_fill_default_self_id(self, payload: dict[str, Any]) -> bool:
         if "onebot_self_id" not in payload:

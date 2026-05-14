@@ -175,6 +175,7 @@ class ShellWebUI:
         self._app.add_api_route("/api/logout", self._handle_logout, methods=["POST"])
         self._app.add_api_route("/api/basic-info", self._handle_basic_info, methods=["GET"])
         self._app.add_api_route("/api/basic-info/avatar", self._handle_basic_info_avatar, methods=["GET"])
+        self._app.add_api_route("/api/basic-info/server-avatar", self._handle_basic_info_server_avatar, methods=["GET"])
         self._app.add_api_route("/api/settings", self._handle_settings, methods=["GET"])
         self._app.add_api_route("/api/settings", self._handle_update_settings, methods=["PUT"])
         self._app.add_api_route(
@@ -513,6 +514,13 @@ class ShellWebUI:
         avatar = await self.manager.get_basic_info_avatar_content(bot_id)
         if avatar is None:
             raise HTTPException(status_code=404, detail="基础信息头像不存在")
+        content, content_type = avatar
+        return Response(content=content, media_type=content_type)
+
+    async def _handle_basic_info_server_avatar(self, bot_id: str = Query(default="")) -> Response:
+        avatar = await self.manager.get_basic_info_server_avatar_content(bot_id)
+        if avatar is None:
+            raise HTTPException(status_code=404, detail="基础信息服务器头像不存在")
         content, content_type = avatar
         return Response(content=content, media_type=content_type)
 

@@ -73,7 +73,7 @@
 
 - `launcher.sh` 会先调用 `tools/check_requirements.py` 检查依赖，再在缺失或版本不兼容时自动安装并复检；`v0.1.5` 新增的 `psutil` 也包含在这条自动补装链路里。
 - `Dockerfile` 会把 `tools/` 一并打进镜像，保证容器内和宿主机目录里的工具链一致。
-- `docker/entrypoint.sh` 仍负责容器首次启动时写入 `config/shell.json` 默认值，并在外部 volume 为空时补种内置插件；`rocketcat_plugin_built_in_command` 与 `rocketcat_plugin_adapt_iamthinking` 都会随镜像自动补种到外挂插件目录。
+- `docker/entrypoint.sh` 仍负责容器首次启动时写入 `config/shell.json` 默认值，并对外挂 `data/plugins` 中的内置插件执行缺失补种与版本变更自动刷新；`rocketcat_plugin_built_in_command` 与 `rocketcat_plugin_adapt_iamthinking` 都会随镜像自动同步到外挂插件目录。
 - `docker-compose.yml`、`.env` 和 `.env.example` 已改为 Linux 风格的默认持久化路径 `/opt/rocketcatshell/...`，不再使用旧的 Windows `D:/docker/...` 示例。
 - 共享媒体导出仍保留在 Docker 版里：默认继续使用 `ROCKETCAT_SHARED_MEDIA_HOST_DIR` 路径传输，把容器内共享媒体目录翻译为宿主机可见路径；只有在路径对上游不可见，或 AstrBot 与 RocketCatShell 同为 Docker、更适合直接传 Base64 时，才建议启用 `enable_base64_media_transport`，或在首次启动前把 `.env` 里的 `ROCKETCAT_DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT=true`。Base64 是兼容兜底，不是 Docker 版默认快路径。
 
