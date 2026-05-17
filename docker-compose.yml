@@ -1,8 +1,7 @@
 services:
   rocketcatshell:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: 138763327/rocketcatshell-linux:latest
+    pull_policy: always
     container_name: ${ROCKETCAT_CONTAINER_NAME:-rocketcatshell}
     restart: unless-stopped
     ports:
