@@ -323,39 +323,17 @@ class RocketChatMediaBridge:
             "link",
         )
 
-        def collect_candidates(source: dict[str, Any]) -> None:
-            files_raw = source.get("files", [])
-            if isinstance(files_raw, dict):
-                candidates.append(files_raw)
-            elif isinstance(files_raw, list):
-                candidates.extend([item for item in files_raw if isinstance(item, dict)])
-
-            for key in ("file", "fileUpload"):
-                single_file = source.get(key)
-                if isinstance(single_file, dict):
-                    candidates.append(single_file)
-
-            if any(source.get(key) for key in media_shaped_keys):
-                candidates.append(source)
-
-        collect_candidates(payload)
-        for attachment in self.get_all_attachments_recursive(
-            payload,
-            skip_quote_attachments=skip_quote_attachments,
-        ):
-            collect_candidates(attachment)
-
-        for candidate in candidates:
+        async def append_candidate(candidate: dict[str, Any]) -> None:
             kind = self.classify_file_kind(candidate)
             materialized = await self._materialize_media_reference(candidate, kind)
             if not materialized:
-                continue
+                return
             file_ref = str(materialized.get("path") or materialized.get("url") or "")
             if not file_ref:
-                continue
+                return
             key = (kind, file_ref)
             if key in seen:
-                continue
+                return
             seen.add(key)
             media.append(
                 {
@@ -365,6 +343,40 @@ class RocketChatMediaBridge:
                     "path": str(materialized.get("path") or ""),
                 }
             )
+
+        async def process_source(source: dict[str, Any]) -> None:
+            files_raw = source.get("files", [])
+            if isinstance(files_raw, dict):
+                await append_candidate(files_raw)
+            elif isinstance(files_raw, list):
+                for item in files_raw:
+                    if isinstance(item, dict):
+                        await append_candidate(item)
+
+            for key in ("file", "fileUpload"):
+                single_file = source.get(key)
+                if isinstance(single_file, dict):
+                    await append_candidate(single_file)
+
+            if self._has_media_shaped_value(source, media_shaped_keys):
+                await append_candidate(source)
+
+        fast_candidates = self._can_fast_extract_attachment_descriptors(
+            payload,
+            skip_quote_attachments=skip_quote_attachments,
+            include_url_images=include_url_images,
+        )
+        if fast_candidates is not None:
+            for candidate in fast_candidates:
+                await append_candidate(candidate)
+            return media
+
+        await process_source(payload)
+        for attachment in self._iter_attachment_sources(
+            payload,
+            skip_quote_attachments=skip_quote_attachments,
+        ):
+            await process_source(attachment)
 
         if include_url_images:
             for url_obj in payload.get("urls", []):
@@ -1359,7 +1371,7 @@ class RocketChatMediaBridge:
         url = await self.client._normalize_media_url(url)
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"}:
-            logger.warning(f"[RocketChatOneBotBridge] 鎷掔粷涓嬭浇涓嶆敮鎸佺殑濯掍綋鍗忚: {url}")
+            logger.warning(f"[RocketChatOneBotBridge] 拒绝下载不支持的媒体协议: {url}")
             return None, None
         if self.client._http_session is None:
             return None, None
@@ -1376,14 +1388,14 @@ class RocketChatMediaBridge:
                 max_redirects=3,
             ) as resp:
                 if resp.status >= 400:
-                    logger.error(f"[RocketChatOneBotBridge] 涓嬭浇濯掍綋澶辫触 {resp.status}: {url}")
+                    logger.error(f"[RocketChatOneBotBridge] 下载媒体失败 {resp.status}: {url}")
                     return None, None
 
                 limit = self.client.config.remote_media_max_size
                 content_length = resp.content_length
                 if content_length is not None and content_length > limit:
                     logger.error(
-                        f"[RocketChatOneBotBridge] 涓嬭浇濯掍綋澶辫触锛屾枃浠惰繃澶? {content_length} > {limit} ({url})"
+                        f"[RocketChatOneBotBridge] 下载媒体失败，文件过大: {content_length} > {limit} ({url})"
                     )
                     return None, None
 
@@ -1401,7 +1413,7 @@ class RocketChatMediaBridge:
                         downloaded += len(chunk)
                         if downloaded > limit:
                             logger.error(
-                                f"[RocketChatOneBotBridge] 涓嬭浇濯掍綋澶辫触锛屾枃浠惰秴杩囬檺鍒? {downloaded} > {limit} ({url})"
+                                f"[RocketChatOneBotBridge] 下载媒体失败，文件超过限制: {downloaded} > {limit} ({url})"
                             )
                             tmp.close()
                             os.unlink(tmp_path)
@@ -1415,7 +1427,7 @@ class RocketChatMediaBridge:
                         os.unlink(tmp_path)
                     raise
         except Exception as exc:
-            logger.error(f"[RocketChatOneBotBridge] 涓嬭浇濯掍綋寮傚父: {exc!r}")
+            logger.error(f"[RocketChatOneBotBridge] 下载媒体异常: {exc!r}")
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
             return None, None
@@ -1430,7 +1442,7 @@ class RocketChatMediaBridge:
         estimated_size = (len(encoded) // 4) * 3
         if estimated_size > limit + 2:
             logger.error(
-                f"[RocketChatOneBotBridge] Base64 濯掍綋澶勭悊澶辫触锛屾枃浠惰繃澶? {estimated_size} > {limit}"
+                f"[RocketChatOneBotBridge] Base64 媒体处理失败，文件过大: {estimated_size} > {limit}"
             )
             return None, None
 
@@ -1442,7 +1454,7 @@ class RocketChatMediaBridge:
 
         if len(raw) > limit:
             logger.error(
-                f"[RocketChatOneBotBridge] Base64 濯掍綋澶勭悊澶辫触锛屾枃浠惰秴杩囬檺鍒? {len(raw)} > {limit}"
+                f"[RocketChatOneBotBridge] Base64 媒体处理失败，文件超过限制: {len(raw)} > {limit}"
             )
             return None, None
 

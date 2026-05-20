@@ -286,7 +286,7 @@ class RocketChatClient:
                 raise
             except Exception as exc:
                 logger.error(
-                    "[RocketChatOneBotBridge] Rocket.Chat inbound worker 澶勭悊娑堟伅寮傚父: %r",
+                    "[RocketChatOneBotBridge] Rocket.Chat inbound worker 处理消息异常: %r",
                     exc,
                 )
             finally:

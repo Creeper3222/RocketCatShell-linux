@@ -311,7 +311,7 @@ class RocketCatPluginManager:
             return instance.get_handled_actions()
         except Exception as exc:
             logger.warning(
-                "[RocketCatShell] 鑾峰彇鎻掍欢 %s action 绱㈠紩澶辫触: %r",
+                "[RocketCatShell] 获取插件 %s action 索引失败: %r",
                 instance.context.plugin_id,
                 exc,
             )
