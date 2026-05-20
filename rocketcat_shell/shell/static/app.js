@@ -25,6 +25,9 @@ const state = {
   bots: [],
   status: null,
   currentPage: 'network',
+  network: {
+    pollTimer: null,
+  },
   settings: {
     data: null,
     loaded: false,
@@ -36,6 +39,11 @@ const state = {
       online_count: 0,
     },
     loaded: false,
+  },
+  diagnostics: {
+    data: null,
+    loaded: false,
+    pollTimer: null,
   },
   logs: {
     items: [],
@@ -74,6 +82,7 @@ function buildCreateDefaults() {
 const elements = {
   navButtons: Array.from(document.querySelectorAll('[data-page]')),
   networkPage: document.getElementById('networkPage'),
+  diagnosticsPage: document.getElementById('diagnosticsPage'),
   basicPage: document.getElementById('basicPage'),
   logsPage: document.getElementById('logsPage'),
   settingsPage: document.getElementById('settingsPage'),
@@ -94,6 +103,34 @@ const elements = {
   basicEmptyState: document.getElementById('basicEmptyState'),
   basicEnabledCount: document.getElementById('basicEnabledCount'),
   basicOnlineCount: document.getElementById('basicOnlineCount'),
+  diagnosticsRefreshButton: document.getElementById('diagnosticsRefreshButton'),
+  diagnosticsCpuSummary: document.getElementById('diagnosticsCpuSummary'),
+  diagnosticsCpuCores: document.getElementById('diagnosticsCpuCores'),
+  diagnosticsCpuFrequency: document.getElementById('diagnosticsCpuFrequency'),
+  diagnosticsProcessCpuUsage: document.getElementById('diagnosticsProcessCpuUsage'),
+  diagnosticsCpuRing: document.getElementById('diagnosticsCpuRing'),
+  diagnosticsCpuProcessRing: document.getElementById('diagnosticsCpuProcessRing'),
+  diagnosticsCpuMeterValue: document.getElementById('diagnosticsCpuMeterValue'),
+  diagnosticsCpuMeterDetail: document.getElementById('diagnosticsCpuMeterDetail'),
+  diagnosticsCpuMeterSystem: document.getElementById('diagnosticsCpuMeterSystem'),
+  diagnosticsCpuMeterProcess: document.getElementById('diagnosticsCpuMeterProcess'),
+  diagnosticsMemorySummary: document.getElementById('diagnosticsMemorySummary'),
+  diagnosticsMemoryAvailable: document.getElementById('diagnosticsMemoryAvailable'),
+  diagnosticsMemoryProcess: document.getElementById('diagnosticsMemoryProcess'),
+  diagnosticsMemoryTotal: document.getElementById('diagnosticsMemoryTotal'),
+  diagnosticsMemoryRing: document.getElementById('diagnosticsMemoryRing'),
+  diagnosticsMemoryProcessRing: document.getElementById('diagnosticsMemoryProcessRing'),
+  diagnosticsMemoryMeterValue: document.getElementById('diagnosticsMemoryMeterValue'),
+  diagnosticsMemoryMeterDetail: document.getElementById('diagnosticsMemoryMeterDetail'),
+  diagnosticsMemoryMeterSystem: document.getElementById('diagnosticsMemoryMeterSystem'),
+  diagnosticsMemoryMeterProcess: document.getElementById('diagnosticsMemoryMeterProcess'),
+  diagnosticsSnapshotTime: document.getElementById('diagnosticsSnapshotTime'),
+  diagnosticsHostNote: document.getElementById('diagnosticsHostNote'),
+  diagnosticsCacheNote: document.getElementById('diagnosticsCacheNote'),
+  diagnosticsOnlineCount: document.getElementById('diagnosticsOnlineCount'),
+  diagnosticsRuntimeStorage: document.getElementById('diagnosticsRuntimeStorage'),
+  diagnosticsGrid: document.getElementById('diagnosticsGrid'),
+  diagnosticsEmptyState: document.getElementById('diagnosticsEmptyState'),
   banner: document.getElementById('statusBanner'),
   botGrid: document.getElementById('botGrid'),
   emptyState: document.getElementById('emptyState'),
@@ -268,6 +305,7 @@ async function pickJsonTextForImport() {
 function setActivePage(page) {
   state.currentPage = page;
   elements.networkPage.classList.toggle('hidden', page !== 'network');
+  elements.diagnosticsPage.classList.toggle('hidden', page !== 'diagnostics');
   elements.basicPage.classList.toggle('hidden', page !== 'basic');
   elements.logsPage.classList.toggle('hidden', page !== 'logs');
   elements.settingsPage.classList.toggle('hidden', page !== 'settings');
@@ -284,6 +322,18 @@ function setActivePage(page) {
     startLogPolling();
   } else {
     stopLogPolling();
+  }
+
+  if (page === 'network') {
+    startNetworkPolling();
+  } else {
+    stopNetworkPolling();
+  }
+
+  if (page === 'diagnostics') {
+    startDiagnosticsPolling();
+  } else {
+    stopDiagnosticsPolling();
   }
 }
 
@@ -320,6 +370,14 @@ function buildBasicInfoFallback() {
 
 async function activatePage(page, { forceReload = false } = {}) {
   setActivePage(page);
+  if (page === 'network') {
+    await loadData();
+    return;
+  }
+  if (page === 'diagnostics') {
+    await loadDiagnostics({ forceReload, silent: false });
+    return;
+  }
   if (page === 'basic') {
     await loadBasicInfo({ forceReload, silent: false });
     return;
@@ -341,6 +399,199 @@ function getBasicStatusTone(statusCode) {
     return 'blocked';
   }
   return 'pending';
+}
+
+function getDiagnosticStatusTone(statusCode) {
+  if (statusCode === 'online') {
+    return 'online';
+  }
+  if (statusCode === 'disabled') {
+    return 'blocked';
+  }
+  return 'pending';
+}
+
+function formatDiagnosticBytes(value) {
+  const normalized = Number(value);
+  if (!Number.isFinite(normalized) || normalized < 0) {
+    return '-';
+  }
+  if (normalized < 1024) {
+    return `${Math.trunc(normalized)} B`;
+  }
+  if (normalized < 1024 ** 2) {
+    return `${(normalized / 1024).toFixed(2)} KB`;
+  }
+  if (normalized < 1024 ** 3) {
+    return `${(normalized / (1024 ** 2)).toFixed(2)} MB`;
+  }
+  return `${(normalized / (1024 ** 3)).toFixed(2)} GB`;
+}
+
+function formatDiagnosticTime(value) {
+  const normalized = Number(value);
+  if (!Number.isFinite(normalized) || normalized <= 0) {
+    return '-';
+  }
+  const date = new Date(normalized * 1000);
+  if (Number.isNaN(date.getTime())) {
+    return '-';
+  }
+  const elapsedSeconds = Math.max(0, Math.floor(Date.now() / 1000 - normalized));
+  let ageLabel = `${elapsedSeconds}s 前`;
+  if (elapsedSeconds >= 86400) {
+    ageLabel = `${Math.floor(elapsedSeconds / 86400)}d 前`;
+  } else if (elapsedSeconds >= 3600) {
+    ageLabel = `${Math.floor(elapsedSeconds / 3600)}h 前`;
+  } else if (elapsedSeconds >= 60) {
+    ageLabel = `${Math.floor(elapsedSeconds / 60)}m 前`;
+  }
+  const dateLabel = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}:${String(date.getSeconds()).padStart(2, '0')}`;
+  return `${dateLabel} (${ageLabel})`;
+}
+
+function formatDiagnosticDuration(value) {
+  const normalized = Number(value);
+  if (!Number.isFinite(normalized) || normalized < 0) {
+    return '-';
+  }
+  if (normalized < 1) {
+    return '<1 秒';
+  }
+  if (normalized < 10) {
+    return `${normalized.toFixed(1)} 秒`;
+  }
+  if (normalized < 60) {
+    return `${Math.round(normalized)} 秒`;
+  }
+  if (normalized < 3600) {
+    const minutes = Math.floor(normalized / 60);
+    const seconds = Math.round(normalized % 60);
+    return seconds > 0 ? `${minutes} 分 ${seconds} 秒` : `${minutes} 分`;
+  }
+  const hours = Math.floor(normalized / 3600);
+  const minutes = Math.floor((normalized % 3600) / 60);
+  return minutes > 0 ? `${hours} 小时 ${minutes} 分` : `${hours} 小时`;
+}
+
+function clampDiagnosticPercent(value) {
+  const normalized = Number(value);
+  if (!Number.isFinite(normalized)) {
+    return 0;
+  }
+  return Math.max(0, Math.min(normalized, 100));
+}
+
+function formatDiagnosticPercentLabel(value) {
+  const normalized = clampDiagnosticPercent(value);
+  if (normalized === 0) {
+    return '0%';
+  }
+  if (normalized < 10) {
+    return `${normalized.toFixed(1)}%`;
+  }
+  return `${normalized.toFixed(0)}%`;
+}
+
+function getDiagnosticVisibleInnerPercent(value) {
+  const normalized = clampDiagnosticPercent(value);
+  if (normalized <= 0) {
+    return 0;
+  }
+  return Math.max(normalized, 2.5);
+}
+
+function setDiagnosticsMeter(circleElement, percent) {
+  if (!circleElement) {
+    return;
+  }
+  const normalized = clampDiagnosticPercent(percent);
+  circleElement.style.strokeDasharray = `${normalized} 100`;
+}
+
+function getDiagnosticsCacheStatusLabel(cacheMeta) {
+  const status = String(cacheMeta?.cache_status || '').trim().toLowerCase();
+  if (status === 'hit') {
+    return '缓存命中';
+  }
+  if (status === 'miss') {
+    return '实时采样';
+  }
+  if (status === 'disabled') {
+    return '缓存关闭';
+  }
+  if (status === 'error') {
+    return '采样失败';
+  }
+  return '状态未知';
+}
+
+function getDiagnosticAuthLabel(authState) {
+  const normalized = String(authState || '').trim().toLowerCase();
+  if (normalized === 'authenticated') {
+    return '已认证';
+  }
+  if (normalized === 'partial') {
+    return '部分认证';
+  }
+  if (normalized === 'disconnected') {
+    return '未认证';
+  }
+  return String(authState || '-').trim() || '-';
+}
+
+function stopNetworkPolling() {
+  if (state.network.pollTimer) {
+    window.clearTimeout(state.network.pollTimer);
+    state.network.pollTimer = null;
+  }
+}
+
+function startNetworkPolling() {
+  stopNetworkPolling();
+  if (state.currentPage !== 'network') {
+    return;
+  }
+  state.network.pollTimer = window.setTimeout(async () => {
+    try {
+      await loadData();
+    } catch (error) {
+      if (!isAbortError(error)) {
+        console.warn(error);
+      }
+    } finally {
+      if (state.currentPage === 'network') {
+        startNetworkPolling();
+      }
+    }
+  }, 10000);
+}
+
+function stopDiagnosticsPolling() {
+  if (state.diagnostics.pollTimer) {
+    window.clearTimeout(state.diagnostics.pollTimer);
+    state.diagnostics.pollTimer = null;
+  }
+}
+
+function startDiagnosticsPolling() {
+  stopDiagnosticsPolling();
+  if (state.currentPage !== 'diagnostics') {
+    return;
+  }
+  state.diagnostics.pollTimer = window.setTimeout(async () => {
+    try {
+      await loadDiagnostics({ forceReload: true, silent: true });
+    } catch (error) {
+      if (!isAbortError(error)) {
+        console.warn(error);
+      }
+    } finally {
+      if (state.currentPage === 'diagnostics') {
+        startDiagnosticsPolling();
+      }
+    }
+  }, 10000);
 }
 
 function getAvatarInitial(item) {
@@ -378,6 +629,125 @@ function renderStatus(status) {
     return;
   }
   setBanner('');
+}
+
+function renderDiagnostics(payload) {
+  const diagnostics = payload || {};
+  const host = diagnostics.host || null;
+  const hostCache = diagnostics.host_cache || null;
+  const summary = diagnostics.summary || {};
+  const items = Array.isArray(diagnostics.items) ? diagnostics.items : [];
+  state.diagnostics.data = diagnostics;
+  state.diagnostics.loaded = true;
+
+  elements.diagnosticsSnapshotTime.textContent = host
+    ? (host.snapshot_timestamp ? formatDiagnosticTime(host.snapshot_timestamp) : (host.snapshot_time || '-'))
+    : '主机快照不可用';
+  elements.diagnosticsHostNote.textContent = host
+    ? `${host.system_label || '-'} · Python ${host.python_version || '-'} · 主机 ${host.hostname || '-'}`
+    : (diagnostics.host_error || '当前无法获取主机诊断快照。');
+  elements.diagnosticsCacheNote.textContent = host
+    ? `采样状态: ${getDiagnosticsCacheStatusLabel(hostCache)} · 快照年龄 ${formatDiagnosticDuration(hostCache?.snapshot_age_seconds)} · TTL ${formatDiagnosticDuration(hostCache?.cache_ttl_seconds)}`
+    : `采样状态: ${getDiagnosticsCacheStatusLabel(hostCache)} · TTL ${formatDiagnosticDuration(hostCache?.cache_ttl_seconds)}`;
+
+  const cpuPercent = clampDiagnosticPercent(host?.cpu_usage_percent);
+  const cpuProcessPercent = Math.min(cpuPercent, clampDiagnosticPercent(host?.process_cpu_usage_percent));
+  const memoryPercent = clampDiagnosticPercent(host?.memory_usage_percent);
+  const memoryProcessPercent = Math.min(memoryPercent, clampDiagnosticPercent(host?.process_memory_percent));
+  const cpuProcessVisiblePercent = Math.min(cpuPercent, getDiagnosticVisibleInnerPercent(cpuProcessPercent));
+  const memoryProcessVisiblePercent = Math.min(memoryPercent, getDiagnosticVisibleInnerPercent(memoryProcessPercent));
+  setDiagnosticsMeter(elements.diagnosticsCpuRing, cpuPercent);
+  setDiagnosticsMeter(elements.diagnosticsCpuProcessRing, cpuProcessVisiblePercent);
+  setDiagnosticsMeter(elements.diagnosticsMemoryRing, memoryPercent);
+  setDiagnosticsMeter(elements.diagnosticsMemoryProcessRing, memoryProcessVisiblePercent);
+
+  elements.diagnosticsCpuSummary.textContent = host?.cpu_model || '-';
+  elements.diagnosticsCpuCores.textContent = host?.cpu_cores || '-';
+  elements.diagnosticsCpuFrequency.textContent = host?.cpu_frequency || '-';
+  elements.diagnosticsProcessCpuUsage.textContent = host?.process_cpu_usage || '-';
+  elements.diagnosticsCpuMeterValue.textContent = host ? String(Math.round(cpuPercent)) : '-';
+  elements.diagnosticsCpuMeterDetail.textContent = '外环系统 · 内环 Shell';
+  elements.diagnosticsCpuMeterSystem.textContent = host ? formatDiagnosticPercentLabel(cpuPercent) : '-';
+  elements.diagnosticsCpuMeterProcess.textContent = host ? formatDiagnosticPercentLabel(cpuProcessPercent) : '-';
+
+  elements.diagnosticsMemorySummary.textContent = host
+    ? `已用 ${host.memory_used || '-'} / 总量 ${host.memory_total || '-'}`
+    : '-';
+  elements.diagnosticsMemoryAvailable.textContent = host?.memory_available || '-';
+  elements.diagnosticsMemoryProcess.textContent = host?.process_memory || '-';
+  elements.diagnosticsMemoryTotal.textContent = host?.memory_total || '-';
+  elements.diagnosticsMemoryMeterValue.textContent = host ? String(Math.round(memoryPercent)) : '-';
+  elements.diagnosticsMemoryMeterDetail.textContent = '外环系统 · 内环 Shell';
+  elements.diagnosticsMemoryMeterSystem.textContent = host ? formatDiagnosticPercentLabel(memoryPercent) : '-';
+  elements.diagnosticsMemoryMeterProcess.textContent = host ? formatDiagnosticPercentLabel(memoryProcessPercent) : '-';
+
+  elements.diagnosticsOnlineCount.textContent = `${Number(summary.online_bot_count) || 0} / ${Number(summary.enabled_bot_count) || 0}`;
+  elements.diagnosticsRuntimeStorage.textContent = `${formatDiagnosticBytes(summary.total_runtime_snapshot_bytes)} / ${formatDiagnosticBytes(summary.total_runtime_journal_bytes)}`;
+
+  elements.diagnosticsEmptyState.classList.toggle('hidden', items.length > 0);
+  elements.diagnosticsGrid.innerHTML = '';
+
+  for (const item of items) {
+    const card = document.createElement('article');
+    const tone = getDiagnosticStatusTone(item.status_code);
+    const disconnectRow = item.last_disconnect_reason
+      ? `
+        <div class="diagnostics-row">
+          <span>最近断开</span>
+          <strong>${escapeHtml(item.last_disconnect_reason)}</strong>
+        </div>`
+      : '';
+    card.className = 'diagnostics-card';
+    card.innerHTML = `
+      <div class="diagnostics-card-head">
+        <div>
+          <h3 class="diagnostics-card-title">${escapeHtml(item.client_name || '未命名 Bot')}</h3>
+          <p class="diagnostics-card-subtitle">${escapeHtml(item.bot_id || '-')}</p>
+        </div>
+        <span class="basic-status-pill ${tone}">${escapeHtml(item.status_label || '-')}</span>
+      </div>
+
+      <div class="diagnostics-card-body">
+        <div class="diagnostics-row">
+          <span>认证状态</span>
+          <strong>${escapeHtml(getDiagnosticAuthLabel(item.auth_state))}</strong>
+        </div>
+        <div class="diagnostics-row">
+          <span>Rocket.Chat</span>
+          <strong>${escapeHtml(item.server_url || '-')}</strong>
+        </div>
+        <div class="diagnostics-row">
+          <span>OneBot self_id</span>
+          <strong>${escapeHtml(item.onebot_self_id || '-')}</strong>
+        </div>
+        <div class="diagnostics-row">
+          <span>重连失败</span>
+          <strong>${escapeHtml(String(item.reconnect_failures ?? 0))}</strong>
+        </div>
+        <div class="diagnostics-row">
+          <span>最近 WebSocket</span>
+          <strong>${escapeHtml(formatDiagnosticTime(item.last_websocket_activity_at))}</strong>
+        </div>
+        <div class="diagnostics-row">
+          <span>最近入站</span>
+          <strong>${escapeHtml(formatDiagnosticTime(item.last_inbound_message_at))}</strong>
+        </div>
+        <div class="diagnostics-row">
+          <span>最近出站</span>
+          <strong>${escapeHtml(formatDiagnosticTime(item.last_outbound_message_at))}</strong>
+        </div>
+        <div class="diagnostics-row">
+          <span>Snapshot</span>
+          <strong>${escapeHtml(formatDiagnosticBytes(item.runtime_snapshot_bytes))}</strong>
+        </div>
+        <div class="diagnostics-row">
+          <span>Journal</span>
+          <strong>${escapeHtml(formatDiagnosticBytes(item.runtime_journal_bytes))}</strong>
+        </div>${disconnectRow}
+      </div>
+    `;
+    elements.diagnosticsGrid.appendChild(card);
+  }
 }
 
 function renderBasicInfo(payload) {
@@ -1101,6 +1471,22 @@ async function loadBasicInfo({ forceReload = false, silent = false } = {}) {
   }
 }
 
+async function loadDiagnostics({ forceReload = false, silent = false } = {}) {
+  if (!forceReload && state.diagnostics.loaded) {
+    return;
+  }
+
+  try {
+    const diagnostics = await requestJson('/api/diagnostics');
+    renderDiagnostics(diagnostics);
+  } catch (error) {
+    state.diagnostics.loaded = false;
+    if (!silent) {
+      showToast(error.message || '诊断数据加载失败', 'error');
+    }
+  }
+}
+
 async function saveBot() {
   const payload = collectFormData();
   if (!Number.isFinite(payload.room_info_cache_ttl_seconds) || payload.room_info_cache_ttl_seconds < 0) {
@@ -1414,6 +1800,10 @@ elements.logAutoScrollToggle?.addEventListener('change', (event) => {
 elements.basicRefreshButton?.addEventListener('click', async () => {
   await activatePage('basic', { forceReload: true });
   showToast('基础信息已刷新');
+});
+elements.diagnosticsRefreshButton?.addEventListener('click', async () => {
+  await activatePage('diagnostics', { forceReload: true });
+  showToast('运行诊断已刷新');
 });
 elements.settingsRefreshButton?.addEventListener('click', async () => {
   await activatePage('settings', { forceReload: true });

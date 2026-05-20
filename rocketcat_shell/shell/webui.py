@@ -133,7 +133,7 @@ class ShellWebUI:
         self._bound_socket: socket.socket | None = None
         self._log_buffer = BridgeLogBuffer(max_entries=5000)
         self._log_handler = BridgeLogHandler(self._log_buffer)
-        self._app = FastAPI(title="RocketCat Shell", version="v0.1.5")
+        self._app = FastAPI(title="RocketCat Shell", version="v0.1.6")
         self._static_dir = Path(__file__).resolve().parent / "static"
         self._login_file = self._static_dir / "login.html"
         self._setup_routes()
@@ -171,6 +171,7 @@ class ShellWebUI:
         )
         self._app.add_api_route("/", self._handle_index, methods=["GET"])
         self._app.add_api_route("/api/status", self._handle_status, methods=["GET"])
+        self._app.add_api_route("/api/diagnostics", self._handle_diagnostics, methods=["GET"])
         self._app.add_api_route("/api/login", self._handle_login, methods=["POST"])
         self._app.add_api_route("/api/logout", self._handle_logout, methods=["POST"])
         self._app.add_api_route("/api/basic-info", self._handle_basic_info, methods=["GET"])
@@ -506,6 +507,9 @@ class ShellWebUI:
 
     async def _handle_status(self) -> dict[str, Any]:
         return await self.manager.get_webui_state()
+
+    async def _handle_diagnostics(self) -> dict[str, Any]:
+        return await self.manager.get_diagnostics_state()
 
     async def _handle_basic_info(self) -> dict[str, Any]:
         return await self.manager.get_basic_info_state()

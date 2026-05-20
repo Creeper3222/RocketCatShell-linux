@@ -28,6 +28,10 @@ class RocketChatClient:
     _INBOUND_WORKER_COUNT = 2
     _INBOUND_QUEUE_MAX_SIZE = 512
     _SERVER_BRANDING_CACHE_TTL_SECONDS = 300.0
+    _WEBSOCKET_HEARTBEAT_SECONDS = 30.0
+    _WEBSOCKET_READ_TIMEOUT_SECONDS = 90.0
+    _DDP_CONNECT_TIMEOUT_SECONDS = 20.0
+    _DDP_LOGIN_TIMEOUT_SECONDS = 20.0
     _INBOUND_SIGNATURE_FIELD_NAMES = (
         "_id",
         "rid",
@@ -87,6 +91,11 @@ class RocketChatClient:
         )
         self.media = RocketChatMediaBridge(self)
         self._consecutive_reconnect_failures = 0
+        self._last_rest_login_at = 0.0
+        self._last_websocket_activity_at = 0.0
+        self._last_inbound_message_at = 0.0
+        self._last_outbound_message_at = 0.0
+        self._last_disconnect_reason = ""
 
     async def start(self) -> None:
         if self._running:
@@ -136,6 +145,7 @@ class RocketChatClient:
                 await self.e2ee.initialize()
                 await self._ws_connect_and_listen()
                 if self._running:
+                    self._last_disconnect_reason = "websocket disconnected"
                     logger.warning(
                         f"[RocketChatOneBotBridge] Rocket.Chat 连接已断开，{self.config.reconnect_delay:.1f}s 后重连。"
                     )
@@ -147,6 +157,7 @@ class RocketChatClient:
                     break
                 self.auth_token = None
                 self.user_id = None
+                self._last_disconnect_reason = repr(exc)
                 self._consecutive_reconnect_failures += 1
                 if self._should_stop_reconnect():
                     await self._handle_reconnect_exhausted(exc)
@@ -162,6 +173,7 @@ class RocketChatClient:
 
     async def _handle_reconnect_exhausted(self, exc: Exception) -> None:
         self._running = False
+        self._last_disconnect_reason = repr(exc)
         logger.error("[RocketChatOneBotBridge] 连接失败，已自动关闭rocketchat桥接器，请检查网络或目标服务器状态")
         if self._on_reconnect_exhausted is not None:
             await self._on_reconnect_exhausted(
@@ -169,6 +181,36 @@ class RocketChatClient:
                 self._consecutive_reconnect_failures,
                 repr(exc),
             )
+
+    def build_diagnostic_snapshot(self) -> dict[str, Any]:
+        authenticated = bool(self.auth_token and self.user_id)
+        if authenticated:
+            auth_state = "authenticated"
+        elif self.auth_token or self.user_id:
+            auth_state = "partial"
+        else:
+            auth_state = "disconnected"
+        return {
+            "authenticated": authenticated,
+            "auth_state": auth_state,
+            "reconnect_failures": self._consecutive_reconnect_failures,
+            "last_rest_login_at": self._last_rest_login_at or None,
+            "last_websocket_activity_at": self._last_websocket_activity_at or None,
+            "last_inbound_message_at": self._last_inbound_message_at or None,
+            "last_outbound_message_at": self._last_outbound_message_at or None,
+            "last_disconnect_reason": self._last_disconnect_reason,
+        }
+
+    def _mark_websocket_activity(self) -> None:
+        self._last_websocket_activity_at = time.time()
+
+    def _mark_inbound_message_activity(self) -> None:
+        now = time.time()
+        self._last_inbound_message_at = now
+        self._last_websocket_activity_at = now
+
+    def _mark_outbound_message_activity(self) -> None:
+        self._last_outbound_message_at = time.time()
 
     async def _request_json(self, method: str, url: str, **kwargs) -> dict[str, Any]:
         if self._http_session is None:
@@ -339,6 +381,8 @@ class RocketChatClient:
             self.bot_profile.setdefault("_id", self.user_id)
             self.bot_profile.setdefault("username", self.bot_username)
             self._user_cache[str(self.user_id)] = dict(self.bot_profile)
+        self._last_rest_login_at = time.time()
+        self._last_disconnect_reason = ""
         logger.info(
             f"[RocketChatOneBotBridge] Rocket.Chat 登录成功 | userId={self.user_id} | username={self.bot_username}"
         )
@@ -616,6 +660,7 @@ class RocketChatClient:
         if not data.get("success"):
             logger.error(f"[RocketChatOneBotBridge] Rocket.Chat 发送失败: {data}")
             return None
+        self._mark_outbound_message_activity()
         return data
 
     async def _send_structured_message(
@@ -1092,7 +1137,7 @@ class RocketChatClient:
         self._subscribed_rooms.clear()
         async with self._http_session.ws_connect(
             ws_url,
-            heartbeat=30.0,
+            heartbeat=self._WEBSOCKET_HEARTBEAT_SECONDS,
             max_msg_size=8 * 1024 * 1024,
         ) as ws:
             self._ws = ws
@@ -1104,6 +1149,8 @@ class RocketChatClient:
                 await self._ddp_subscribe_rooms(ws, subscriptions)
                 await self._ddp_subscribe_user_events(ws)
                 self._consecutive_reconnect_failures = 0
+                self._mark_websocket_activity()
+                self._last_disconnect_reason = ""
                 logger.info(
                     f"[RocketChatOneBotBridge] Rocket.Chat WebSocket 就绪，共订阅 {len(subscriptions)} 个房间。"
                 )
@@ -1117,6 +1164,35 @@ class RocketChatClient:
                     await self._drain_inbound_queue()
                 await self._stop_inbound_workers()
                 self._ws = None
+
+    async def _receive_ws_frame(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        *,
+        timeout: float,
+        stage: str,
+    ) -> aiohttp.WSMessage:
+        try:
+            raw = await asyncio.wait_for(ws.receive(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"Rocket.Chat WebSocket {stage} 读取超时（{timeout:.1f}s）"
+            ) from exc
+
+        if raw.type == aiohttp.WSMsgType.ERROR:
+            raise RuntimeError(
+                f"Rocket.Chat WebSocket {stage} 异常: {ws.exception()!r}"
+            )
+        if raw.type in {
+            aiohttp.WSMsgType.CLOSE,
+            aiohttp.WSMsgType.CLOSED,
+            aiohttp.WSMsgType.CLOSING,
+        }:
+            raise RuntimeError(
+                f"Rocket.Chat WebSocket {stage} 已关闭 (close_code={getattr(ws, 'close_code', None)})"
+            )
+        self._mark_websocket_activity()
+        return raw
 
     async def _ddp_call(
         self,
@@ -1151,7 +1227,12 @@ class RocketChatClient:
 
     async def _ddp_connect(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         await ws.send_str(json_dumps({"msg": "connect", "version": "1", "support": ["1"]}))
-        async for raw in ws:
+        while True:
+            raw = await self._receive_ws_frame(
+                ws,
+                timeout=self._DDP_CONNECT_TIMEOUT_SECONDS,
+                stage="DDP connect",
+            )
             if raw.type != aiohttp.WSMsgType.TEXT:
                 continue
             data = json_loads(raw.data)
@@ -1159,7 +1240,6 @@ class RocketChatClient:
                 await ws.send_str(json_dumps({"msg": "pong"}))
             elif data.get("msg") == "connected":
                 return
-        raise RuntimeError("Rocket.Chat DDP connect 未收到 connected")
 
     async def _ddp_login(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         await ws.send_str(
@@ -1172,7 +1252,12 @@ class RocketChatClient:
                 }
             )
         )
-        async for raw in ws:
+        while True:
+            raw = await self._receive_ws_frame(
+                ws,
+                timeout=self._DDP_LOGIN_TIMEOUT_SECONDS,
+                stage="DDP login",
+            )
             if raw.type != aiohttp.WSMsgType.TEXT:
                 continue
             data = json_loads(raw.data)
@@ -1182,7 +1267,6 @@ class RocketChatClient:
                 if data.get("error"):
                     raise RuntimeError(f"Rocket.Chat DDP 登录失败: {data['error']}")
                 return
-        raise RuntimeError("Rocket.Chat DDP login 未收到 result")
 
     async def _ddp_subscribe_rooms(
         self,
@@ -1218,19 +1302,17 @@ class RocketChatClient:
         )
 
     async def _ws_listen_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        async for raw in ws:
+        while self._running:
+            raw = await self._receive_ws_frame(
+                ws,
+                timeout=self._WEBSOCKET_READ_TIMEOUT_SECONDS,
+                stage="listen",
+            )
             if not self._running:
                 break
             if raw.type == aiohttp.WSMsgType.TEXT:
                 data = json_loads(raw.data)
                 await self._dispatch_ddp(data, ws)
-            elif raw.type in {
-                aiohttp.WSMsgType.CLOSE,
-                aiohttp.WSMsgType.CLOSED,
-                aiohttp.WSMsgType.CLOSING,
-                aiohttp.WSMsgType.ERROR,
-            }:
-                break
 
     async def _dispatch_ddp(self, data: dict[str, Any], ws: aiohttp.ClientWebSocketResponse) -> None:
         msg_type = data.get("msg")
@@ -1242,9 +1324,13 @@ class RocketChatClient:
 
         if msg_type == "changed" and collection == "stream-room-messages":
             args = data.get("fields", {}).get("args", [])
+            saw_message = False
             for raw_msg in args:
                 if isinstance(raw_msg, dict):
+                    saw_message = True
                     await self._enqueue_incoming_message(raw_msg)
+            if saw_message:
+                self._mark_inbound_message_activity()
             return
 
         if msg_type == "changed" and collection == "stream-notify-user":

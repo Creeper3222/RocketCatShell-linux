@@ -44,9 +44,19 @@ class InboundTranslator:
         if not room_id or not sender_source_id or not source_message_id:
             return None
 
-        quote_contexts_task = asyncio.create_task(
-            self._build_quote_contexts(raw_msg, max_depth=self._MAX_QUOTE_DEPTH)
-        )
+        quote_contexts_task: asyncio.Task[list[dict[str, Any]]] | None = None
+        reply_source_id: str | None = None
+        cleaned_text = str(raw_msg.get("msg") or "")
+        may_have_quote_contexts = self._may_have_quote_contexts(raw_msg)
+        if may_have_quote_contexts:
+            reply_source_id, cleaned_text = self._extract_reply_source_id(raw_msg)
+            quote_contexts_task = asyncio.create_task(
+                self._build_quote_contexts(
+                    raw_msg,
+                    max_depth=self._MAX_QUOTE_DEPTH,
+                    reply_source_id=reply_source_id,
+                )
+            )
         runtime_batch = self._begin_runtime_batch()
         try:
             with perf_stage(perf_trace, "room_lookup"):
@@ -91,7 +101,6 @@ class InboundTranslator:
                         batch=runtime_batch,
                     )
 
-            reply_source_id, cleaned_text = self._extract_reply_source_id(raw_msg)
             current_input_text = cleaned_text.strip()
             with perf_stage(perf_trace, "mention_segments"):
                 message_segments, cleaned_text = await self._build_mention_segments(
@@ -100,7 +109,9 @@ class InboundTranslator:
                     batch=runtime_batch,
                 )
             with perf_stage(perf_trace, "quote_contexts"):
-                quote_contexts = await quote_contexts_task
+                quote_contexts = []
+                if quote_contexts_task is not None:
+                    quote_contexts = await quote_contexts_task
             with perf_stage(perf_trace, "mention_metadata"):
                 mention_metadata = await self._extract_mention_metadata(raw_msg, batch=runtime_batch)
             mention_display_names = [
@@ -520,6 +531,41 @@ class InboundTranslator:
             return []
         return [{"type": "text", "data": {"text": text}}]
 
+    def _may_have_quote_contexts(self, raw_msg: dict[str, Any]) -> bool:
+        if self._payload_has_quote_attachment(raw_msg):
+            return True
+
+        urls = raw_msg.get("urls")
+        if isinstance(urls, list):
+            for url_obj in urls:
+                if not isinstance(url_obj, dict):
+                    continue
+                parsed_url = url_obj.get("parsedUrl", {})
+                if isinstance(parsed_url, dict):
+                    query = parsed_url.get("query", {})
+                    if isinstance(query, dict) and query.get("msg"):
+                        return True
+                if "msg=" in str(url_obj.get("url") or ""):
+                    return True
+
+        return "msg=" in str(raw_msg.get("msg") or "")
+
+    def _payload_has_quote_attachment(self, payload: dict[str, Any]) -> bool:
+        attachments = payload.get("attachments")
+        if isinstance(attachments, dict):
+            attachments = [attachments]
+        if not isinstance(attachments, list):
+            return False
+
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            if self._extract_message_id_from_url(str(attachment.get("message_link") or "")):
+                return True
+            if self._payload_has_quote_attachment(attachment):
+                return True
+        return False
+
     def _extract_reply_source_id(self, raw_msg: dict) -> tuple[str | None, str]:
         text = str(raw_msg.get("msg") or "")
         urls = raw_msg.get("urls")
@@ -563,6 +609,7 @@ class InboundTranslator:
         raw_msg: dict[str, Any],
         *,
         max_depth: int,
+        reply_source_id: str | None = None,
     ) -> list[dict[str, Any]]:
         contexts: list[dict[str, Any]] = []
         visited: set[str] = set()
@@ -576,7 +623,6 @@ class InboundTranslator:
         if contexts:
             return contexts
 
-        reply_source_id, _ = self._extract_reply_source_id(raw_msg)
         if not reply_source_id:
             return contexts
 

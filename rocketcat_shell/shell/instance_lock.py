@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -21,9 +22,19 @@ class SingleInstanceError(RuntimeError):
 
 
 class ShellInstanceLock:
-    def __init__(self, lock_path: Path):
+    def __init__(
+        self,
+        lock_path: Path,
+        *,
+        retry_attempts: int = 5,
+        retry_delay_seconds: float = 0.1,
+        retry_backoff: float = 2.0,
+    ):
         self.lock_path = lock_path
         self._handle: BinaryIO | None = None
+        self._retry_attempts = max(1, int(retry_attempts))
+        self._retry_delay_seconds = max(0.0, float(retry_delay_seconds))
+        self._retry_backoff = max(1.0, float(retry_backoff))
 
     def acquire(self, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         if self._handle is not None:
@@ -70,7 +81,21 @@ class ShellInstanceLock:
     def _lock_handle(self, handle: BinaryIO) -> None:
         handle.seek(0)
         if os.name == "nt":
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            last_error: OSError | None = None
+            delay = self._retry_delay_seconds
+            for attempt in range(self._retry_attempts):
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    return
+                except OSError as exc:
+                    last_error = exc
+                    if attempt + 1 >= self._retry_attempts:
+                        break
+                    if delay > 0:
+                        time.sleep(delay)
+                    delay *= self._retry_backoff
+            if last_error is not None:
+                raise last_error
             return
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 

@@ -239,6 +239,27 @@ class FakeMedia:
 
         return descriptors
 
+    def build_onebot_segment_from_descriptor(self, media: dict[str, Any]) -> dict[str, Any] | None:
+        kind = str(media.get("kind") or "")
+        file_ref = str(media.get("path") or media.get("url") or "")
+        if not file_ref:
+            return None
+        if kind == "image":
+            return {"type": "image", "data": {"file": file_ref}}
+        if kind == "audio":
+            return {"type": "record", "data": {"file": file_ref}}
+        if kind == "video":
+            return {"type": "video", "data": {"file": file_ref}}
+        name = str(media.get("name") or "attachment")
+        return {
+            "type": "file",
+            "data": {
+                "url": file_ref,
+                "file_name": name,
+                "name": name,
+            },
+        }
+
     def build_onebot_segments_from_descriptors(
         self,
         media_descriptors: list[dict[str, str]],
@@ -472,7 +493,100 @@ def make_scenarios() -> dict[str, Scenario]:
             },
             quoted_messages={},
         ),
+        "quote_image": Scenario(
+            name="quote_image",
+            raw_msg={
+                "_id": "quote-image-msg",
+                "rid": "room-1",
+                "u": sender,
+                "msg": "[reply](https://example.test/channel/room-a?msg=quoted-image-1) please inspect the quoted image",
+                "ts": {"$date": 1710000003500},
+            },
+            quoted_messages={
+                "quoted-image-1": {
+                    "_id": "quoted-image-1",
+                    "rid": "room-1",
+                    "u": quoted_sender,
+                    "msg": "quoted image payload",
+                    "attachments": [
+                        {
+                            "image_url": "https://example.test/quoted-cat.png",
+                            "title": "quoted-cat.png",
+                            "type": "image/png",
+                        }
+                    ],
+                    "ts": {"$date": 1710000003200},
+                }
+            },
+        ),
+        "media_mix": Scenario(
+            name="media_mix",
+            raw_msg={
+                "_id": "media-mix-msg",
+                "rid": "room-1",
+                "u": sender,
+                "msg": "mixed media payload",
+                "attachments": [
+                    {
+                        "image_url": "https://example.test/cat.png",
+                        "title": "cat.png",
+                        "type": "image/png",
+                    },
+                    {
+                        "audio_url": "https://example.test/sample.mp3",
+                        "title": "sample.mp3",
+                    },
+                    {
+                        "url": "https://example.test/report.pdf",
+                        "title": "report.pdf",
+                    },
+                ],
+                "urls": [
+                    {
+                        "url": "https://example.test/preview.png",
+                        "meta": {"contentType": "image/png"},
+                    }
+                ],
+                "ts": {"$date": 1710000003600},
+            },
+            quoted_messages={},
+        ),
     }
+
+
+def apply_profile_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    profile_defaults = {
+        "micro": {
+            "iterations": 200,
+            "warmup": 20,
+            "room_info_delay_ms": 0.0,
+            "quote_fetch_delay_ms": 0.0,
+            "media_delay_ms": 0.0,
+            "scenarios": ["text", "quote", "thread", "image"],
+        },
+        "realistic": {
+            "iterations": 120,
+            "warmup": 20,
+            "room_info_delay_ms": 2.5,
+            "quote_fetch_delay_ms": 4.0,
+            "media_delay_ms": 1.5,
+            "scenarios": ["text", "quote", "thread", "image", "quote_image", "media_mix"],
+        },
+    }
+    defaults = profile_defaults[args.profile]
+    if args.iterations is None:
+        args.iterations = defaults["iterations"]
+    if args.warmup is None:
+        args.warmup = defaults["warmup"]
+    if args.room_info_delay_ms is None:
+        args.room_info_delay_ms = defaults["room_info_delay_ms"]
+    if args.quote_fetch_delay_ms is None:
+        args.quote_fetch_delay_ms = defaults["quote_fetch_delay_ms"]
+    if args.media_delay_ms is None:
+        args.media_delay_ms = defaults["media_delay_ms"]
+    if not args.scenario:
+        args.scenario = list(defaults["scenarios"])
+    return args
 
 
 def create_translator(
@@ -608,7 +722,8 @@ def print_summary(
 ) -> None:
     print("settings:")
     print(
-        "  iterations={iterations} warmup={warmup} message_window_size={window} room_info_delay_ms={room_delay:.3f} quote_fetch_delay_ms={quote_delay:.3f} media_delay_ms={media_delay:.3f}".format(
+        "  profile={profile} iterations={iterations} warmup={warmup} message_window_size={window} room_info_delay_ms={room_delay:.3f} quote_fetch_delay_ms={quote_delay:.3f} media_delay_ms={media_delay:.3f}".format(
+            profile=args.profile,
             iterations=args.iterations,
             warmup=args.warmup,
             window=args.message_window_size,
@@ -635,6 +750,12 @@ def parse_args() -> argparse.Namespace:
     default_root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description="Compare inbound translation latency between control and rebuild branches.")
     parser.add_argument(
+        "--profile",
+        choices=["micro", "realistic"],
+        default="micro",
+        help="Benchmark profile preset. micro keeps the old zero-delay path; realistic adds modest fetch/media delays and richer scenarios.",
+    )
+    parser.add_argument(
         "--control-root",
         type=Path,
         default=default_root.parent / "rocketcat_shell",
@@ -646,19 +767,20 @@ def parse_args() -> argparse.Namespace:
         default=default_root,
         help="Path to the rebuild branch root",
     )
-    parser.add_argument("--iterations", type=int, default=200, help="Measured iterations per scenario")
-    parser.add_argument("--warmup", type=int, default=20, help="Warmup iterations per scenario")
+    parser.add_argument("--iterations", type=int, default=None, help="Measured iterations per scenario")
+    parser.add_argument("--warmup", type=int, default=None, help="Warmup iterations per scenario")
     parser.add_argument("--message-window-size", type=int, default=1000, help="Message window size for translator dependencies")
-    parser.add_argument("--room-info-delay-ms", type=float, default=0.0, help="Artificial delay for get_room_info")
-    parser.add_argument("--quote-fetch-delay-ms", type=float, default=0.0, help="Artificial delay for fetch_message_by_id")
-    parser.add_argument("--media-delay-ms", type=float, default=0.0, help="Artificial delay for media materialization")
+    parser.add_argument("--room-info-delay-ms", type=float, default=None, help="Artificial delay for get_room_info")
+    parser.add_argument("--quote-fetch-delay-ms", type=float, default=None, help="Artificial delay for fetch_message_by_id")
+    parser.add_argument("--media-delay-ms", type=float, default=None, help="Artificial delay for media materialization")
     parser.add_argument(
         "--scenario",
         action="append",
-        choices=["text", "quote", "thread", "image"],
+        dest="scenario",
+        choices=["text", "quote", "thread", "image", "quote_image", "media_mix"],
         help="Restrict benchmark to one or more named scenarios",
     )
-    return parser.parse_args()
+    return apply_profile_defaults(parser.parse_args())
 
 
 async def async_main(args: argparse.Namespace) -> int:

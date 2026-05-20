@@ -172,6 +172,48 @@ class JournalPersistenceWorker:
         done.wait()
         self._thread.join(timeout=5.0)
 
+    @classmethod
+    def load_snapshot_payload(cls, snapshot_path: Path) -> dict[str, Any] | None:
+        if not snapshot_path.exists():
+            return None
+
+        try:
+            snapshot_payload = pickle.loads(snapshot_path.read_bytes())
+        except Exception as exc:
+            logger.warning(
+                "[RocketCatShell] failed to decode runtime snapshot | path=%s | error=%s",
+                snapshot_path,
+                exc,
+            )
+            return None
+
+        if not isinstance(snapshot_payload, dict):
+            logger.warning(
+                "[RocketCatShell] ignored runtime snapshot with invalid payload type | path=%s | type=%s",
+                snapshot_path,
+                type(snapshot_payload).__name__,
+            )
+            return None
+
+        snapshot_version = snapshot_payload.get("version")
+        if snapshot_version not in (None, cls._SNAPSHOT_VERSION):
+            logger.warning(
+                "[RocketCatShell] ignored runtime snapshot with unsupported version | path=%s | version=%s | expected=%s",
+                snapshot_path,
+                snapshot_version,
+                cls._SNAPSHOT_VERSION,
+            )
+            return None
+
+        if snapshot_version is not None and not isinstance(snapshot_payload.get("state"), dict):
+            logger.warning(
+                "[RocketCatShell] ignored runtime snapshot with invalid state payload | path=%s",
+                snapshot_path,
+            )
+            return None
+
+        return snapshot_payload
+
     def _run(self) -> None:
         pending_since_flush = 0
         records_since_snapshot = 0
@@ -1085,9 +1127,9 @@ def build_runtime_hot_stores(
     journal_path = data_dir / "runtime.journal.bin"
 
     state_engine = RuntimeStateEngine(message_window_size=message_window_size)
-    if snapshot_path.exists():
+    snapshot_payload = JournalPersistenceWorker.load_snapshot_payload(snapshot_path)
+    if snapshot_payload is not None:
         try:
-            snapshot_payload = pickle.loads(snapshot_path.read_bytes())
             state_engine.load_snapshot_payload(snapshot_payload)
         except Exception as exc:
             logger.warning(

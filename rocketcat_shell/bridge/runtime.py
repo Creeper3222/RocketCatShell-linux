@@ -5,6 +5,7 @@ import inspect
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from rocketcat_shell.diagnostics import build_runtime_diagnostic_item
 from rocketcat_shell.logger import logger
 from rocketcat_shell.plugin_system import (
     PluginExecutionContext,
@@ -206,6 +207,17 @@ class BridgeRuntime:
             "is_main_bot": False,
             "user_id": user_id,
         }
+
+    def build_diagnostic_summary(self) -> dict[str, Any]:
+        self._reload_config_snapshot()
+        return build_runtime_diagnostic_item(
+            instance_name=self.instance_name,
+            config=self.config,
+            rocketchat=self.rocketchat,
+            started=self.started,
+            data_dir=self.data_dir,
+            message_index_max_entries=self.message_index_max_entries,
+        )
 
     async def _handle_rocketchat_message(self, raw_msg: dict[str, Any]) -> None:
         if self.inbound_translator is None or self.onebot is None:

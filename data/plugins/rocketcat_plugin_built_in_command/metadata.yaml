@@ -1,6 +1,6 @@
 name: rocketcat_plugin_built_in_command
 display_name: 内置指令系统
 desc: 提供 RocketCatShell 自有的内置指令入口，当前实现精确纯文本命令 #rocketcat 与 #system。
-version: v0.1.5
+version: v0.1.6
 author: Creeper3222
 repo: ""

@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>RocketCat Shell</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260430f" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260520g" />
   </head>
   <body>
     <div class="shell-layout">
@@ -21,6 +21,10 @@
           <button class="nav-item active" type="button" data-page="network">
             <span class="nav-icon">≋</span>
             <span>网络配置</span>
+          </button>
+          <button class="nav-item" type="button" data-page="diagnostics">
+            <span class="nav-icon">◎</span>
+            <span>运行诊断</span>
           </button>
           <button class="nav-item" type="button" data-page="basic">
             <span class="nav-icon">⌁</span>
@@ -83,6 +87,156 @@
             </div>
 
             <div id="botGrid" class="bot-grid"></div>
+          </section>
+        </section>
+
+        <section id="diagnosticsPage" class="page-view hidden">
+          <header class="page-header">
+            <div>
+              <p class="eyebrow">RocketCat Shell</p>
+              <h1>运行诊断</h1>
+            </div>
+            <div class="header-actions">
+              <button id="diagnosticsRefreshButton" class="action-button subtle" type="button">刷新</button>
+            </div>
+          </header>
+
+          <section class="panel-shell diagnostics-panel-shell">
+            <div class="diagnostics-panel-head">
+              <div>
+                <p class="eyebrow">Realtime Diagnostics</p>
+                <h2>运行诊断</h2>
+              </div>
+              <div class="diagnostics-panel-meta">
+                <p class="status-label">最近采样</p>
+                <p id="diagnosticsSnapshotTime" class="status-detail">-</p>
+              </div>
+            </div>
+            <p id="diagnosticsHostNote" class="diagnostics-summary-note">-</p>
+            <p id="diagnosticsCacheNote" class="status-detail">-</p>
+
+            <section class="diagnostics-meter-grid">
+              <article class="diagnostics-meter-card" data-tone="cpu">
+                <div class="diagnostics-meter-copy">
+                  <div>
+                    <p class="status-label">Host CPU</p>
+                    <h3 class="diagnostics-meter-title">CPU 占用</h3>
+                  </div>
+                  <p id="diagnosticsCpuSummary" class="diagnostics-meter-summary">-</p>
+                  <div class="diagnostics-meter-stats">
+                    <div class="diagnostics-meter-stat">
+                      <span>核心</span>
+                      <strong id="diagnosticsCpuCores">-</strong>
+                    </div>
+                    <div class="diagnostics-meter-stat">
+                      <span>当前主频</span>
+                      <strong id="diagnosticsCpuFrequency">-</strong>
+                    </div>
+                    <div class="diagnostics-meter-stat">
+                      <span>Shell 进程</span>
+                      <strong id="diagnosticsProcessCpuUsage">-</strong>
+                    </div>
+                  </div>
+                </div>
+                <div class="diagnostics-meter-shell">
+                  <div class="diagnostics-meter" data-tone="cpu">
+                    <svg viewBox="0 0 120 120" aria-hidden="true">
+                      <circle class="diagnostics-meter-track diagnostics-meter-track-outer" cx="60" cy="60" r="46" pathLength="100"></circle>
+                      <circle id="diagnosticsCpuRing" class="diagnostics-meter-progress diagnostics-meter-progress-outer" cx="60" cy="60" r="46" pathLength="100"></circle>
+                      <circle class="diagnostics-meter-track diagnostics-meter-track-inner" cx="60" cy="60" r="46" pathLength="100"></circle>
+                      <circle id="diagnosticsCpuProcessRing" class="diagnostics-meter-progress diagnostics-meter-progress-inner" cx="60" cy="60" r="46" pathLength="100"></circle>
+                    </svg>
+                    <div class="diagnostics-meter-center">
+                      <span class="diagnostics-meter-kicker">系统总占用</span>
+                      <div class="diagnostics-meter-value-row">
+                        <span id="diagnosticsCpuMeterValue" class="diagnostics-meter-value">-</span>
+                        <span class="diagnostics-meter-unit">%</span>
+                      </div>
+                      <span id="diagnosticsCpuMeterDetail" class="diagnostics-meter-footnote">-</span>
+                    </div>
+                  </div>
+                  <div class="diagnostics-meter-legend">
+                    <span class="diagnostics-meter-legend-item">
+                      <i class="diagnostics-meter-legend-swatch system"></i>
+                      <span>系统 <strong id="diagnosticsCpuMeterSystem">-</strong></span>
+                    </span>
+                    <span class="diagnostics-meter-legend-item">
+                      <i class="diagnostics-meter-legend-swatch process"></i>
+                      <span>Shell <strong id="diagnosticsCpuMeterProcess">-</strong></span>
+                    </span>
+                  </div>
+                </div>
+              </article>
+
+              <article class="diagnostics-meter-card" data-tone="memory">
+                <div class="diagnostics-meter-copy">
+                  <div>
+                    <p class="status-label">System Memory</p>
+                    <h3 class="diagnostics-meter-title">内存占用</h3>
+                  </div>
+                  <p id="diagnosticsMemorySummary" class="diagnostics-meter-summary">-</p>
+                  <div class="diagnostics-meter-stats">
+                    <div class="diagnostics-meter-stat">
+                      <span>可用</span>
+                      <strong id="diagnosticsMemoryAvailable">-</strong>
+                    </div>
+                    <div class="diagnostics-meter-stat">
+                      <span>Shell 进程</span>
+                      <strong id="diagnosticsMemoryProcess">-</strong>
+                    </div>
+                    <div class="diagnostics-meter-stat">
+                      <span>总量</span>
+                      <strong id="diagnosticsMemoryTotal">-</strong>
+                    </div>
+                  </div>
+                </div>
+                <div class="diagnostics-meter-shell">
+                  <div class="diagnostics-meter" data-tone="memory">
+                    <svg viewBox="0 0 120 120" aria-hidden="true">
+                      <circle class="diagnostics-meter-track diagnostics-meter-track-outer" cx="60" cy="60" r="46" pathLength="100"></circle>
+                      <circle id="diagnosticsMemoryRing" class="diagnostics-meter-progress diagnostics-meter-progress-outer" cx="60" cy="60" r="46" pathLength="100"></circle>
+                      <circle class="diagnostics-meter-track diagnostics-meter-track-inner" cx="60" cy="60" r="46" pathLength="100"></circle>
+                      <circle id="diagnosticsMemoryProcessRing" class="diagnostics-meter-progress diagnostics-meter-progress-inner" cx="60" cy="60" r="46" pathLength="100"></circle>
+                    </svg>
+                    <div class="diagnostics-meter-center">
+                      <span class="diagnostics-meter-kicker">系统总占用</span>
+                      <div class="diagnostics-meter-value-row">
+                        <span id="diagnosticsMemoryMeterValue" class="diagnostics-meter-value">-</span>
+                        <span class="diagnostics-meter-unit">%</span>
+                      </div>
+                      <span id="diagnosticsMemoryMeterDetail" class="diagnostics-meter-footnote">-</span>
+                    </div>
+                  </div>
+                  <div class="diagnostics-meter-legend">
+                    <span class="diagnostics-meter-legend-item">
+                      <i class="diagnostics-meter-legend-swatch system"></i>
+                      <span>系统 <strong id="diagnosticsMemoryMeterSystem">-</strong></span>
+                    </span>
+                    <span class="diagnostics-meter-legend-item">
+                      <i class="diagnostics-meter-legend-swatch process"></i>
+                      <span>Shell <strong id="diagnosticsMemoryMeterProcess">-</strong></span>
+                    </span>
+                  </div>
+                </div>
+              </article>
+            </section>
+
+            <section class="status-grid diagnostics-summary-grid">
+              <article class="status-card">
+                <p class="status-label">在线 / 已启用</p>
+                <p id="diagnosticsOnlineCount" class="status-value">-</p>
+              </article>
+              <article class="status-card">
+                <p class="status-label">Snapshot / Journal</p>
+                <p id="diagnosticsRuntimeStorage" class="status-value">-</p>
+              </article>
+            </section>
+
+            <div id="diagnosticsEmptyState" class="empty-state hidden">
+              <p>当前还没有可展示的 bot 诊断数据。</p>
+            </div>
+
+            <div id="diagnosticsGrid" class="diagnostics-grid"></div>
           </section>
         </section>
 
@@ -502,6 +656,6 @@
 
     <div id="toast" class="toast hidden"></div>
 
-    <script src="/static/app.js?v=20260501a"></script>
+    <script src="/static/app.js?v=20260520b"></script>
   </body>
   </html>

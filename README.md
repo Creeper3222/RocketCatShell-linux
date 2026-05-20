@@ -7,15 +7,30 @@
 
 本项目的目标不是继续做一个“宿主里的桥接插件”，而是把 RocketCat 发展成一套真正独立的 `Rocket.Chat <-> OneBot v11` 桥接软件。
 
-这个 live 目录对应的是 RocketCatShell 的 Linux / Docker 迁移版：核心功能现已与 Windows `v0.1.5` rebuild 对齐，同时保留容器初始化、外部挂载目录、内置插件自动补种，以及 Docker 专属共享媒体路径翻译 / Base64 兼容策略等 docker 化包装层。
+这个 live 目录对应的是 RocketCatShell 的 Linux / Docker 迁移版：核心功能现已与 Windows `v0.1.6` rebuild 对齐，同时保留容器初始化、外部挂载目录、内置插件自动补种，以及 Docker 专属共享媒体路径翻译 / Base64 兼容策略等 docker 化包装层。
 
-> 当前 README 对应版本为 `v0.1.5`。`v0.1.3` 是破坏性架构重构基线，`v0.1.4` 统一收口性能优化，而 `v0.1.5` 继续补齐内置指令、本地 typing 指示器适配、单实例启动保护，以及 Rocket.Chat 旧版 / 8.x 媒体上传兼容与 `#rocketcat` 新旧服兼容收口。
+> 当前 README 对应版本为 `v0.1.6`。`v0.1.3` 是破坏性架构重构基线，`v0.1.4` 统一收口性能优化，`v0.1.5` 补齐了内置指令与运维增强，而 `v0.1.6` 继续把重点推进到更实用的运行诊断可观测性、真实负载 benchmark 和入站热路径性能收口。
 
 这意味着：
 
 - RocketCatShell 自己拥有 `config/`、`data/`、`logs/` 目录边界。
 - RocketCatShell 自己提供本地 WebUI、登录认证、Bot 管理和插件管理。
 - RocketCatShell 仍然可以作为 OneBot reverse WebSocket 客户端与 AstrBot 协同，但不再依赖 AstrBot 插件宿主才能运行。
+
+---
+
+## v0.1.6（诊断可观测性与性能收口更新）
+
+`v0.1.6` 建立在 `v0.1.5` 的内置指令、Shell 插件系统和独立 WebUI 管理面之上。这一版不再继续增加新的大块宿主能力，而是把这套独立 Shell 更像“可发布软件”地收口：一方面补上更直观、更低延迟的运行诊断与状态可观测性，另一方面把入站翻译热路径和 benchmark 工具一起推进到更贴近真实负载的状态，方便后续继续做针对性优化。
+
+- `/api/diagnostics` 的主机快照采集现在改为短 TTL 缓存，避免每次请求都重新执行一次固定 CPU 采样等待；内置 `#system` 指令也复用同一套缓存逻辑，页面刷新、轮询和房间内诊断命令不再重复触发整段采样开销。
+- 运行诊断已从“网络配置”页拆分为独立导航页，并新增主机快照缓存状态、快照年龄、TTL 等元数据展示。WebUI 现在可以直接区分当前是缓存命中、实时采样还是采样失败，而不是只看到一份静态诊断结果。
+- 运行诊断页的主机 CPU / 内存摘要已升级为更直观的环形指示器视图，并补充系统总占用与 Shell 进程占用的双层视觉表达，配合在线 Bot / Snapshot / Journal 汇总，更适合长时间运行时做快速巡检。
+- Docker 版这里展示和 `#system` 返回的仍然是当前容器运行环境；容器外宿主机路径可见性、共享媒体目录翻译和 Base64 兼容策略没有被这次更新改写。
+- 入站翻译热路径继续做了针对性优化：引用上下文任务只在确实可能存在引用时才构建；回复来源解析结果复用，避免重复扫描正文；纯文本引用不再误走 quoted media 提取；消息注册表 entry 复制路径改为面向 JSON-like 结构的轻量 clone；媒体描述提取改为单次遍历并为扁平 attachment 场景增加快速路径，继续压低高频图片 / 引用 / 混合消息场景下的固定开销。
+- `tools/benchmark_inbound_translate.py` 现在支持 `--profile realistic`，可直接带入更接近真实环境的 room info / quote fetch / media delay，并新增 `quote_image`、`media_mix` 场景，避免只靠零延迟微基准得到过于理想化的结论。
+
+升级到 `v0.1.6` 不需要迁移 `v0.1.5` 的配置目录、热存储 snapshot / journal 或本地插件数据；Docker / Linux 版在更新源码后重新构建镜像即可。如果浏览器已经打开旧版 WebUI，刷新页面以获取最新静态资源。
 
 ---
 

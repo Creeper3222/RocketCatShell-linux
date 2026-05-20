@@ -13,6 +13,7 @@ from ..__init__ import __version__
 from ..bridge.hot_storage import build_runtime_hot_stores
 from ..bridge.id_map import DurableIdMap
 from ..bridge.runtime import BridgeRuntime
+from ..diagnostics import build_runtime_diagnostic_item, collect_cached_host_diagnostics_with_meta
 from ..layout import ProjectLayout
 from ..logger import logger
 from ..models import BotRecord, DEFAULT_WEBUI_ACCESS_PASSWORD, ShellSettings, _coerce_bool
@@ -22,6 +23,7 @@ from ..settings import load_or_create_shell_settings, read_json, write_json
 
 
 ROCKETCAT_CONFIG_MARKER_FIELD = "Is rocketcat config"
+_HOST_DIAGNOSTICS_CACHE_TTL_SECONDS = 3.0
 
 
 class ShellManager:
@@ -386,6 +388,90 @@ class ShellManager:
             "summary": {
                 "enabled_count": len(items),
                 "online_count": online_count,
+            },
+        }
+
+    async def get_diagnostics_state(self) -> dict[str, Any]:
+        settings = self._require_settings()
+        async with self._lock:
+            bots = list(self.bots)
+            runtimes = dict(self.runtimes)
+
+        try:
+            host_snapshot, host_cache = await asyncio.to_thread(
+                collect_cached_host_diagnostics_with_meta,
+                product_version=__version__,
+                cache_ttl_seconds=_HOST_DIAGNOSTICS_CACHE_TTL_SECONDS,
+            )
+            host_error = ""
+        except RuntimeError as exc:
+            host_snapshot = None
+            host_cache = {
+                "cache_enabled": _HOST_DIAGNOSTICS_CACHE_TTL_SECONDS > 0,
+                "cache_hit": False,
+                "cache_status": "error",
+                "cache_ttl_seconds": _HOST_DIAGNOSTICS_CACHE_TTL_SECONDS,
+                "captured_at": None,
+                "snapshot_age_seconds": None,
+            }
+            host_error = str(exc)
+        except Exception as exc:
+            logger.warning("[RocketCatShell] 采集主机诊断快照失败: %r", exc)
+            host_snapshot = None
+            host_cache = {
+                "cache_enabled": _HOST_DIAGNOSTICS_CACHE_TTL_SECONDS > 0,
+                "cache_hit": False,
+                "cache_status": "error",
+                "cache_ttl_seconds": _HOST_DIAGNOSTICS_CACHE_TTL_SECONDS,
+                "captured_at": None,
+                "snapshot_age_seconds": None,
+            }
+            host_error = "主机诊断快照采集失败，请检查日志。"
+
+        items: list[dict[str, Any]] = []
+        for bot in bots:
+            runtime = runtimes.get(bot.bot_id)
+            if runtime is not None:
+                item = runtime.build_diagnostic_summary()
+            else:
+                item = build_runtime_diagnostic_item(
+                    instance_name=bot.name or bot.bot_id,
+                    config=bot,
+                    rocketchat=None,
+                    started=False,
+                    data_dir=self.layout.bots_dir / bot.bot_id,
+                    message_index_max_entries=settings.message_index_max_entries,
+                )
+            items.append(item)
+
+        items.sort(
+            key=lambda item: (
+                item.get("status_code") != "online",
+                not item.get("enabled"),
+                str(item.get("client_name") or ""),
+            )
+        )
+        online_bot_count = sum(1 for item in items if item.get("status_code") == "online")
+        enabled_bot_count = sum(1 for item in items if item.get("enabled"))
+        reconnecting_bot_count = sum(
+            1
+            for item in items
+            if item.get("enabled") and int(item.get("reconnect_failures") or 0) > 0
+        )
+        total_runtime_snapshot_bytes = sum(int(item.get("runtime_snapshot_bytes") or 0) for item in items)
+        total_runtime_journal_bytes = sum(int(item.get("runtime_journal_bytes") or 0) for item in items)
+        return {
+            "host": host_snapshot,
+            "host_cache": host_cache,
+            "host_error": host_error,
+            "items": items,
+            "summary": {
+                "bot_count": len(items),
+                "enabled_bot_count": enabled_bot_count,
+                "online_bot_count": online_bot_count,
+                "reconnecting_bot_count": reconnecting_bot_count,
+                "total_runtime_snapshot_bytes": total_runtime_snapshot_bytes,
+                "total_runtime_journal_bytes": total_runtime_journal_bytes,
             },
         }
 

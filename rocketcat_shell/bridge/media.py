@@ -129,9 +129,20 @@ class RocketChatMediaBridge:
             },
         }
 
-    def classify_file_kind(self, file_obj: dict[str, Any]) -> str:
-        candidates: list[str] = []
+    @staticmethod
+    def _match_media_kind(candidate: Any) -> str | None:
+        if not isinstance(candidate, str):
+            return None
+        normalized = candidate.strip().lower()
+        if normalized.startswith("image/"):
+            return "image"
+        if normalized.startswith("audio/"):
+            return "audio"
+        if normalized.startswith("video/"):
+            return "video"
+        return None
 
+    def classify_file_kind(self, file_obj: dict[str, Any]) -> str:
         for key in (
             "type",
             "mimeType",
@@ -140,9 +151,21 @@ class RocketChatMediaBridge:
             "audio_type",
             "video_type",
         ):
+            matched_kind = self._match_media_kind(file_obj.get(key))
+            if matched_kind:
+                return matched_kind
+
+        for key, kind in (
+            ("image_url", "image"),
+            ("imageUrl", "image"),
+            ("audio_url", "audio"),
+            ("audioUrl", "audio"),
+            ("video_url", "video"),
+            ("videoUrl", "video"),
+        ):
             value = file_obj.get(key)
             if isinstance(value, str) and value:
-                candidates.append(value)
+                return kind
 
         for key in (
             "name",
@@ -163,16 +186,9 @@ class RocketChatMediaBridge:
             if not isinstance(value, str) or not value:
                 continue
             guessed, _ = mimetypes.guess_type(value.split("?", 1)[0])
-            if guessed:
-                candidates.append(guessed)
-
-        for candidate in candidates:
-            if candidate.startswith("image/"):
-                return "image"
-            if candidate.startswith("audio/"):
-                return "audio"
-            if candidate.startswith("video/"):
-                return "video"
+            matched_kind = self._match_media_kind(guessed)
+            if matched_kind:
+                return matched_kind
 
         return "file"
 
@@ -197,6 +213,90 @@ class RocketChatMediaBridge:
             )
         return result
 
+    def _iter_attachment_sources(
+        self,
+        payload: dict[str, Any],
+        *,
+        skip_quote_attachments: bool = False,
+    ):
+        attachments = payload.get("attachments", [])
+        if isinstance(attachments, dict):
+            attachments = [attachments]
+        if not isinstance(attachments, list):
+            return
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            if skip_quote_attachments and attachment.get("message_link"):
+                continue
+            yield attachment
+            yield from self._iter_attachment_sources(
+                attachment,
+                skip_quote_attachments=skip_quote_attachments,
+            )
+
+    @staticmethod
+    def _has_media_shaped_value(source: dict[str, Any], keys: tuple[str, ...]) -> bool:
+        for key in keys:
+            if source.get(key):
+                return True
+        return False
+
+    @staticmethod
+    def _normalize_attachment_list(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
+        attachments = payload.get("attachments")
+        if isinstance(attachments, dict):
+            attachments = [attachments]
+        if not isinstance(attachments, list):
+            return None
+        normalized = [attachment for attachment in attachments if isinstance(attachment, dict)]
+        return normalized or None
+
+    def _can_fast_extract_attachment_descriptors(
+        self,
+        payload: dict[str, Any],
+        *,
+        skip_quote_attachments: bool,
+        include_url_images: bool,
+    ) -> list[dict[str, Any]] | None:
+        if payload.get("files") or payload.get("file") or payload.get("fileUpload"):
+            return None
+        if self._has_media_shaped_value(
+            payload,
+            (
+                "type",
+                "mimeType",
+                "contentType",
+                "image_url",
+                "imageUrl",
+                "audio_url",
+                "audioUrl",
+                "video_url",
+                "videoUrl",
+                "title_link",
+                "titleLink",
+                "url",
+                "path",
+                "link",
+            ),
+        ):
+            return None
+        if include_url_images and isinstance(payload.get("urls"), list) and payload.get("urls"):
+            return None
+
+        attachments = self._normalize_attachment_list(payload)
+        if not attachments:
+            return None
+
+        fast_candidates: list[dict[str, Any]] = []
+        for attachment in attachments:
+            if skip_quote_attachments and attachment.get("message_link"):
+                return None
+            if attachment.get("attachments") or attachment.get("files") or attachment.get("file") or attachment.get("fileUpload"):
+                return None
+            fast_candidates.append(attachment)
+        return fast_candidates or None
+
     async def extract_media_descriptors(
         self,
         payload: dict[str, Any],
@@ -206,7 +306,6 @@ class RocketChatMediaBridge:
     ) -> list[dict[str, str]]:
         media: list[dict[str, str]] = []
         seen: set[tuple[str, str]] = set()
-        candidates: list[dict[str, Any]] = []
         media_shaped_keys = (
             "type",
             "mimeType",
@@ -379,7 +478,7 @@ class RocketChatMediaBridge:
                 return bytes(raw)
         except Exception as exc:
             logger.error(f"[RocketChatOneBotBridge] 下载媒体异常: {exc!r}")
-            return None
+        return None
 
     async def _select_media_url(
         self,
@@ -428,7 +527,7 @@ class RocketChatMediaBridge:
             ),
         }
 
-        for key in key_candidates.get(target_kind, ()): 
+        for key in key_candidates.get(target_kind, ()):
             value = file_obj.get(key)
             if isinstance(value, str) and value:
                 return await self.client._normalize_media_url(value)

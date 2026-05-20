@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
+
+from rocketcat_shell import __version__
+from rocketcat_shell.diagnostics import (
+    build_runtime_diagnostic_item,
+    collect_cached_host_diagnostics,
+    format_host_diagnostics_text,
+)
+
 import os
 import platform
 import socket
 import time
 from datetime import datetime
-from typing import Any
 
 try:
     import winreg
@@ -134,7 +142,7 @@ class Plugin(RocketCatPlugin):
         runtime: PluginExecutionContext,
     ) -> list[dict[str, Any]]:
         try:
-            system_snapshot_text = await self._build_system_snapshot_text()
+            system_snapshot_text = await self._build_system_snapshot_text(runtime)
         except RuntimeError as exc:
             logger.warning(
                 "[RocketCatShell][Plugin:%s] 构建 #system 快照失败: %r",
@@ -253,9 +261,20 @@ class Plugin(RocketCatPlugin):
 
         return sent_messages
 
-    async def _build_system_snapshot_text(self) -> str:
-        snapshot = await asyncio.to_thread(self._collect_system_snapshot)
-        return self._format_system_snapshot(snapshot)
+    async def _build_system_snapshot_text(self, runtime: PluginExecutionContext) -> str:
+        snapshot = await asyncio.to_thread(
+            collect_cached_host_diagnostics,
+            product_version=__version__,
+            cpu_sample_seconds=_SYSTEM_CPU_SAMPLE_SECONDS,
+            cache_ttl_seconds=_SYSTEM_CPU_SAMPLE_SECONDS + 1.0,
+        )
+        runtime_item = build_runtime_diagnostic_item(
+            instance_name=runtime.instance_name,
+            config=runtime.bridge_config,
+            rocketchat=runtime.rocketchat,
+            started=True,
+        )
+        return format_host_diagnostics_text(snapshot, runtime_items=[runtime_item])
 
     def _collect_system_snapshot(self) -> dict[str, str]:
         if psutil is None:
