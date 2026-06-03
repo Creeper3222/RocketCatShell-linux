@@ -12,6 +12,9 @@ from .config import BridgeConfig
 from .json_codec import json_dumps, json_loads
 
 
+_ONEBOT_WS_MAX_MSG_SIZE = 32 * 1024 * 1024
+
+
 ActionHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
 FailureCallback = Callable[[str, int, str], Awaitable[None]]
 
@@ -96,6 +99,7 @@ class OneBotReverseWsClient:
                     headers=headers,
                     heartbeat=30.0,
                     autoping=True,
+                    max_msg_size=_ONEBOT_WS_MAX_MSG_SIZE,
                 ) as ws:
                     self._ws = ws
                     self._consecutive_reconnect_failures = 0
@@ -104,8 +108,14 @@ class OneBotReverseWsClient:
                     self._sender_task = asyncio.create_task(self._sender_loop())
                     await self._listen_loop(ws)
                     if self._running:
+                        close_code = getattr(ws, "close_code", None)
+                        close_reason = (
+                            "，疑似收到超出限制的 OneBot 大消息"
+                            if close_code == 1009
+                            else ""
+                        )
                         logger.warning(
-                            f"[RocketChatOneBotBridge] OneBot reverse WS 已断开，{self.config.reconnect_delay:.1f}s 后重连。"
+                            f"[RocketChatOneBotBridge] OneBot reverse WS 已断开 (close_code={close_code}){close_reason}，{self.config.reconnect_delay:.1f}s 后重连。"
                         )
                         await asyncio.sleep(self.config.reconnect_delay)
             except asyncio.CancelledError:

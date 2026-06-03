@@ -26,6 +26,7 @@
 - `/api/diagnostics` 的主机快照采集现在改为短 TTL 缓存，避免每次请求都重新执行一次固定 CPU 采样等待；内置 `#system` 指令也复用同一套缓存逻辑，页面刷新、轮询和房间内诊断命令不再重复触发整段采样开销。
 - 运行诊断已从“网络配置”页拆分为独立导航页，并新增主机快照缓存状态、快照年龄、TTL 等元数据展示。WebUI 现在可以直接区分当前是缓存命中、实时采样还是采样失败，而不是只看到一份静态诊断结果。
 - 运行诊断页的主机 CPU / 内存摘要已升级为更直观的环形指示器视图，并补充系统总占用与 Shell 进程占用的双层视觉表达，配合在线 Bot / Snapshot / Journal 汇总，更适合长时间运行时做快速巡检。
+- OneBot reverse WebSocket 客户端现在会显式放宽 `aiohttp` 的入站消息大小上限，并在断链日志里补充 `close_code`。这修复了 AstrBot 侧较大的 `base64://` 图片动作在进入 RocketCatShell 前就触发 reverse WS 断开的问题；Docker / Linux 版在启用 Base64 兼容传输或接收较大的本地图片动作时，也不再被默认 `4 MiB` 帧限制提前截断。
 - Docker 版这里展示和 `#system` 返回的仍然是当前容器运行环境；容器外宿主机路径可见性、共享媒体目录翻译和 Base64 兼容策略没有被这次更新改写。
 - 入站翻译热路径继续做了针对性优化：引用上下文任务只在确实可能存在引用时才构建；回复来源解析结果复用，避免重复扫描正文；纯文本引用不再误走 quoted media 提取；消息注册表 entry 复制路径改为面向 JSON-like 结构的轻量 clone；媒体描述提取改为单次遍历并为扁平 attachment 场景增加快速路径，继续压低高频图片 / 引用 / 混合消息场景下的固定开销。
 - `tools/benchmark_inbound_translate.py` 现在支持 `--profile realistic`，可直接带入更接近真实环境的 room info / quote fetch / media delay，并新增 `quote_image`、`media_mix` 场景，避免只靠零延迟微基准得到过于理想化的结论。
