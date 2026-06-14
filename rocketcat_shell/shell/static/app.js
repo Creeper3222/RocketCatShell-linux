@@ -19,6 +19,7 @@ const DEFAULT_FORM = {
 };
 
 const ROCKETCAT_CONFIG_MARKER_FIELD = 'Is rocketcat config';
+const FILE_IMAGE_EXTENSIONS = new Set(['.bmp', '.gif', '.jpeg', '.jpg', '.png', '.webp']);
 
 const state = {
   editingId: null,
@@ -63,6 +64,40 @@ const state = {
     current: null,
     pendingUninstall: null,
   },
+  files: {
+    path: '',
+    parentPath: '',
+    canGoUp: false,
+    rootPath: '',
+    items: [],
+    loaded: false,
+    loading: false,
+    uploading: false,
+    downloading: false,
+    uploadVisible: false,
+    createType: 'file',
+    selectedPaths: new Set(),
+    moving: false,
+    moveTargetPath: '',
+    moveTree: {
+      directories: new Map(),
+      expanded: new Set(),
+      loading: new Set(),
+    },
+    pendingDeletePaths: null,
+    pendingMovePaths: null,
+    pendingRenameItem: null,
+    pendingAuthItem: null,
+    pendingAuthMode: 'edit',
+    previewItem: null,
+    editingFile: null,
+    pendingSave: false,
+    imageViewer: {
+      visible: false,
+      items: [],
+      index: 0,
+    },
+  },
 };
 
 function getSuggestedOnebotSelfId() {
@@ -87,6 +122,7 @@ const elements = {
   logsPage: document.getElementById('logsPage'),
   settingsPage: document.getElementById('settingsPage'),
   pluginsPage: document.getElementById('pluginsPage'),
+  filesPage: document.getElementById('filesPage'),
   bridgeStatus: document.getElementById('bridgeStatus'),
   mainBotStatus: document.getElementById('mainBotStatus'),
   webuiStatus: document.getElementById('webuiStatus'),
@@ -141,6 +177,29 @@ const elements = {
   basicRefreshButton: document.getElementById('basicRefreshButton'),
   settingsRefreshButton: document.getElementById('settingsRefreshButton'),
   pluginsRefreshButton: document.getElementById('pluginsRefreshButton'),
+  fileRefreshButton: document.getElementById('fileRefreshButton'),
+  fileUpButton: document.getElementById('fileUpButton'),
+  fileCreateButton: document.getElementById('fileCreateButton'),
+  fileUploadButton: document.getElementById('fileUploadButton'),
+  fileDeleteSelectedButton: document.getElementById('fileDeleteSelectedButton'),
+  fileMoveSelectedButton: document.getElementById('fileMoveSelectedButton'),
+  fileDownloadSelectedButton: document.getElementById('fileDownloadSelectedButton'),
+  fileDeleteSelectedCount: document.getElementById('fileDeleteSelectedCount'),
+  fileMoveSelectedCount: document.getElementById('fileMoveSelectedCount'),
+  fileDownloadSelectedCount: document.getElementById('fileDownloadSelectedCount'),
+  fileCurrentPath: document.getElementById('fileCurrentPath'),
+  fileRootPath: document.getElementById('fileRootPath'),
+  fileItemCount: document.getElementById('fileItemCount'),
+  fileSensitiveCount: document.getElementById('fileSensitiveCount'),
+  fileBreadcrumb: document.getElementById('fileBreadcrumb'),
+  fileStatus: document.getElementById('fileStatus'),
+  fileUploadZone: document.getElementById('fileUploadZone'),
+  fileUploadInput: document.getElementById('fileUploadInput'),
+  fileUploadPickButton: document.getElementById('fileUploadPickButton'),
+  fileUploadStatus: document.getElementById('fileUploadStatus'),
+  fileTableBody: document.getElementById('fileTableBody'),
+  fileSelectAllInput: document.getElementById('fileSelectAllInput'),
+  fileEmptyState: document.getElementById('fileEmptyState'),
   modal: document.getElementById('botModal'),
   modalTitle: document.getElementById('modalTitle'),
   form: document.getElementById('botForm'),
@@ -176,6 +235,63 @@ const elements = {
   pluginUninstallCloseButton: document.getElementById('pluginUninstallCloseButton'),
   pluginUninstallCancelButton: document.getElementById('pluginUninstallCancelButton'),
   pluginUninstallConfirmButton: document.getElementById('pluginUninstallConfirmButton'),
+  filePreviewModal: document.getElementById('filePreviewModal'),
+  filePreviewTitle: document.getElementById('filePreviewTitle'),
+  filePreviewMeta: document.getElementById('filePreviewMeta'),
+  filePreviewNotice: document.getElementById('filePreviewNotice'),
+  filePreviewContent: document.getElementById('filePreviewContent'),
+  filePreviewCloseButton: document.getElementById('filePreviewCloseButton'),
+  filePreviewCancelButton: document.getElementById('filePreviewCancelButton'),
+  fileEditModal: document.getElementById('fileEditModal'),
+  fileEditPathChip: document.getElementById('fileEditPathChip'),
+  fileEditNotice: document.getElementById('fileEditNotice'),
+  fileEditLineNumbers: document.getElementById('fileEditLineNumbers'),
+  fileEditContentInput: document.getElementById('fileEditContentInput'),
+  fileEditCloseButton: document.getElementById('fileEditCloseButton'),
+  fileEditCancelButton: document.getElementById('fileEditCancelButton'),
+  fileEditSaveButton: document.getElementById('fileEditSaveButton'),
+  fileSaveConfirmModal: document.getElementById('fileSaveConfirmModal'),
+  fileSaveConfirmTitle: document.getElementById('fileSaveConfirmTitle'),
+  fileSaveConfirmMessage: document.getElementById('fileSaveConfirmMessage'),
+  fileSaveConfirmCloseButton: document.getElementById('fileSaveConfirmCloseButton'),
+  fileSaveConfirmCancelButton: document.getElementById('fileSaveConfirmCancelButton'),
+  fileSaveConfirmSubmitButton: document.getElementById('fileSaveConfirmSubmitButton'),
+  fileImageViewer: document.getElementById('fileImageViewer'),
+  fileImageViewerCount: document.getElementById('fileImageViewerCount'),
+  fileImageViewerImage: document.getElementById('fileImageViewerImage'),
+  fileImageViewerCloseButton: document.getElementById('fileImageViewerCloseButton'),
+  fileImageViewerPrevButton: document.getElementById('fileImageViewerPrevButton'),
+  fileImageViewerNextButton: document.getElementById('fileImageViewerNextButton'),
+  fileCreateModal: document.getElementById('fileCreateModal'),
+  fileCreateNameInput: document.getElementById('fileCreateNameInput'),
+  fileCreateCloseButton: document.getElementById('fileCreateCloseButton'),
+  fileCreateCancelButton: document.getElementById('fileCreateCancelButton'),
+  fileCreateSubmitButton: document.getElementById('fileCreateSubmitButton'),
+  fileCreateTypeButtons: Array.from(document.querySelectorAll('[data-file-create-type]')),
+  fileDeleteModal: document.getElementById('fileDeleteModal'),
+  fileDeleteTitle: document.getElementById('fileDeleteTitle'),
+  fileDeleteMessage: document.getElementById('fileDeleteMessage'),
+  fileDeleteCloseButton: document.getElementById('fileDeleteCloseButton'),
+  fileDeleteCancelButton: document.getElementById('fileDeleteCancelButton'),
+  fileDeleteConfirmButton: document.getElementById('fileDeleteConfirmButton'),
+  fileMoveModal: document.getElementById('fileMoveModal'),
+  fileMoveTree: document.getElementById('fileMoveTree'),
+  fileMoveSelectedPath: document.getElementById('fileMoveSelectedPath'),
+  fileMoveSelectionInfo: document.getElementById('fileMoveSelectionInfo'),
+  fileMoveCloseButton: document.getElementById('fileMoveCloseButton'),
+  fileMoveCancelButton: document.getElementById('fileMoveCancelButton'),
+  fileMoveConfirmButton: document.getElementById('fileMoveConfirmButton'),
+  fileRenameModal: document.getElementById('fileRenameModal'),
+  fileRenameNameInput: document.getElementById('fileRenameNameInput'),
+  fileRenameCloseButton: document.getElementById('fileRenameCloseButton'),
+  fileRenameCancelButton: document.getElementById('fileRenameCancelButton'),
+  fileRenameSubmitButton: document.getElementById('fileRenameSubmitButton'),
+  fileAuthModal: document.getElementById('fileAuthModal'),
+  fileAuthMessage: document.getElementById('fileAuthMessage'),
+  fileAuthPasswordInput: document.getElementById('fileAuthPasswordInput'),
+  fileAuthCloseButton: document.getElementById('fileAuthCloseButton'),
+  fileAuthCancelButton: document.getElementById('fileAuthCancelButton'),
+  fileAuthSubmitButton: document.getElementById('fileAuthSubmitButton'),
   toast: document.getElementById('toast'),
   logConsole: document.getElementById('logConsole'),
   logAutoScrollToggle: document.getElementById('logAutoScrollToggle'),
@@ -196,12 +312,16 @@ function showToast(message, kind = 'default') {
 }
 
 async function requestJson(url, options = {}) {
+  const { headers: optionHeaders, ...requestOptions } = options;
+  const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData;
   const response = await fetch(url, {
-    headers: {
-      'Content-Type': 'application/json',
-      ...(options.headers || {}),
-    },
-    ...options,
+    headers: isFormData
+      ? { ...(optionHeaders || {}) }
+      : {
+          'Content-Type': 'application/json',
+          ...(optionHeaders || {}),
+        },
+    ...requestOptions,
   });
   const payload = await response.json().catch(() => ({}));
   if (response.status === 401 && !options.skipAuthRedirect) {
@@ -213,6 +333,27 @@ async function requestJson(url, options = {}) {
     throw new Error(payload.error || payload.detail || '请求失败');
   }
   return payload;
+}
+
+async function requestBlob(url, options = {}) {
+  const { headers: optionHeaders, ...requestOptions } = options;
+  const response = await fetch(url, {
+    headers: {
+      'Content-Type': 'application/json',
+      ...(optionHeaders || {}),
+    },
+    ...requestOptions,
+  });
+  if (response.status === 401 && !options.skipAuthRedirect) {
+    stopLogPolling();
+    window.location.replace('/');
+    throw new Error('登录已失效，请重新登录');
+  }
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.error || payload.detail || '请求失败');
+  }
+  return response.blob();
 }
 
 function isAbortError(error) {
@@ -310,6 +451,7 @@ function setActivePage(page) {
   elements.logsPage.classList.toggle('hidden', page !== 'logs');
   elements.settingsPage.classList.toggle('hidden', page !== 'settings');
   elements.pluginsPage.classList.toggle('hidden', page !== 'plugins');
+  elements.filesPage.classList.toggle('hidden', page !== 'files');
 
   for (const button of elements.navButtons) {
     const isActive = button.dataset.page === page;
@@ -388,6 +530,10 @@ async function activatePage(page, { forceReload = false } = {}) {
   }
   if (page === 'plugins') {
     await loadPlugins({ forceReload, silent: false });
+    return;
+  }
+  if (page === 'files') {
+    await loadFiles({ forceReload, silent: false });
   }
 }
 
@@ -835,10 +981,10 @@ function renderSettings(payload) {
   elements.settingsAuthStatus.textContent = settings.webui_auth_enabled ? '已启用' : '未启用';
   elements.settingsPasswordMode.textContent = isDefaultPassword ? '默认密码' : '已自定义';
   elements.settingsPasswordHint.textContent = isDefaultPassword
-    ? '当前仍在使用默认密码 123456，请尽快修改。'
-    : '当前已使用自定义 WebUI 登录密码。';
+    ? '当前仍在使用默认密码 123456，请尽快修改；该密码也用于敏感文件预览鉴权。'
+    : '当前已使用自定义 WebUI 登录认证 / 文件管理鉴权密码。';
   if (elements.settingsPasswordHelper) {
-    elements.settingsPasswordHelper.textContent = '保存后立即生效。当前会话会保留，后续重新登录需使用新密码。';
+    elements.settingsPasswordHelper.textContent = '保存后立即生效。当前会话会保留，后续重新登录和打开敏感持久化数据文件都需使用新密码。';
   }
   if (elements.settingsPortHint) {
     elements.settingsPortHint.textContent = settings.webui_port_hint
@@ -1348,6 +1494,1194 @@ function escapeHtml(value) {
     .replaceAll("'", '&#39;');
 }
 
+function normalizeFilePath(value = '') {
+  return String(value || '')
+    .replaceAll('\\', '/')
+    .split('/')
+    .filter((part) => part && part !== '.')
+    .join('/');
+}
+
+function formatFilePath(value = '') {
+  const normalized = normalizeFilePath(value);
+  return normalized ? `/${normalized}` : '/';
+}
+
+function joinFilePath(basePath = '', childPath = '') {
+  const base = normalizeFilePath(basePath);
+  const child = normalizeFilePath(childPath);
+  if (base && child) {
+    return `${base}/${child}`;
+  }
+  return child || base;
+}
+
+function getFileExtension(item = {}) {
+  const extension = String(item.extension || '').toLowerCase();
+  if (extension) {
+    return extension;
+  }
+  const name = String(item.name || item.path || '');
+  const dotIndex = name.lastIndexOf('.');
+  return dotIndex >= 0 ? name.slice(dotIndex).toLowerCase() : '';
+}
+
+function isFileImage(item = {}) {
+  return item.preview_type === 'image' || FILE_IMAGE_EXTENSIONS.has(getFileExtension(item));
+}
+
+function buildFilePreviewUrl(pathValue = '') {
+  return `/api/files/preview?path=${encodeURIComponent(normalizeFilePath(pathValue))}`;
+}
+
+function formatFileSize(value, isDirectory = false) {
+  if (isDirectory) {
+    return '-';
+  }
+  const size = Number(value);
+  if (!Number.isFinite(size) || size < 0) {
+    return '-';
+  }
+  if (size < 1024) {
+    return `${size} B`;
+  }
+  if (size < 1024 ** 2) {
+    return `${(size / 1024).toFixed(1)} KB`;
+  }
+  if (size < 1024 ** 3) {
+    return `${(size / (1024 ** 2)).toFixed(1)} MB`;
+  }
+  return `${(size / (1024 ** 3)).toFixed(2)} GB`;
+}
+
+function formatFileTime(value) {
+  if (!value) {
+    return '-';
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return '-';
+  }
+  return date.toLocaleString();
+}
+
+function validateRelativeFileName(value = '') {
+  const normalized = normalizeFilePath(value);
+  if (!normalized) {
+    throw new Error('名称不能为空');
+  }
+  if (String(value || '').startsWith('/') || /^[A-Za-z]:/.test(String(value || ''))) {
+    throw new Error('名称必须是相对路径');
+  }
+  if (normalized.split('/').some((part) => part === '..')) {
+    throw new Error('名称不能包含上级目录');
+  }
+  if (/[<>:"|?*]/.test(normalized)) {
+    throw new Error('名称包含非法字符');
+  }
+  return normalized;
+}
+
+function validateFileBaseName(value = '') {
+  const name = String(value || '').trim();
+  if (!name) {
+    throw new Error('名称不能为空');
+  }
+  if (name === '.' || name === '..' || name.includes('/') || name.includes('\\')) {
+    throw new Error('名称不能包含目录层级');
+  }
+  if (/^[A-Za-z]:/.test(name) || /[<>:"|?*]/.test(name)) {
+    throw new Error('名称包含非法字符');
+  }
+  return name;
+}
+
+function getFileIconVariant(item) {
+  const extension = getFileExtension(item);
+  if (extension === '.txt') {
+    return 'text';
+  }
+  if (extension === '.json' || extension === '.py' || extension === '.md') {
+    return 'code';
+  }
+  if (extension === '.pdf') {
+    return 'pdf';
+  }
+  if (extension === '.doc' || extension === '.docx') {
+    return 'word';
+  }
+  return 'generic';
+}
+
+function renderDocumentFileIcon(variant) {
+  const icons = {
+    generic: `
+      <span class="file-icon file-icon--file file-icon--file-generic" aria-hidden="true">
+        <svg viewBox="0 0 24 24" focusable="false">
+          <path d="M6.8 2.8h7.1l5.3 5.3v13.1H6.8c-1.1 0-2-.9-2-2V4.8c0-1.1.9-2 2-2Z" />
+          <path d="M13.8 2.8v5.3c0 .6.5 1.1 1.1 1.1h5.3L13.8 2.8Z" />
+        </svg>
+      </span>
+    `,
+    text: `
+      <span class="file-icon file-icon--file file-icon--file-text" aria-hidden="true">
+        <svg viewBox="0 0 24 24" focusable="false">
+          <path fill="#6b7280" d="M6.8 2.8h7.1l5.3 5.3v13.1H6.8c-1.1 0-2-.9-2-2V4.8c0-1.1.9-2 2-2Z" />
+          <path fill="rgba(255,255,255,0.42)" d="M13.8 2.8v5.3c0 .6.5 1.1 1.1 1.1h5.3L13.8 2.8Z" />
+          <rect x="8.2" y="11" width="7.4" height="1.3" rx=".65" fill="#ffffff" />
+          <rect x="8.2" y="13.6" width="7.4" height="1.3" rx=".65" fill="#ffffff" />
+          <rect x="8.2" y="16.2" width="6.1" height="1.3" rx=".65" fill="#ffffff" />
+        </svg>
+      </span>
+    `,
+    code: `
+      <span class="file-icon file-icon--file file-icon--file-code" aria-hidden="true">
+        <svg viewBox="0 0 24 24" focusable="false">
+          <path fill="#4f8df8" d="M6.8 2.8h7.1l5.3 5.3v13.1H6.8c-1.1 0-2-.9-2-2V4.8c0-1.1.9-2 2-2Z" />
+          <path fill="#dbeafe" d="M13.8 2.8v5.3c0 .6.5 1.1 1.1 1.1h5.3L13.8 2.8Z" />
+          <path d="m10.2 11.3-2.2 2.2 2.2 2.2" fill="none" stroke="#ffffff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+          <path d="m13.8 11.3 2.2 2.2-2.2 2.2" fill="none" stroke="#ffffff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      </span>
+    `,
+    pdf: `
+      <span class="file-icon file-icon--file file-icon--file-pdf" aria-hidden="true">
+        <svg viewBox="0 0 24 24" focusable="false">
+          <path fill="#f97316" d="M6.8 2.8h7.1l5.3 5.3v13.1H6.8c-1.1 0-2-.9-2-2V4.8c0-1.1.9-2 2-2Z" />
+          <path fill="#fdba74" d="M13.8 2.8v5.3c0 .6.5 1.1 1.1 1.1h5.3L13.8 2.8Z" />
+          <text x="12" y="17.2" text-anchor="middle" fill="#ffffff" font-size="4.5" font-weight="700" font-family="Segoe UI, Arial, sans-serif">PDF</text>
+        </svg>
+      </span>
+    `,
+    word: `
+      <span class="file-icon file-icon--file file-icon--file-word" aria-hidden="true">
+        <svg viewBox="0 0 24 24" focusable="false">
+          <path fill="#4f8df8" d="M6.8 2.8h7.1l5.3 5.3v13.1H6.8c-1.1 0-2-.9-2-2V4.8c0-1.1.9-2 2-2Z" />
+          <path fill="#dbeafe" d="M13.8 2.8v5.3c0 .6.5 1.1 1.1 1.1h5.3L13.8 2.8Z" />
+          <text x="12" y="17.4" text-anchor="middle" fill="#ffffff" font-size="8.2" font-weight="700" font-family="Segoe UI, Arial, sans-serif">W</text>
+        </svg>
+      </span>
+    `,
+  };
+  return icons[variant] || icons.generic;
+}
+
+function renderFileIcon(item) {
+  if (item.is_directory) {
+    return `
+      <span class="file-icon file-icon--folder" aria-hidden="true">
+        <svg viewBox="0 0 24 24" focusable="false">
+          <path d="M2.8 7.2c0-1.3 1-2.3 2.3-2.3h5.3c.7 0 1.3.3 1.7.8l1.1 1.3h5.7c1.4 0 2.5 1.1 2.5 2.5v7.9c0 1.4-1.1 2.5-2.5 2.5H5.1c-1.3 0-2.3-1-2.3-2.3V7.2Z" />
+        </svg>
+      </span>
+    `;
+  }
+  if (isFileImage(item)) {
+    return `
+      <span class="file-icon file-icon--image" aria-hidden="true">
+        <img src="${escapeHtml(buildFilePreviewUrl(item.path))}" alt="" loading="lazy" />
+      </span>
+    `;
+  }
+  return renderDocumentFileIcon(getFileIconVariant(item));
+}
+
+function renderFileActionIcon(iconName) {
+  const icons = {
+    rename: `
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4.6 7.1h6.8" />
+        <path d="M4.6 12h5.2" />
+        <path d="M4.6 16.9h4.2" />
+        <path d="M13.4 17.6 18.7 12.3a1.7 1.7 0 0 0-2.4-2.4l-5.3 5.3-.7 3.1 3.1-.7Z" />
+      </svg>
+    `,
+    move: `
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="m12 3.8 3.2 3.2-3.2 3.2" />
+        <path d="M12 3.8 8.8 7 12 10.2" />
+        <path d="m12 13.8 3.2 3.2-3.2 3.2" />
+        <path d="M12 13.8 8.8 17 12 20.2" />
+        <path d="M3.8 12 7 8.8l3.2 3.2" />
+        <path d="M3.8 12 7 15.2l3.2-3.2" />
+        <path d="M13.8 12 17 8.8l3.2 3.2" />
+        <path d="M13.8 12 17 15.2l3.2-3.2" />
+      </svg>
+    `,
+    copy: `
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="8.2" y="8.2" width="10.2" height="10.2" rx="1.7" />
+        <path d="M6 14.6H5.7c-1 0-1.7-.8-1.7-1.7V5.7c0-1 .8-1.7 1.7-1.7h7.2c1 0 1.7.8 1.7 1.7V6" />
+      </svg>
+    `,
+    download: `
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M12 4.6v10.1" />
+        <path d="m7.4 10 4.6 4.6 4.6-4.6" />
+        <path d="M5.2 15.7v2.6c0 1 .8 1.9 1.9 1.9h9.8c1 0 1.9-.8 1.9-1.9v-2.6" />
+      </svg>
+    `,
+    trash: `
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4.8 7h14.4" />
+        <path d="M9.4 7V4.8h5.2V7" />
+        <path d="M7 7.2 7.7 20h8.6l.7-12.8" />
+        <path d="M10 10.7v5.5" />
+        <path d="M14 10.7v5.5" />
+      </svg>
+    `,
+  };
+  return icons[iconName] || '';
+}
+
+function getFileTypeLabel(item) {
+  if (item.is_directory) {
+    return '目录';
+  }
+  if (isFileImage(item)) {
+    return '图片文件';
+  }
+  if (getFileExtension(item) === '.pdf') {
+    if (item.is_protected || item.can_edit === false) {
+      return item.requires_password ? 'PDF文件 · 需鉴权 · 只读' : 'PDF文件 · 只读';
+    }
+    return item.requires_password ? 'PDF文件 · 需鉴权' : 'PDF文件';
+  }
+  if (item.preview_type === 'binary') {
+    return '文件 · 当前不可预览';
+  }
+  if (item.is_protected || item.can_edit === false) {
+    return item.requires_password ? '文本文件 · 需鉴权 · 只读' : '文本文件 · 只读';
+  }
+  return item.requires_password ? '文本文件 · 需鉴权' : '文本文件';
+}
+
+function getSelectedFileItems() {
+  return state.files.items.filter((item) => state.files.selectedPaths.has(normalizeFilePath(item.path)));
+}
+
+function getSelectedFilePaths() {
+  return getSelectedFileItems().map((item) => normalizeFilePath(item.path));
+}
+
+function pruneFileSelection() {
+  const visiblePaths = new Set(state.files.items.map((item) => normalizeFilePath(item.path)));
+  for (const selectedPath of Array.from(state.files.selectedPaths)) {
+    if (!visiblePaths.has(selectedPath)) {
+      state.files.selectedPaths.delete(selectedPath);
+    }
+  }
+}
+
+function renderFileSelectionState() {
+  const selectedCount = state.files.selectedPaths.size;
+  const visibleCount = state.files.items.length;
+  const hasSelection = selectedCount > 0;
+  const fileBusy = state.files.loading || state.files.uploading || state.files.moving || state.files.downloading;
+
+  elements.fileDeleteSelectedButton?.classList.toggle('hidden', !hasSelection);
+  elements.fileMoveSelectedButton?.classList.toggle('hidden', !hasSelection);
+  elements.fileDownloadSelectedButton?.classList.toggle('hidden', !hasSelection);
+  if (elements.fileDeleteSelectedCount) {
+    elements.fileDeleteSelectedCount.textContent = `(${selectedCount})`;
+  }
+  if (elements.fileMoveSelectedCount) {
+    elements.fileMoveSelectedCount.textContent = `(${selectedCount})`;
+  }
+  if (elements.fileDownloadSelectedCount) {
+    elements.fileDownloadSelectedCount.textContent = `(${selectedCount})`;
+  }
+  if (elements.fileDeleteSelectedButton) {
+    elements.fileDeleteSelectedButton.disabled = fileBusy || !hasSelection;
+  }
+  if (elements.fileMoveSelectedButton) {
+    elements.fileMoveSelectedButton.disabled = fileBusy || !hasSelection;
+  }
+  if (elements.fileDownloadSelectedButton) {
+    elements.fileDownloadSelectedButton.disabled = fileBusy || !hasSelection;
+  }
+  if (elements.fileSelectAllInput) {
+    elements.fileSelectAllInput.checked = visibleCount > 0 && selectedCount === visibleCount;
+    elements.fileSelectAllInput.indeterminate = selectedCount > 0 && selectedCount < visibleCount;
+    elements.fileSelectAllInput.disabled = fileBusy || visibleCount === 0;
+  }
+}
+
+function renderFileBreadcrumb(pathValue) {
+  if (!elements.fileBreadcrumb) {
+    return;
+  }
+  const normalized = normalizeFilePath(pathValue);
+  const parts = normalized ? normalized.split('/') : [];
+  const crumbs = [
+    '<button class="file-breadcrumb-item" type="button" data-file-path="">根目录</button>',
+  ];
+  let current = '';
+  for (const part of parts) {
+    current = current ? `${current}/${part}` : part;
+    crumbs.push(
+      `<button class="file-breadcrumb-item" type="button" data-file-path="${escapeHtml(current)}">${escapeHtml(part)}</button>`
+    );
+  }
+  elements.fileBreadcrumb.innerHTML = crumbs.join('<span class="file-breadcrumb-separator">/</span>');
+}
+
+function renderFileManager(payload = {}) {
+  state.files.path = normalizeFilePath(payload.path || '');
+  state.files.parentPath = normalizeFilePath(payload.parent_path || '');
+  state.files.canGoUp = Boolean(payload.can_go_up);
+  state.files.rootPath = String(payload.root_path || '');
+  state.files.items = Array.isArray(payload.items) ? payload.items : [];
+  state.files.loaded = true;
+  pruneFileSelection();
+
+  elements.fileCurrentPath.textContent = formatFilePath(state.files.path);
+  elements.fileRootPath.textContent = state.files.rootPath
+    ? `边界: ${state.files.rootPath}`
+    : '边界: RocketCatShell 根目录';
+  elements.fileItemCount.textContent = String(state.files.items.length);
+  elements.fileSensitiveCount.textContent = String(
+    state.files.items.filter((item) => item.requires_password).length
+  );
+  const fileBusy = state.files.loading || state.files.uploading || state.files.moving || state.files.downloading;
+  elements.fileUpButton.disabled = !state.files.canGoUp || fileBusy;
+  elements.fileCreateButton.disabled = fileBusy;
+  elements.fileRefreshButton.disabled = fileBusy;
+  elements.fileUploadButton.disabled = fileBusy;
+  elements.fileUploadButton.classList.toggle('active', state.files.uploadVisible);
+  elements.fileUploadZone?.classList.toggle('hidden', !state.files.uploadVisible);
+  if (elements.fileUploadStatus) {
+    elements.fileUploadStatus.textContent = state.files.uploading
+      ? '正在上传文件...'
+      : '单次最多上传 20 个文件，单文件不超过 100 MiB。';
+  }
+  elements.fileStatus.textContent = state.files.loading
+    ? '正在读取目录...'
+    : '浏览并管理 RocketCatShell 根目录内文件。';
+  renderFileBreadcrumb(state.files.path);
+  renderFileSelectionState();
+
+  if (!elements.fileTableBody) {
+    return;
+  }
+  if (state.files.loading) {
+    elements.fileEmptyState.classList.add('hidden');
+    elements.fileTableBody.innerHTML = '<tr><td colspan="6" class="file-table-message">正在读取目录...</td></tr>';
+    return;
+  }
+  elements.fileEmptyState.classList.toggle('hidden', state.files.items.length > 0);
+  if (!state.files.items.length) {
+    elements.fileTableBody.innerHTML = '';
+    return;
+  }
+
+  elements.fileTableBody.innerHTML = state.files.items.map((item) => {
+    const normalizedPath = normalizeFilePath(item.path);
+    const selected = state.files.selectedPaths.has(normalizedPath);
+    return `
+    <tr class="${selected ? 'file-row-selected' : ''}">
+      <td class="file-select-cell">
+        <input class="file-checkbox" type="checkbox" aria-label="选择 ${escapeHtml(item.name || item.path || '-')}" data-file-action="select" data-file-path="${escapeHtml(item.path)}" ${selected ? 'checked' : ''} />
+      </td>
+      <td>
+        <button class="file-name-button" type="button" data-file-action="open" data-file-path="${escapeHtml(item.path)}">
+          ${renderFileIcon(item)}
+          <span class="file-name-text">${escapeHtml(item.name || item.path || '-')}</span>
+          ${item.requires_password ? '<span class="file-lock-badge">需鉴权</span>' : ''}
+        </button>
+      </td>
+      <td>${escapeHtml(getFileTypeLabel(item))}</td>
+      <td>${escapeHtml(formatFileSize(item.size, item.is_directory))}</td>
+      <td>${escapeHtml(formatFileTime(item.mtime))}</td>
+      <td class="file-actions-cell">
+        <div class="file-row-actions" aria-label="文件操作">
+          <button class="file-row-action-button" type="button" data-file-action="rename" data-file-path="${escapeHtml(item.path)}" aria-label="重命名" title="重命名">${renderFileActionIcon('rename')}</button>
+          <button class="file-row-action-button" type="button" data-file-action="move" data-file-path="${escapeHtml(item.path)}" aria-label="移动" title="移动">${renderFileActionIcon('move')}</button>
+          <button class="file-row-action-button" type="button" data-file-action="copy" data-file-path="${escapeHtml(item.path)}" aria-label="复制相对路径" title="复制相对路径">${renderFileActionIcon('copy')}</button>
+          <button class="file-row-action-button" type="button" data-file-action="download" data-file-path="${escapeHtml(item.path)}" aria-label="下载" title="下载">${renderFileActionIcon('download')}</button>
+          <button class="file-row-action-button danger" type="button" data-file-action="delete" data-file-path="${escapeHtml(item.path)}" aria-label="删除" title="删除">${renderFileActionIcon('trash')}</button>
+        </div>
+      </td>
+    </tr>
+  `;
+  }).join('');
+  renderFileSelectionState();
+}
+
+async function loadFiles({ path = state.files.path, forceReload = false, silent = false } = {}) {
+  if (state.files.loading && !forceReload) {
+    return;
+  }
+  state.files.loading = true;
+  renderFileManager({
+    path: state.files.path,
+    parent_path: state.files.parentPath,
+    can_go_up: state.files.canGoUp,
+    root_path: state.files.rootPath,
+    items: state.files.items,
+  });
+  try {
+    const query = new URLSearchParams({ path: normalizeFilePath(path) });
+    const payload = await requestJson(`/api/files?${query.toString()}`);
+    state.files.loading = false;
+    state.files.selectedPaths.clear();
+    renderFileManager(payload);
+  } catch (error) {
+    state.files.loading = false;
+    renderFileManager({
+      path: state.files.path,
+      parent_path: state.files.parentPath,
+      can_go_up: state.files.canGoUp,
+      root_path: state.files.rootPath,
+      items: [],
+    });
+    if (!silent) {
+      showToast(error.message || '文件列表加载失败', 'error');
+    }
+  }
+}
+
+function setFileCreateType(type) {
+  state.files.createType = type === 'directory' ? 'directory' : 'file';
+  for (const button of elements.fileCreateTypeButtons || []) {
+    button.classList.toggle('active', button.dataset.fileCreateType === state.files.createType);
+  }
+}
+
+function openFileCreateModal(type = 'file') {
+  setFileCreateType(type);
+  if (elements.fileCreateNameInput) {
+    elements.fileCreateNameInput.value = '';
+  }
+  elements.fileCreateModal?.classList.remove('hidden');
+  window.setTimeout(() => elements.fileCreateNameInput?.focus(), 0);
+}
+
+function closeFileCreateModal() {
+  elements.fileCreateModal?.classList.add('hidden');
+  if (elements.fileCreateNameInput) {
+    elements.fileCreateNameInput.value = '';
+  }
+}
+
+async function createFileManagerItem() {
+  const name = validateRelativeFileName(elements.fileCreateNameInput?.value || '');
+  const targetPath = joinFilePath(state.files.path, name);
+  await requestJson('/api/files/create', {
+    method: 'POST',
+    body: JSON.stringify({
+      path: targetPath,
+      type: state.files.createType,
+    }),
+  });
+  closeFileCreateModal();
+  await loadFiles({ forceReload: true });
+  showToast(state.files.createType === 'directory' ? '目录已创建' : '文件已创建', 'success');
+}
+
+function setFileUploadVisible(visible) {
+  state.files.uploadVisible = Boolean(visible);
+  renderFileManager({
+    path: state.files.path,
+    parent_path: state.files.parentPath,
+    can_go_up: state.files.canGoUp,
+    root_path: state.files.rootPath,
+    items: state.files.items,
+  });
+}
+
+function setFileUploadDragActive(active) {
+  elements.fileUploadZone?.classList.toggle('drag-active', Boolean(active));
+}
+
+async function uploadFileManagerFiles(fileList) {
+  const selectedFiles = Array.from(fileList || []);
+  if (!selectedFiles.length) {
+    return;
+  }
+
+  const formData = new FormData();
+  for (const file of selectedFiles) {
+    const fileName = file.webkitRelativePath || file.name;
+    formData.append('files', file, fileName);
+  }
+
+  state.files.uploading = true;
+  renderFileManager({
+    path: state.files.path,
+    parent_path: state.files.parentPath,
+    can_go_up: state.files.canGoUp,
+    root_path: state.files.rootPath,
+    items: state.files.items,
+  });
+  try {
+    const query = new URLSearchParams({ path: state.files.path });
+    const payload = await requestJson(`/api/files/upload?${query.toString()}`, {
+      method: 'POST',
+      body: formData,
+    });
+    await loadFiles({ forceReload: true });
+    showToast(`已上传 ${payload.uploaded || selectedFiles.length} 个文件`, 'success');
+  } finally {
+    state.files.uploading = false;
+    if (elements.fileUploadInput) {
+      elements.fileUploadInput.value = '';
+    }
+    renderFileManager({
+      path: state.files.path,
+      parent_path: state.files.parentPath,
+      can_go_up: state.files.canGoUp,
+      root_path: state.files.rootPath,
+      items: state.files.items,
+    });
+  }
+}
+
+function setFileSelection(pathValue, selected) {
+  const normalized = normalizeFilePath(pathValue);
+  if (!normalized) {
+    return;
+  }
+  if (selected) {
+    state.files.selectedPaths.add(normalized);
+  } else {
+    state.files.selectedPaths.delete(normalized);
+  }
+  renderFileManager({
+    path: state.files.path,
+    parent_path: state.files.parentPath,
+    can_go_up: state.files.canGoUp,
+    root_path: state.files.rootPath,
+    items: state.files.items,
+  });
+}
+
+function setAllFileSelection(selected) {
+  state.files.selectedPaths.clear();
+  if (selected) {
+    for (const item of state.files.items) {
+      state.files.selectedPaths.add(normalizeFilePath(item.path));
+    }
+  }
+  renderFileManager({
+    path: state.files.path,
+    parent_path: state.files.parentPath,
+    can_go_up: state.files.canGoUp,
+    root_path: state.files.rootPath,
+    items: state.files.items,
+  });
+}
+
+function openFileDeleteModal() {
+  state.files.pendingDeletePaths = null;
+  const selectedCount = getSelectedFilePaths().length;
+  if (!selectedCount) {
+    return;
+  }
+  if (elements.fileDeleteTitle) {
+    elements.fileDeleteTitle.textContent = '批量删除';
+  }
+  elements.fileDeleteMessage.textContent = `确定要删除选中的 ${selectedCount} 个项目吗？`;
+  elements.fileDeleteModal?.classList.remove('hidden');
+}
+
+function openSingleFileDeleteModal(item) {
+  if (!item) {
+    return;
+  }
+  state.files.pendingDeletePaths = [normalizeFilePath(item.path)];
+  if (elements.fileDeleteTitle) {
+    elements.fileDeleteTitle.textContent = '删除文件';
+  }
+  elements.fileDeleteMessage.textContent = `确定要删除「${item.name || item.path}」吗？`;
+  elements.fileDeleteModal?.classList.remove('hidden');
+}
+
+function closeFileDeleteModal() {
+  state.files.pendingDeletePaths = null;
+  elements.fileDeleteModal?.classList.add('hidden');
+}
+
+async function deleteSelectedFileItems() {
+  const selectedPaths = state.files.pendingDeletePaths || getSelectedFilePaths();
+  if (!selectedPaths.length) {
+    return;
+  }
+  await requestJson('/api/files/delete', {
+    method: 'POST',
+    body: JSON.stringify({ paths: selectedPaths }),
+  });
+  closeFileDeleteModal();
+  state.files.selectedPaths.clear();
+  await loadFiles({ forceReload: true });
+  showToast(`已删除 ${selectedPaths.length} 个项目`, 'success');
+}
+
+function resetMoveTreeState() {
+  state.files.moveTree.directories = new Map();
+  state.files.moveTree.expanded = new Set(['']);
+  state.files.moveTree.loading = new Set();
+}
+
+async function loadMoveDirectories(pathValue = '') {
+  const normalized = normalizeFilePath(pathValue);
+  if (state.files.moveTree.directories.has(normalized)) {
+    return;
+  }
+  state.files.moveTree.loading.add(normalized);
+  renderMoveTree();
+  try {
+    const query = new URLSearchParams({ path: normalized });
+    const payload = await requestJson(`/api/files?${query.toString()}`);
+    const directories = (payload.items || [])
+      .filter((item) => item.is_directory)
+      .map((item) => ({
+        name: item.name,
+        path: normalizeFilePath(item.path),
+      }));
+    state.files.moveTree.directories.set(normalized, directories);
+  } finally {
+    state.files.moveTree.loading.delete(normalized);
+    renderMoveTree();
+  }
+}
+
+function renderMoveTreeNode(pathValue = '', depth = 0) {
+  const normalized = normalizeFilePath(pathValue);
+  const expanded = state.files.moveTree.expanded.has(normalized);
+  const loading = state.files.moveTree.loading.has(normalized);
+  const selected = normalizeFilePath(state.files.moveTargetPath) === normalized;
+  const children = state.files.moveTree.directories.get(normalized) || [];
+  const label = normalized ? normalized.split('/').pop() : '/';
+  const rows = [`
+    <div class="file-move-tree-row ${selected ? 'selected' : ''}" style="--depth: ${depth}">
+      <button class="file-move-node" type="button" data-file-move-path="${escapeHtml(normalized)}">
+        <span class="file-move-node-toggle">${expanded ? '-' : '+'}</span>
+        <span class="file-move-node-label">${escapeHtml(label || '/')}</span>
+      </button>
+    </div>
+  `];
+  if (expanded) {
+    if (loading) {
+      rows.push(`<div class="file-move-tree-loading" style="--depth: ${depth + 1}">正在读取目录...</div>`);
+    } else {
+      for (const child of children) {
+        rows.push(renderMoveTreeNode(child.path, depth + 1));
+      }
+      if (!children.length) {
+        rows.push(`<div class="file-move-tree-empty" style="--depth: ${depth + 1}">空目录</div>`);
+      }
+    }
+  }
+  return rows.join('');
+}
+
+function renderMoveTree() {
+  if (!elements.fileMoveTree) {
+    return;
+  }
+  const movingPaths = state.files.pendingMovePaths || getSelectedFilePaths();
+  elements.fileMoveTree.innerHTML = renderMoveTreeNode('', 0);
+  elements.fileMoveSelectedPath.textContent = formatFilePath(state.files.moveTargetPath);
+  elements.fileMoveSelectionInfo.textContent = `移动项：${movingPaths.length} 个项目`;
+  elements.fileMoveConfirmButton.disabled = state.files.moving || !movingPaths.length;
+}
+
+async function openFileMoveModal() {
+  if (!state.files.selectedPaths.size) {
+    return;
+  }
+  state.files.pendingMovePaths = null;
+  await openFileMoveModalForPaths(getSelectedFilePaths());
+}
+
+async function openSingleFileMoveModal(item) {
+  if (!item) {
+    return;
+  }
+  await openFileMoveModalForPaths([normalizeFilePath(item.path)]);
+}
+
+async function openFileMoveModalForPaths(paths) {
+  const normalizedPaths = Array.from(new Set((paths || []).map((pathValue) => normalizeFilePath(pathValue)).filter(Boolean)));
+  if (!normalizedPaths.length) {
+    return;
+  }
+  state.files.pendingMovePaths = normalizedPaths;
+  state.files.moveTargetPath = '';
+  resetMoveTreeState();
+  elements.fileMoveModal?.classList.remove('hidden');
+  renderMoveTree();
+  try {
+    await loadMoveDirectories('');
+    if (state.files.path) {
+      const parts = state.files.path.split('/');
+      let current = '';
+      for (const part of parts) {
+        current = current ? `${current}/${part}` : part;
+        state.files.moveTree.expanded.add(current);
+        await loadMoveDirectories(current);
+      }
+    }
+  } catch (error) {
+    showToast(error.message || '目录树加载失败', 'error');
+  }
+}
+
+function closeFileMoveModal() {
+  elements.fileMoveModal?.classList.add('hidden');
+  state.files.moveTargetPath = '';
+  state.files.pendingMovePaths = null;
+  resetMoveTreeState();
+}
+
+async function selectMoveTarget(pathValue) {
+  const normalized = normalizeFilePath(pathValue);
+  state.files.moveTargetPath = normalized;
+  if (state.files.moveTree.expanded.has(normalized)) {
+    state.files.moveTree.expanded.delete(normalized);
+  } else {
+    state.files.moveTree.expanded.add(normalized);
+    try {
+      await loadMoveDirectories(normalized);
+    } catch (error) {
+      showToast(error.message || '目录读取失败', 'error');
+    }
+  }
+  renderMoveTree();
+}
+
+async function moveSelectedFileItems() {
+  const selectedPaths = state.files.pendingMovePaths || getSelectedFilePaths();
+  if (!selectedPaths.length) {
+    return;
+  }
+  state.files.moving = true;
+  renderMoveTree();
+  renderFileSelectionState();
+  try {
+    await requestJson('/api/files/move', {
+      method: 'POST',
+      body: JSON.stringify({
+        paths: selectedPaths,
+        target_path: state.files.moveTargetPath,
+      }),
+    });
+    closeFileMoveModal();
+    state.files.selectedPaths.clear();
+    await loadFiles({ forceReload: true });
+    showToast(`已移动 ${selectedPaths.length} 个项目`, 'success');
+  } finally {
+    state.files.moving = false;
+    renderMoveTree();
+    renderFileSelectionState();
+  }
+}
+
+function openFileRenameModal(item) {
+  if (!item) {
+    return;
+  }
+  state.files.pendingRenameItem = item;
+  elements.fileRenameNameInput.value = item.name || '';
+  elements.fileRenameModal?.classList.remove('hidden');
+  window.setTimeout(() => elements.fileRenameNameInput?.focus(), 0);
+}
+
+function closeFileRenameModal() {
+  state.files.pendingRenameItem = null;
+  elements.fileRenameModal?.classList.add('hidden');
+  if (elements.fileRenameNameInput) {
+    elements.fileRenameNameInput.value = '';
+  }
+}
+
+async function renameFileManagerItem() {
+  const item = state.files.pendingRenameItem;
+  if (!item) {
+    return;
+  }
+  const name = validateFileBaseName(elements.fileRenameNameInput?.value || '');
+  await requestJson('/api/files/rename', {
+    method: 'POST',
+    body: JSON.stringify({
+      path: item.path,
+      name,
+    }),
+  });
+  closeFileRenameModal();
+  state.files.selectedPaths.delete(normalizeFilePath(item.path));
+  await loadFiles({ forceReload: true });
+  showToast('重命名成功', 'success');
+}
+
+async function copyFileRelativePath(item) {
+  if (!item) {
+    return;
+  }
+  const relativePath = normalizeFilePath(item.path);
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(relativePath);
+  } else {
+    const helper = document.createElement('textarea');
+    helper.value = relativePath;
+    helper.setAttribute('readonly', 'readonly');
+    helper.style.position = 'fixed';
+    helper.style.opacity = '0';
+    document.body.appendChild(helper);
+    helper.select();
+    document.execCommand('copy');
+    document.body.removeChild(helper);
+  }
+  showToast('相对路径已复制', 'success');
+}
+
+async function downloadSingleFileItem(item) {
+  if (!item) {
+    return;
+  }
+  state.files.downloading = true;
+  renderFileSelectionState();
+  try {
+    const query = new URLSearchParams({ path: normalizeFilePath(item.path) });
+    const blob = await requestBlob(`/api/files/download?${query.toString()}`, {
+      method: 'GET',
+    });
+    const objectUrl = window.URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = objectUrl;
+    link.download = item.is_directory ? `${item.name}.zip` : item.name;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    window.setTimeout(() => window.URL.revokeObjectURL(objectUrl), 0);
+    showToast('下载已开始', 'success');
+  } finally {
+    state.files.downloading = false;
+    renderFileSelectionState();
+  }
+}
+
+async function downloadSelectedFileItems() {
+  const selectedPaths = getSelectedFilePaths();
+  if (!selectedPaths.length) {
+    return;
+  }
+  state.files.downloading = true;
+  renderFileSelectionState();
+  try {
+    const blob = await requestBlob('/api/files/download', {
+      method: 'POST',
+      body: JSON.stringify({ paths: selectedPaths }),
+    });
+    const objectUrl = window.URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = objectUrl;
+    link.download = 'files.zip';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    window.setTimeout(() => window.URL.revokeObjectURL(objectUrl), 0);
+    showToast(`已打包 ${selectedPaths.length} 个项目`, 'success');
+  } finally {
+    state.files.downloading = false;
+    renderFileSelectionState();
+  }
+}
+
+function findFileItem(pathValue) {
+  const normalized = normalizeFilePath(pathValue);
+  return state.files.items.find((item) => normalizeFilePath(item.path) === normalized) || null;
+}
+
+function buildFileImageViewerItems() {
+  return state.files.items
+    .filter((item) => !item.is_directory && isFileImage(item))
+    .map((item) => ({
+      path: normalizeFilePath(item.path),
+      name: item.name || item.path || '图片预览',
+      url: buildFilePreviewUrl(item.path),
+    }));
+}
+
+function renderFileImageViewer() {
+  if (!state.files.imageViewer.visible) {
+    return;
+  }
+  const items = state.files.imageViewer.items;
+  if (!items.length) {
+    closeFileImageViewer();
+    return;
+  }
+  const index = Math.max(0, Math.min(state.files.imageViewer.index, items.length - 1));
+  state.files.imageViewer.index = index;
+  const current = items[index];
+  if (elements.fileImageViewerImage) {
+    elements.fileImageViewerImage.src = current.url;
+    elements.fileImageViewerImage.alt = current.name;
+  }
+  if (elements.fileImageViewerCount) {
+    elements.fileImageViewerCount.textContent = `${index + 1} / ${items.length}`;
+  }
+  const showNav = items.length > 1;
+  elements.fileImageViewerPrevButton?.classList.toggle('hidden', !showNav);
+  elements.fileImageViewerNextButton?.classList.toggle('hidden', !showNav);
+}
+
+function openFileImageViewer(item) {
+  const items = buildFileImageViewerItems();
+  if (!items.length) {
+    return;
+  }
+  const targetPath = normalizeFilePath(item?.path || '');
+  const index = Math.max(0, items.findIndex((entry) => entry.path === targetPath));
+  state.files.imageViewer.items = items;
+  state.files.imageViewer.index = index;
+  state.files.imageViewer.visible = true;
+  document.body.classList.add('file-image-viewer-open');
+  renderFileImageViewer();
+  elements.fileImageViewer?.classList.remove('hidden');
+}
+
+function moveFileImageViewer(step) {
+  const items = state.files.imageViewer.items;
+  if (!state.files.imageViewer.visible || items.length <= 1) {
+    return;
+  }
+  const total = items.length;
+  state.files.imageViewer.index = (state.files.imageViewer.index + step + total) % total;
+  renderFileImageViewer();
+}
+
+function closeFileImageViewer() {
+  state.files.imageViewer.visible = false;
+  state.files.imageViewer.items = [];
+  state.files.imageViewer.index = 0;
+  elements.fileImageViewer?.classList.add('hidden');
+  document.body.classList.remove('file-image-viewer-open');
+  if (elements.fileImageViewerImage) {
+    elements.fileImageViewerImage.removeAttribute('src');
+  }
+}
+
+async function openFileItem(item) {
+  if (!item) {
+    return;
+  }
+  if (item.is_directory) {
+    await loadFiles({ path: item.path, forceReload: true });
+    return;
+  }
+  if (isFileImage(item)) {
+    openFileImageViewer(item);
+    return;
+  }
+  if (item.preview_type !== 'text') {
+    openFilePreviewModal({
+      path: item.path,
+      name: item.name,
+      size: item.size,
+      mtime: item.mtime,
+      content: '',
+      truncated: false,
+      unavailable: true,
+    });
+    return;
+  }
+  if (item.requires_password) {
+    openFileAuthModal(item, 'edit');
+    return;
+  }
+  await openTextFileForEdit(item);
+}
+
+async function readFileContent(item, password = '') {
+  return requestJson('/api/files/read', {
+    method: 'POST',
+    body: JSON.stringify({
+      path: item.path,
+      password,
+    }),
+    skipAuthRedirect: Boolean(item.requires_password),
+  });
+}
+
+async function readFileForPreview(item, password = '') {
+  const payload = await readFileContent(item, password);
+  openFilePreviewModal(payload);
+}
+
+async function openTextFileForEdit(item, password = '') {
+  const payload = await readFileContent(item, password);
+  if (!payload.can_edit) {
+    openFilePreviewModal(payload);
+    return;
+  }
+  openFileEditModal(payload, password);
+}
+
+function openFilePreviewModal(payload) {
+  state.files.previewItem = payload;
+  const fileName = payload.name || payload.path || '文件预览';
+  elements.filePreviewTitle.textContent = fileName;
+  elements.filePreviewMeta.innerHTML = `
+    <span>${escapeHtml(formatFilePath(payload.path || ''))}</span>
+    <span>${escapeHtml(formatFileSize(payload.size, false))}</span>
+    <span>${escapeHtml(formatFileTime(payload.mtime))}</span>
+  `;
+  if (payload.unavailable) {
+    elements.filePreviewNotice.textContent = '当前阶段仅支持文本文件预览。';
+    elements.filePreviewNotice.classList.remove('hidden');
+    elements.filePreviewContent.textContent = '';
+    elements.filePreviewContent.classList.add('hidden');
+  } else {
+    let notice = '';
+    if (payload.is_protected) {
+      notice = '该文件属于 RocketCatShell 核心源码或内置插件源码，只允许查看，不能修改。';
+    } else if (payload.truncated) {
+      notice = '文件较大，仅显示前 1 MiB 内容，暂不允许在线编辑。';
+    } else if (payload.can_edit === false) {
+      notice = '该文件当前只允许查看，不能在线编辑。';
+    }
+    elements.filePreviewNotice.textContent = notice;
+    elements.filePreviewNotice.classList.toggle('hidden', !notice);
+    elements.filePreviewContent.textContent = payload.content || '';
+    elements.filePreviewContent.classList.remove('hidden');
+  }
+  elements.filePreviewModal.classList.remove('hidden');
+}
+
+function closeFilePreviewModal() {
+  state.files.previewItem = null;
+  elements.filePreviewModal?.classList.add('hidden');
+  if (elements.filePreviewContent) {
+    elements.filePreviewContent.textContent = '';
+  }
+}
+
+function updateFileEditLineNumbers() {
+  if (!elements.fileEditLineNumbers || !elements.fileEditContentInput) {
+    return;
+  }
+  const lineCount = Math.max(1, elements.fileEditContentInput.value.split('\n').length);
+  elements.fileEditLineNumbers.textContent = Array.from({ length: lineCount }, (_, index) => index + 1).join('\n');
+}
+
+function openFileEditModal(payload, password = '') {
+  state.files.editingFile = {
+    path: normalizeFilePath(payload.path),
+    name: payload.name || payload.path || '文件',
+    content: payload.content || '',
+    originalContent: payload.content || '',
+    password,
+    requiresPassword: Boolean(payload.requires_password),
+    isProtected: Boolean(payload.is_protected),
+  };
+  if (elements.fileEditPathChip) {
+    elements.fileEditPathChip.textContent = formatFilePath(payload.path || '');
+  }
+  if (elements.fileEditContentInput) {
+    elements.fileEditContentInput.value = state.files.editingFile.content;
+    updateFileEditLineNumbers();
+    elements.fileEditContentInput.scrollTop = 0;
+  }
+  if (elements.fileEditNotice) {
+    const notice = payload.requires_password
+      ? '该文件需要鉴权，保存前会要求二次确认。'
+      : '';
+    elements.fileEditNotice.textContent = notice;
+    elements.fileEditNotice.classList.toggle('hidden', !notice);
+  }
+  elements.fileEditModal?.classList.remove('hidden');
+  window.setTimeout(() => elements.fileEditContentInput?.focus(), 0);
+}
+
+function closeFileEditModal() {
+  state.files.editingFile = null;
+  elements.fileEditModal?.classList.add('hidden');
+  if (elements.fileEditContentInput) {
+    elements.fileEditContentInput.value = '';
+  }
+  if (elements.fileEditLineNumbers) {
+    elements.fileEditLineNumbers.textContent = '1';
+  }
+}
+
+function openFileSaveConfirmModal() {
+  const editingFile = state.files.editingFile;
+  if (!editingFile) {
+    return;
+  }
+  const nextContent = elements.fileEditContentInput?.value || '';
+  if (nextContent === editingFile.originalContent) {
+    showToast('文件内容没有变化');
+    return;
+  }
+  if (elements.fileSaveConfirmTitle) {
+    elements.fileSaveConfirmTitle.textContent = editingFile.requiresPassword ? '保存鉴权文件' : '保存文件';
+  }
+  if (elements.fileSaveConfirmMessage) {
+    elements.fileSaveConfirmMessage.textContent = editingFile.requiresPassword
+      ? `修改鉴权文件可能导致出错，确定要保存「${formatFilePath(editingFile.path)}」吗？`
+      : `确定要保存「${formatFilePath(editingFile.path)}」的修改吗？`;
+  }
+  elements.fileSaveConfirmModal?.classList.remove('hidden');
+}
+
+function closeFileSaveConfirmModal() {
+  state.files.pendingSave = false;
+  elements.fileSaveConfirmModal?.classList.add('hidden');
+}
+
+async function saveFileEditContent() {
+  const editingFile = state.files.editingFile;
+  if (!editingFile || state.files.pendingSave) {
+    return;
+  }
+  state.files.pendingSave = true;
+  if (elements.fileSaveConfirmSubmitButton) {
+    elements.fileSaveConfirmSubmitButton.disabled = true;
+  }
+  try {
+    await requestJson('/api/files/write', {
+      method: 'POST',
+      body: JSON.stringify({
+        path: editingFile.path,
+        content: elements.fileEditContentInput?.value || '',
+        password: editingFile.password || '',
+      }),
+      skipAuthRedirect: editingFile.requiresPassword,
+    });
+    closeFileSaveConfirmModal();
+    closeFileEditModal();
+    await loadFiles({ forceReload: true, silent: true });
+    showToast('保存成功', 'success');
+  } finally {
+    state.files.pendingSave = false;
+    if (elements.fileSaveConfirmSubmitButton) {
+      elements.fileSaveConfirmSubmitButton.disabled = false;
+    }
+  }
+}
+
+function openFileAuthModal(item, mode = 'edit') {
+  state.files.pendingAuthItem = item;
+  state.files.pendingAuthMode = mode;
+  elements.fileAuthMessage.textContent = `文件 ${formatFilePath(item.path)} 包含敏感持久化数据，请输入 WebUI 登录认证 / 文件管理鉴权密码。`;
+  elements.fileAuthPasswordInput.value = '';
+  elements.fileAuthModal.classList.remove('hidden');
+  window.setTimeout(() => elements.fileAuthPasswordInput?.focus(), 0);
+}
+
+function closeFileAuthModal() {
+  state.files.pendingAuthItem = null;
+  state.files.pendingAuthMode = 'edit';
+  elements.fileAuthModal?.classList.add('hidden');
+  if (elements.fileAuthPasswordInput) {
+    elements.fileAuthPasswordInput.value = '';
+  }
+}
+
 function setFormData(data) {
   const merged = { ...DEFAULT_FORM, ...data };
   for (const [key, value] of Object.entries(merged)) {
@@ -1419,6 +2753,22 @@ async function loadData() {
   }
 }
 
+async function loadDiagnostics({ forceReload = false, silent = false } = {}) {
+  if (!forceReload && state.diagnostics.loaded) {
+    return;
+  }
+
+  try {
+    const diagnostics = await requestJson('/api/diagnostics');
+    renderDiagnostics(diagnostics);
+  } catch (error) {
+    state.diagnostics.loaded = false;
+    if (!silent) {
+      showToast(error.message || '诊断数据加载失败', 'error');
+    }
+  }
+}
+
 async function loadPlugins({ forceReload = false, silent = false } = {}) {
   if (!forceReload && state.plugins.loaded) {
     return;
@@ -1471,22 +2821,6 @@ async function loadBasicInfo({ forceReload = false, silent = false } = {}) {
   }
 }
 
-async function loadDiagnostics({ forceReload = false, silent = false } = {}) {
-  if (!forceReload && state.diagnostics.loaded) {
-    return;
-  }
-
-  try {
-    const diagnostics = await requestJson('/api/diagnostics');
-    renderDiagnostics(diagnostics);
-  } catch (error) {
-    state.diagnostics.loaded = false;
-    if (!silent) {
-      showToast(error.message || '诊断数据加载失败', 'error');
-    }
-  }
-}
-
 async function saveBot() {
   const payload = collectFormData();
   if (!Number.isFinite(payload.room_info_cache_ttl_seconds) || payload.room_info_cache_ttl_seconds < 0) {
@@ -1508,7 +2842,7 @@ async function saveBot() {
 async function savePasswordSettings() {
   const password = String(elements.settingsWebuiPasswordInput?.value || '').trim();
   if (!password) {
-    throw new Error('请设置登录密码');
+    throw new Error('请设置 WebUI 登录认证 / 文件管理鉴权密码');
   }
 
   const payload = await requestJson('/api/settings', {
@@ -1517,7 +2851,7 @@ async function savePasswordSettings() {
   });
   state.settings.loaded = true;
   renderSettings(payload);
-  showToast('WebUI 登录密码已更新，新的密码已立即生效', 'success');
+  showToast('WebUI 登录认证 / 文件管理鉴权密码已更新', 'success');
 }
 
 async function savePortSettings() {
@@ -1813,6 +3147,36 @@ elements.pluginsRefreshButton?.addEventListener('click', async () => {
   await activatePage('plugins', { forceReload: true });
   showToast('插件列表已刷新');
 });
+elements.fileRefreshButton?.addEventListener('click', async () => {
+  await loadFiles({ forceReload: true });
+  showToast('文件列表已刷新');
+});
+elements.fileUpButton?.addEventListener('click', async () => {
+  if (!state.files.canGoUp) {
+    return;
+  }
+  await loadFiles({ path: state.files.parentPath, forceReload: true });
+});
+elements.fileCreateButton?.addEventListener('click', () => {
+  openFileCreateModal('file');
+});
+elements.fileUploadButton?.addEventListener('click', () => {
+  setFileUploadVisible(!state.files.uploadVisible);
+});
+elements.fileDeleteSelectedButton?.addEventListener('click', openFileDeleteModal);
+elements.fileMoveSelectedButton?.addEventListener('click', async () => {
+  await openFileMoveModal();
+});
+elements.fileDownloadSelectedButton?.addEventListener('click', async () => {
+  try {
+    await downloadSelectedFileItems();
+  } catch (error) {
+    showToast(error.message || '下载失败', 'error');
+  }
+});
+elements.fileSelectAllInput?.addEventListener('change', (event) => {
+  setAllFileSelection(event.target.checked);
+});
 for (const button of elements.navButtons) {
   button.addEventListener('click', async () => {
     try {
@@ -1828,6 +3192,163 @@ for (const button of elements.navButtons) {
     elements.pluginUninstallCancelButton?.addEventListener('click', closePluginUninstallModal);
 elements.closeModalButton?.addEventListener('click', closeModal);
 elements.cancelButton?.addEventListener('click', closeModal);
+elements.filePreviewCloseButton?.addEventListener('click', closeFilePreviewModal);
+elements.filePreviewCancelButton?.addEventListener('click', closeFilePreviewModal);
+elements.fileImageViewerCloseButton?.addEventListener('click', closeFileImageViewer);
+elements.fileImageViewerPrevButton?.addEventListener('click', () => {
+  moveFileImageViewer(-1);
+});
+elements.fileImageViewerNextButton?.addEventListener('click', () => {
+  moveFileImageViewer(1);
+});
+elements.fileCreateCloseButton?.addEventListener('click', closeFileCreateModal);
+elements.fileCreateCancelButton?.addEventListener('click', closeFileCreateModal);
+elements.fileCreateSubmitButton?.addEventListener('click', async () => {
+  try {
+    await createFileManagerItem();
+  } catch (error) {
+    showToast(error.message || '新建失败', 'error');
+    elements.fileCreateNameInput?.focus();
+  }
+});
+elements.fileCreateNameInput?.addEventListener('keydown', async (event) => {
+  if (event.key !== 'Enter') {
+    return;
+  }
+  event.preventDefault();
+  elements.fileCreateSubmitButton?.click();
+});
+for (const button of elements.fileCreateTypeButtons || []) {
+  button.addEventListener('click', () => {
+    setFileCreateType(button.dataset.fileCreateType);
+  });
+}
+elements.fileDeleteCloseButton?.addEventListener('click', closeFileDeleteModal);
+elements.fileDeleteCancelButton?.addEventListener('click', closeFileDeleteModal);
+elements.fileDeleteConfirmButton?.addEventListener('click', async () => {
+  try {
+    await deleteSelectedFileItems();
+  } catch (error) {
+    showToast(error.message || '删除失败', 'error');
+  }
+});
+elements.fileMoveCloseButton?.addEventListener('click', closeFileMoveModal);
+elements.fileMoveCancelButton?.addEventListener('click', closeFileMoveModal);
+elements.fileMoveConfirmButton?.addEventListener('click', async () => {
+  try {
+    await moveSelectedFileItems();
+  } catch (error) {
+    showToast(error.message || '移动失败', 'error');
+  }
+});
+elements.fileMoveTree?.addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-file-move-path]');
+  if (!button) {
+    return;
+  }
+  await selectMoveTarget(button.dataset.fileMovePath || '');
+});
+elements.fileRenameCloseButton?.addEventListener('click', closeFileRenameModal);
+elements.fileRenameCancelButton?.addEventListener('click', closeFileRenameModal);
+elements.fileRenameSubmitButton?.addEventListener('click', async () => {
+  try {
+    await renameFileManagerItem();
+  } catch (error) {
+    showToast(error.message || '重命名失败', 'error');
+    elements.fileRenameNameInput?.focus();
+  }
+});
+elements.fileRenameNameInput?.addEventListener('keydown', async (event) => {
+  if (event.key !== 'Enter') {
+    return;
+  }
+  event.preventDefault();
+  elements.fileRenameSubmitButton?.click();
+});
+elements.fileUploadPickButton?.addEventListener('click', () => {
+  elements.fileUploadInput?.click();
+});
+elements.fileUploadInput?.addEventListener('change', async (event) => {
+  try {
+    await uploadFileManagerFiles(event.target.files);
+  } catch (error) {
+    showToast(error.message || '上传失败', 'error');
+  }
+});
+elements.fileUploadZone?.addEventListener('dragenter', (event) => {
+  event.preventDefault();
+  setFileUploadDragActive(true);
+});
+elements.fileUploadZone?.addEventListener('dragover', (event) => {
+  event.preventDefault();
+  setFileUploadDragActive(true);
+});
+elements.fileUploadZone?.addEventListener('dragleave', (event) => {
+  event.preventDefault();
+  if (!elements.fileUploadZone?.contains(event.relatedTarget)) {
+    setFileUploadDragActive(false);
+  }
+});
+elements.fileUploadZone?.addEventListener('drop', async (event) => {
+  event.preventDefault();
+  setFileUploadDragActive(false);
+  try {
+    await uploadFileManagerFiles(event.dataTransfer?.files);
+  } catch (error) {
+    showToast(error.message || '上传失败', 'error');
+  }
+});
+elements.fileAuthCloseButton?.addEventListener('click', closeFileAuthModal);
+elements.fileAuthCancelButton?.addEventListener('click', closeFileAuthModal);
+elements.fileAuthSubmitButton?.addEventListener('click', async () => {
+  const item = state.files.pendingAuthItem;
+  if (!item) {
+    return;
+  }
+  try {
+    const password = String(elements.fileAuthPasswordInput?.value || '');
+    if (state.files.pendingAuthMode === 'preview') {
+      await readFileForPreview(item, password);
+    } else {
+      await openTextFileForEdit(item, password);
+    }
+    closeFileAuthModal();
+  } catch (error) {
+    showToast(error.message || '文件管理鉴权失败', 'error');
+    elements.fileAuthPasswordInput?.focus();
+  }
+});
+elements.fileAuthPasswordInput?.addEventListener('keydown', async (event) => {
+  if (event.key !== 'Enter') {
+    return;
+  }
+  event.preventDefault();
+  elements.fileAuthSubmitButton?.click();
+});
+elements.fileEditCloseButton?.addEventListener('click', closeFileEditModal);
+elements.fileEditCancelButton?.addEventListener('click', closeFileEditModal);
+elements.fileEditSaveButton?.addEventListener('click', openFileSaveConfirmModal);
+elements.fileEditContentInput?.addEventListener('input', updateFileEditLineNumbers);
+elements.fileEditContentInput?.addEventListener('scroll', () => {
+  if (elements.fileEditLineNumbers && elements.fileEditContentInput) {
+    elements.fileEditLineNumbers.scrollTop = elements.fileEditContentInput.scrollTop;
+  }
+});
+elements.fileEditContentInput?.addEventListener('keydown', (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+    event.preventDefault();
+    openFileSaveConfirmModal();
+  }
+});
+elements.fileSaveConfirmCloseButton?.addEventListener('click', closeFileSaveConfirmModal);
+elements.fileSaveConfirmCancelButton?.addEventListener('click', closeFileSaveConfirmModal);
+elements.fileSaveConfirmSubmitButton?.addEventListener('click', async () => {
+  try {
+    await saveFileEditContent();
+  } catch (error) {
+    showToast(error.message || '保存失败', 'error');
+  }
+});
 elements.submitButton?.addEventListener('click', async () => {
   try {
     await saveBot();
@@ -1907,11 +3428,6 @@ elements.pluginUninstallConfirmButton?.addEventListener('click', async () => {
   }
 });
 
-elements.modal?.addEventListener('click', (event) => {
-  if (event.target === elements.modal) {
-    closeModal();
-  }
-});
 elements.pluginModal?.addEventListener('click', (event) => {
   if (event.target === elements.pluginModal) {
     closePluginModal();
@@ -1920,6 +3436,98 @@ elements.pluginModal?.addEventListener('click', (event) => {
 elements.pluginUninstallModal?.addEventListener('click', (event) => {
   if (event.target === elements.pluginUninstallModal) {
     closePluginUninstallModal();
+  }
+});
+elements.filePreviewModal?.addEventListener('click', (event) => {
+  if (event.target === elements.filePreviewModal) {
+    closeFilePreviewModal();
+  }
+});
+elements.fileImageViewer?.addEventListener('click', (event) => {
+  if (event.target === elements.fileImageViewer) {
+    closeFileImageViewer();
+  }
+});
+elements.fileCreateModal?.addEventListener('click', (event) => {
+  if (event.target === elements.fileCreateModal) {
+    closeFileCreateModal();
+  }
+});
+elements.fileDeleteModal?.addEventListener('click', (event) => {
+  if (event.target === elements.fileDeleteModal) {
+    closeFileDeleteModal();
+  }
+});
+elements.fileMoveModal?.addEventListener('click', (event) => {
+  if (event.target === elements.fileMoveModal) {
+    closeFileMoveModal();
+  }
+});
+elements.fileRenameModal?.addEventListener('click', (event) => {
+  if (event.target === elements.fileRenameModal) {
+    closeFileRenameModal();
+  }
+});
+elements.fileAuthModal?.addEventListener('click', (event) => {
+  if (event.target === elements.fileAuthModal) {
+    closeFileAuthModal();
+  }
+});
+
+elements.fileBreadcrumb?.addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-file-path]');
+  if (!button) {
+    return;
+  }
+  try {
+    await loadFiles({ path: button.dataset.filePath || '', forceReload: true });
+  } catch (error) {
+    showToast(error.message || '目录切换失败', 'error');
+  }
+});
+
+elements.fileTableBody?.addEventListener('click', async (event) => {
+  const checkbox = event.target.closest('[data-file-action="select"]');
+  if (checkbox) {
+    setFileSelection(checkbox.dataset.filePath || '', checkbox.checked);
+    return;
+  }
+  const actionButton = event.target.closest('.file-row-action-button[data-file-action]');
+  if (actionButton) {
+    const item = findFileItem(actionButton.dataset.filePath || '');
+    try {
+      if (actionButton.dataset.fileAction === 'rename') {
+        openFileRenameModal(item);
+        return;
+      }
+      if (actionButton.dataset.fileAction === 'move') {
+        await openSingleFileMoveModal(item);
+        return;
+      }
+      if (actionButton.dataset.fileAction === 'copy') {
+        await copyFileRelativePath(item);
+        return;
+      }
+      if (actionButton.dataset.fileAction === 'download') {
+        await downloadSingleFileItem(item);
+        return;
+      }
+      if (actionButton.dataset.fileAction === 'delete') {
+        openSingleFileDeleteModal(item);
+      }
+    } catch (error) {
+      showToast(error.message || '文件操作失败', 'error');
+    }
+    return;
+  }
+  const button = event.target.closest('[data-file-action="open"]');
+  if (!button) {
+    return;
+  }
+  try {
+    await openFileItem(findFileItem(button.dataset.filePath || ''));
+  } catch (error) {
+    showToast(error.message || '文件打开失败', 'error');
   }
 });
 
@@ -2014,10 +3622,33 @@ elements.logPerfButton?.addEventListener('click', () => {
 });
 
 window.addEventListener('keydown', (event) => {
+  if (state.files.imageViewer.visible) {
+    if (event.key === 'Escape') {
+      closeFileImageViewer();
+      return;
+    }
+    if (event.key === 'ArrowLeft') {
+      moveFileImageViewer(-1);
+      return;
+    }
+    if (event.key === 'ArrowRight') {
+      moveFileImageViewer(1);
+      return;
+    }
+  }
   if (event.key === 'Escape') {
     closeModal();
     closePluginModal();
     closePluginUninstallModal();
+    closeFileImageViewer();
+    closeFilePreviewModal();
+    closeFileCreateModal();
+    closeFileDeleteModal();
+    closeFileMoveModal();
+    closeFileRenameModal();
+    closeFileAuthModal();
+    closeFileSaveConfirmModal();
+    closeFileEditModal();
   }
 });
 

@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>RocketCat Shell</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260520g" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260615a" />
   </head>
   <body>
     <div class="shell-layout">
@@ -19,28 +19,75 @@
 
         <nav class="nav-section">
           <button class="nav-item active" type="button" data-page="network">
-            <span class="nav-icon">≋</span>
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <path d="M2 20h.01" />
+                <path d="M7 20v-4" />
+                <path d="M12 20v-8" />
+                <path d="M17 20V8" />
+                <path d="M22 4v16" />
+              </svg>
+            </span>
             <span>网络配置</span>
           </button>
           <button class="nav-item" type="button" data-page="diagnostics">
-            <span class="nav-icon">◎</span>
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+              </svg>
+            </span>
             <span>运行诊断</span>
           </button>
           <button class="nav-item" type="button" data-page="basic">
-            <span class="nav-icon">⌁</span>
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <rect width="7" height="9" x="3" y="3" rx="1" />
+                <rect width="7" height="5" x="14" y="3" rx="1" />
+                <rect width="7" height="9" x="14" y="12" rx="1" />
+                <rect width="7" height="5" x="3" y="16" rx="1" />
+              </svg>
+            </span>
             <span>基础信息</span>
           </button>
           <button class="nav-item" type="button" data-page="logs">
-            <span class="nav-icon">▤</span>
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+                <path d="M14 2v4a2 2 0 0 0 2 2h4" />
+                <path d="M10 9H8" />
+                <path d="M16 13H8" />
+                <path d="M16 17H8" />
+              </svg>
+            </span>
             <span>猫猫日志</span>
           </button>
           <button class="nav-item" type="button" data-page="settings">
-            <span class="nav-icon">◍</span>
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <path d="M12.22 2h-.44a2 2 0 0 0-2 1.72l-.12.86a2 2 0 0 1-2.9 1.44l-.76-.4a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .55 2.62l.7.53a2 2 0 0 1 0 3.24l-.7.53a2 2 0 0 0-.55 2.62l.22.38a2 2 0 0 0 2.73.73l.76-.4a2 2 0 0 1 2.9 1.44l.12.86a2 2 0 0 0 2 1.72h.44a2 2 0 0 0 2-1.72l.12-.86a2 2 0 0 1 2.9-1.44l.76.4a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.55-2.62l-.7-.53a2 2 0 0 1 0-3.24l.7-.53a2 2 0 0 0 .55-2.62l-.22-.38a2 2 0 0 0-2.73-.73l-.76.4a2 2 0 0 1-2.9-1.44l-.12-.86a2 2 0 0 0-2-1.72Z" />
+                <circle cx="12" cy="12" r="3" />
+              </svg>
+            </span>
             <span>基础设置</span>
           </button>
           <button class="nav-item" type="button" data-page="plugins">
-            <span class="nav-icon">◌</span>
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <path d="m7.5 4.27 9 5.15" />
+                <path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z" />
+                <path d="m3.3 7 8.7 5 8.7-5" />
+                <path d="M12 22V12" />
+              </svg>
+            </span>
             <span>插件管理</span>
+          </button>
+          <button class="nav-item" type="button" data-page="files">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6A2 2 0 0 1 18.46 20H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2A2 2 0 0 0 13.07 6H19a2 2 0 0 1 2 2v2" />
+              </svg>
+            </span>
+            <span>文件管理</span>
           </button>
         </nav>
       </aside>
@@ -340,20 +387,20 @@
           <section class="panel-shell settings-panel-shell">
             <form id="settingsForm" class="settings-form">
               <section class="form-section">
-                <h3>WebUI 登录认证</h3>
+                <h3>WebUI 登录认证 / 文件管理鉴权密码</h3>
                 <div class="field-grid two-columns">
                   <label class="field-block span-two">
-                    <span>自定义 WebUI 登录密码</span>
+                    <span>自定义 WebUI 登录认证 / 文件管理鉴权密码</span>
                     <input
                       id="settingsWebuiPasswordInput"
                       name="webui_access_password"
                       type="password"
                       autocomplete="new-password"
-                      placeholder="请输入新的 WebUI 登录密码"
+                      placeholder="请输入新的 WebUI 登录认证 / 文件管理鉴权密码"
                     />
                   </label>
                 </div>
-                <p id="settingsPasswordHelper" class="settings-helper">保存后立即生效。当前会话会保留，后续重新登录需使用新密码。</p>
+                <p id="settingsPasswordHelper" class="settings-helper">保存后立即生效。该密码同时用于登录 WebUI 和打开敏感持久化数据文件。</p>
                 <div class="settings-actions">
                   <button id="settingsPasswordSaveButton" class="action-button primary" type="button">保存密码</button>
                 </div>
@@ -410,7 +457,7 @@
                   <input id="settingsBase64MediaTransportInput" type="checkbox" />
                   <i></i>
                 </label>
-                <p id="settingsBase64MediaHint" class="settings-helper">关闭时保持当前路径传输；开启后会把可本地读取的媒体改为 Base64 形式发送，更适合 AstrBot 与 RocketCat Shell 同为 Docker 部署的场景。</p>
+                <p id="settingsBase64MediaHint" class="settings-helper">关闭时保持当前路径传输；开启后会把可本地读取的媒体改为 Base64 形式发送，更适合上游在 Docker 部署的情况，但 Base64 编/解码会增加花销，略微降低性能；若上游直接部署在宿主机上，推荐关闭。</p>
                 <div class="settings-actions">
                   <button id="settingsBase64MediaSaveButton" class="action-button primary" type="button">保存媒体传输模式</button>
                 </div>
@@ -418,7 +465,7 @@
 
               <section class="form-section">
                 <h3>配置文件</h3>
-                <p class="settings-helper">导出或导入当前所有 Bot 设置（包括房间信息缓存 TTL 与性能追踪开关）、WebUI 登录密码、默认 WebUI 端口、消息映射窗口条数上限、Base64 媒体传输开关，以及全部插件主配置。</p>
+                <p class="settings-helper">导出或导入当前所有 Bot 设置（包括房间信息缓存 TTL 与性能追踪开关）、WebUI 登录认证 / 文件管理鉴权密码、默认 WebUI 端口、消息映射窗口条数上限、Base64 媒体传输开关，以及全部插件主配置。</p>
                 <div class="settings-actions">
                   <button id="settingsExportConfigButton" class="action-button subtle" type="button">导出配置</button>
                   <button id="settingsImportConfigButton" class="action-button primary" type="button">导入配置</button>
@@ -467,6 +514,130 @@
             </div>
 
             <div id="pluginGrid" class="plugin-grid"></div>
+          </section>
+        </section>
+
+        <section id="filesPage" class="page-view hidden">
+          <header class="page-header">
+            <div>
+              <p class="eyebrow">RocketCat Shell</p>
+              <h1>文件管理</h1>
+            </div>
+          </header>
+
+          <section class="status-grid settings-summary-grid">
+            <article class="status-card wide">
+              <p class="status-label">当前目录</p>
+              <p id="fileCurrentPath" class="status-value file-current-path">/</p>
+              <p id="fileRootPath" class="status-detail">-</p>
+            </article>
+            <article class="status-card">
+              <p class="status-label">目录项目</p>
+              <p id="fileItemCount" class="status-value">0</p>
+            </article>
+            <article class="status-card">
+              <p class="status-label">需鉴权文件</p>
+              <p id="fileSensitiveCount" class="status-value">0</p>
+            </article>
+          </section>
+
+          <section class="panel-shell file-panel-shell">
+            <div class="file-toolbar">
+              <div class="file-tool-buttons">
+                <button id="fileUpButton" class="file-tool-button" type="button" aria-label="返回上级" title="返回上级">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M10.2 6.4 4.6 12l5.6 5.6" />
+                    <path d="M5.2 12h9.1a5.2 5.2 0 0 1 5.2 5.2v.4" />
+                  </svg>
+                </button>
+                <button id="fileCreateButton" class="file-tool-button" type="button" aria-label="新建" title="新建">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M12 5v14" />
+                    <path d="M5 12h14" />
+                  </svg>
+                </button>
+                <button id="fileRefreshButton" class="file-tool-button" type="button" aria-label="刷新" title="刷新">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M20 6.8v5h-5" />
+                    <path d="M19.2 12a7.2 7.2 0 1 1-2.1-5.1L20 9.8" />
+                  </svg>
+                </button>
+                <button id="fileUploadButton" class="file-tool-button" type="button" aria-label="上传文件" title="上传文件">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M12 15.5V4.8" />
+                    <path d="m7.4 9.4 4.6-4.6 4.6 4.6" />
+                    <path d="M5.2 14.4v3.9c0 1 .8 1.9 1.9 1.9h9.8c1 0 1.9-.8 1.9-1.9v-3.9" />
+                  </svg>
+                </button>
+                <button id="fileDeleteSelectedButton" class="file-tool-button file-batch-button hidden" type="button" aria-label="删除选中项目" title="删除选中项目">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M4.8 7h14.4" />
+                    <path d="M9.4 7V4.8h5.2V7" />
+                    <path d="M7 7.2 7.7 20h8.6l.7-12.8" />
+                    <path d="M10 10.7v5.5" />
+                    <path d="M14 10.7v5.5" />
+                  </svg>
+                  <span id="fileDeleteSelectedCount">0</span>
+                </button>
+                <button id="fileMoveSelectedButton" class="file-tool-button file-batch-button hidden" type="button" aria-label="移动选中项目" title="移动选中项目">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="m12 3.8 3.2 3.2-3.2 3.2" />
+                    <path d="M12 3.8 8.8 7 12 10.2" />
+                    <path d="m12 13.8 3.2 3.2-3.2 3.2" />
+                    <path d="M12 13.8 8.8 17 12 20.2" />
+                    <path d="M3.8 12 7 8.8l3.2 3.2" />
+                    <path d="M3.8 12 7 15.2l3.2-3.2" />
+                    <path d="M13.8 12 17 8.8l3.2 3.2" />
+                    <path d="M13.8 12 17 15.2l3.2-3.2" />
+                  </svg>
+                  <span id="fileMoveSelectedCount">0</span>
+                </button>
+                <button id="fileDownloadSelectedButton" class="file-tool-button file-batch-button hidden" type="button" aria-label="下载选中项目" title="下载选中项目">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M12 4.6v10.1" />
+                    <path d="m7.4 10 4.6 4.6 4.6-4.6" />
+                    <path d="M5.2 15.7v2.6c0 1 .8 1.9 1.9 1.9h9.8c1 0 1.9-.8 1.9-1.9v-2.6" />
+                  </svg>
+                  <span id="fileDownloadSelectedCount">0</span>
+                </button>
+              </div>
+              <div id="fileBreadcrumb" class="file-breadcrumb"></div>
+              <p id="fileStatus" class="inline-note file-status">仅浏览 RocketCatShell 根目录内文件。</p>
+            </div>
+
+            <div id="fileUploadZone" class="file-upload-zone hidden">
+              <input id="fileUploadInput" class="hidden" type="file" multiple />
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 15.5V4.8" />
+                <path d="m7.4 9.4 4.6-4.6 4.6 4.6" />
+                <path d="M5.2 14.4v3.9c0 1 .8 1.9 1.9 1.9h9.8c1 0 1.9-.8 1.9-1.9v-3.9" />
+              </svg>
+              <p>拖拽文件到此处上传</p>
+              <button id="fileUploadPickButton" class="action-button subtle" type="button">点击选择文件</button>
+              <span id="fileUploadStatus" class="inline-note">单次最多上传 20 个文件，单文件不超过 100 MiB。</span>
+            </div>
+
+            <div id="fileEmptyState" class="empty-state hidden">
+              <p>当前目录没有可显示的文件。</p>
+            </div>
+
+            <div class="file-table-shell">
+              <table class="file-table">
+                <thead>
+                  <tr>
+                    <th class="file-select-cell">
+                      <input id="fileSelectAllInput" class="file-checkbox" type="checkbox" aria-label="选择全部文件" />
+                    </th>
+                    <th>名称</th>
+                    <th>类型</th>
+                    <th>大小</th>
+                    <th>修改时间</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="fileTableBody"></tbody>
+              </table>
+            </div>
           </section>
         </section>
       </main>
@@ -654,8 +825,176 @@
       </div>
     </div>
 
+    <div id="filePreviewModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="filePreviewTitle">
+      <div class="modal-panel file-preview-panel">
+        <div class="modal-header">
+          <div>
+            <p class="eyebrow">File Preview</p>
+            <h2 id="filePreviewTitle">文件预览</h2>
+          </div>
+          <button id="filePreviewCloseButton" class="icon-button" type="button" aria-label="关闭">×</button>
+        </div>
+        <div id="filePreviewMeta" class="file-preview-meta"></div>
+        <p id="filePreviewNotice" class="plugin-warning-text file-preview-notice hidden"></p>
+        <pre id="filePreviewContent" class="file-preview-content"></pre>
+        <div class="modal-footer">
+          <button id="filePreviewCancelButton" class="action-button subtle" type="button">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="fileEditModal" class="modal hidden file-edit-modal" role="dialog" aria-modal="true" aria-labelledby="fileEditTitle">
+      <div class="modal-panel file-edit-panel">
+        <div class="file-edit-header">
+          <div class="file-edit-heading">
+            <div class="file-edit-title-row">
+              <h2 id="fileEditTitle">编辑文件</h2>
+              <span id="fileEditPathChip" class="file-edit-path-chip">/</span>
+            </div>
+          </div>
+          <div class="file-edit-shortcut">按 <span>Ctrl/Cmd + S</span> 保存</div>
+          <button id="fileEditCloseButton" class="file-edit-close-button" type="button" aria-label="关闭">×</button>
+        </div>
+        <p id="fileEditNotice" class="plugin-warning-text file-edit-notice hidden"></p>
+        <div class="file-edit-body">
+          <div id="fileEditLineNumbers" class="file-edit-line-numbers" aria-hidden="true">1</div>
+          <textarea id="fileEditContentInput" class="file-edit-textarea" spellcheck="false"></textarea>
+        </div>
+        <div class="file-edit-footer">
+          <button id="fileEditCancelButton" class="action-button file-edit-cancel-button" type="button">取消</button>
+          <button id="fileEditSaveButton" class="action-button file-edit-save-button" type="button">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="fileSaveConfirmModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="fileSaveConfirmTitle">
+      <div class="modal-panel file-confirm-panel">
+        <div class="modal-header">
+          <h2 id="fileSaveConfirmTitle">保存文件</h2>
+          <button id="fileSaveConfirmCloseButton" class="icon-button" type="button" aria-label="关闭">×</button>
+        </div>
+        <p id="fileSaveConfirmMessage" class="file-confirm-message">确定要保存当前修改吗？</p>
+        <div class="modal-footer">
+          <button id="fileSaveConfirmCancelButton" class="action-button subtle" type="button">取消</button>
+          <button id="fileSaveConfirmSubmitButton" class="action-button file-edit-save-button" type="button">确认保存</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="fileImageViewer" class="file-image-viewer hidden" role="dialog" aria-modal="true" aria-label="图片预览">
+      <div class="file-image-viewer-topbar">
+        <div id="fileImageViewerCount" class="file-image-viewer-count">1 / 1</div>
+        <button id="fileImageViewerCloseButton" class="file-image-viewer-close" type="button" aria-label="关闭图片预览">
+          ×
+        </button>
+      </div>
+      <button id="fileImageViewerPrevButton" class="file-image-viewer-nav file-image-viewer-nav--prev hidden" type="button" aria-label="上一张">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="m15 18-6-6 6-6" />
+        </svg>
+      </button>
+      <div class="file-image-viewer-stage">
+        <img id="fileImageViewerImage" alt="图片预览" />
+      </div>
+      <button id="fileImageViewerNextButton" class="file-image-viewer-nav file-image-viewer-nav--next hidden" type="button" aria-label="下一张">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="m9 6 6 6-6 6" />
+        </svg>
+      </button>
+    </div>
+
+    <div id="fileCreateModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="fileCreateTitle">
+      <div class="modal-panel file-create-panel">
+        <div class="modal-header">
+          <h2 id="fileCreateTitle">新建</h2>
+          <button id="fileCreateCloseButton" class="icon-button" type="button" aria-label="关闭">×</button>
+        </div>
+        <div class="file-create-body">
+          <div class="file-create-tabs" role="tablist" aria-label="新建类型">
+            <button class="active" type="button" data-file-create-type="file">文件</button>
+            <button type="button" data-file-create-type="directory">目录</button>
+          </div>
+          <label class="field-block file-create-field">
+            <input id="fileCreateNameInput" type="text" placeholder="名称" autocomplete="off" />
+          </label>
+        </div>
+        <div class="modal-footer">
+          <button id="fileCreateCancelButton" class="action-button subtle" type="button">取消</button>
+          <button id="fileCreateSubmitButton" class="action-button primary" type="button">创建</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="fileDeleteModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="fileDeleteTitle">
+      <div class="modal-panel file-confirm-panel">
+        <div class="modal-header">
+          <h2 id="fileDeleteTitle">批量删除</h2>
+          <button id="fileDeleteCloseButton" class="icon-button" type="button" aria-label="关闭">×</button>
+        </div>
+        <p id="fileDeleteMessage" class="file-confirm-message">确定要删除选中的项目吗？</p>
+        <div class="modal-footer">
+          <button id="fileDeleteCancelButton" class="action-button subtle" type="button">取消</button>
+          <button id="fileDeleteConfirmButton" class="action-button primary danger-button" type="button">确定</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="fileMoveModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="fileMoveTitle">
+      <div class="modal-panel file-move-panel">
+        <div class="modal-header">
+          <h2 id="fileMoveTitle">选择目标目录</h2>
+          <button id="fileMoveCloseButton" class="icon-button" type="button" aria-label="关闭">×</button>
+        </div>
+        <div id="fileMoveTree" class="file-move-tree" role="tree"></div>
+        <p class="inline-note file-move-meta">当前选择：<span id="fileMoveSelectedPath">/</span></p>
+        <p id="fileMoveSelectionInfo" class="inline-note file-move-meta">移动项：0 个项目</p>
+        <div class="modal-footer">
+          <button id="fileMoveCancelButton" class="action-button subtle" type="button">取消</button>
+          <button id="fileMoveConfirmButton" class="action-button primary" type="button">确定</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="fileRenameModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="fileRenameTitle">
+      <div class="modal-panel file-rename-panel">
+        <div class="modal-header">
+          <h2 id="fileRenameTitle">重命名</h2>
+          <button id="fileRenameCloseButton" class="icon-button" type="button" aria-label="关闭">×</button>
+        </div>
+        <label class="field-block file-rename-field">
+          <span>新名称</span>
+          <input id="fileRenameNameInput" type="text" autocomplete="off" />
+        </label>
+        <div class="modal-footer">
+          <button id="fileRenameCancelButton" class="action-button subtle" type="button">取消</button>
+          <button id="fileRenameSubmitButton" class="action-button primary" type="button">确定</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="fileAuthModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="fileAuthTitle">
+      <div class="modal-panel file-auth-panel">
+        <div class="modal-header">
+          <div>
+            <p class="eyebrow">Sensitive File</p>
+            <h2 id="fileAuthTitle">文件管理鉴权</h2>
+          </div>
+          <button id="fileAuthCloseButton" class="icon-button" type="button" aria-label="关闭">×</button>
+        </div>
+        <p id="fileAuthMessage" class="plugin-warning-text file-auth-message">该文件包含敏感持久化数据，请输入 WebUI 登录认证 / 文件管理鉴权密码。</p>
+        <label class="field-block file-auth-field">
+          <span>鉴权密码</span>
+          <input id="fileAuthPasswordInput" type="password" autocomplete="current-password" />
+        </label>
+        <div class="modal-footer">
+          <button id="fileAuthCancelButton" class="action-button subtle" type="button">取消</button>
+          <button id="fileAuthSubmitButton" class="action-button primary" type="button">打开文件</button>
+        </div>
+      </div>
+    </div>
+
     <div id="toast" class="toast hidden"></div>
 
-    <script src="/static/app.js?v=20260520b"></script>
+    <script src="/static/app.js?v=20260615a"></script>
   </body>
-  </html>
+</html>

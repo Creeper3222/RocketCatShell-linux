@@ -7,15 +7,32 @@
 
 本项目的目标不是继续做一个“宿主里的桥接插件”，而是把 RocketCat 发展成一套真正独立的 `Rocket.Chat <-> OneBot v11` 桥接软件。
 
-这个 live 目录对应的是 RocketCatShell 的 Linux / Docker 迁移版：核心功能现已与 Windows `v0.1.6` rebuild 对齐，同时保留容器初始化、外部挂载目录、内置插件自动补种，以及 Docker 专属共享媒体路径翻译 / Base64 兼容策略等 docker 化包装层。
+这个 live 目录对应的是 RocketCatShell 的 Linux / Docker 迁移版：核心功能现已与 Windows `v0.1.7` rebuild 对齐，同时保留容器初始化、外部挂载目录、内置插件自动补种，以及 Docker 专属共享媒体路径翻译 / Base64 兼容策略等 docker 化包装层。
 
-> 当前 README 对应版本为 `v0.1.6`。`v0.1.3` 是破坏性架构重构基线，`v0.1.4` 统一收口性能优化，`v0.1.5` 补齐了内置指令与运维增强，而 `v0.1.6` 继续把重点推进到更实用的运行诊断可观测性、真实负载 benchmark 和入站热路径性能收口。
+> 当前 README 对应版本为 `v0.1.7`。`v0.1.3` 是破坏性架构重构基线，`v0.1.4` 统一收口性能优化，`v0.1.5` 补齐了内置指令与运维增强，`v0.1.6` 推进运行诊断可观测性和入站热路径性能收口，而 `v0.1.7` 开始补齐面向 Docker 迁移的内置文件管理能力。
 
 这意味着：
 
 - RocketCatShell 自己拥有 `config/`、`data/`、`logs/` 目录边界。
-- RocketCatShell 自己提供本地 WebUI、登录认证、Bot 管理和插件管理。
+- RocketCatShell 自己提供本地 WebUI、登录认证、Bot 管理、插件管理和项目根目录内文件管理。
 - RocketCatShell 仍然可以作为 OneBot reverse WebSocket 客户端与 AstrBot 协同，但不再依赖 AstrBot 插件宿主才能运行。
+
+---
+
+## v0.1.7（内置文件管理更新）
+
+`v0.1.7` 的首要目标是把类似 NapCat 的内置文件管理能力迁移到 Docker / Linux 版，方便容器环境下直接在 WebUI 内浏览和管理 RocketCatShell 文件。文件管理根目录固定为容器内项目根 `/app`，只能访问 `/app` 内的相对路径；宿主机文件只有通过 `docker-compose.yml` 挂载到 `/app/...` 后才会出现在文件管理中。
+
+- 新增 `文件管理` WebUI 页面，支持目录进入 / 返回、刷新、文件预览、图片全屏查看、文本编辑保存、新建文件或目录、上传、重命名、移动、删除和打包下载。
+- 新增文件 API：`GET /api/files`、`POST /api/files/read`、`POST /api/files/write`、`POST /api/files/create`、`POST /api/files/upload`、`POST /api/files/delete`、`POST /api/files/move`、`POST /api/files/rename`、`GET /api/files/preview`、`GET /api/files/download` 和 `POST /api/files/download`。
+- 文件管理 API 只接受 `/app` 内相对路径，拒绝 `..`、系统绝对路径、Windows 盘符路径和符号链接解析后的越界目标；这只约束 WebUI 文件管理边界，不改变 Docker 版共享媒体目录翻译或 Base64 兼容策略。
+- Docker 包装层和核心源码默认只读保护，包括 `rocketcat_shell/`、`tools/`、`docker/`、两个内置插件源码目录，以及 `requirements.txt`、`Dockerfile`、`docker-compose.yml`、`.dockerignore`、`.env.example`、`launcher.sh` 等发布与启动文件。
+- 用户挂载或创建在非保护目录中的文件仍可按规则管理。例如外部挂载到 `/app/data/plugins` 的非内置插件、`/app/data/plugin_data`、`/app/data/bots` 与 `/app/data/resource` 中的普通文件可浏览、上传、移动、删除或编辑。
+- 对明确的敏感持久化数据文件增加二次鉴权，包括 `config/shell.json`、`config/bots.json`、`config/plugins_config/*.json` 和 `data/bots/**/runtime_state.json`。鉴权密码复用 WebUI 登录认证 / 文件管理鉴权密码，密码只通过请求体提交；鉴权文件保存前会再次提示修改风险。
+- 文件列表图标按常见类型细分：目录、普通文件、`.txt`、`.json/.py/.md`、`.pdf`、`.doc/.docx` 使用不同图标；PDF 类型栏单独显示为 `PDF文件`。
+- `requirements.txt` 新增 `python-multipart`，用于 WebUI 上传文件接口。
+
+升级到 `v0.1.7` 不需要迁移 `v0.1.6` 的配置目录或运行时数据；Docker / Linux 版在更新源码后重新构建镜像即可。如果浏览器已经打开旧版 WebUI，刷新页面以获取最新静态资源。
 
 ---
 
@@ -90,7 +107,8 @@
 - `launcher.sh` 会先调用 `tools/check_requirements.py` 检查依赖，再在缺失或版本不兼容时自动安装并复检；`v0.1.5` 新增的 `psutil` 也包含在这条自动补装链路里。
 - `Dockerfile` 会把 `tools/` 一并打进镜像，保证容器内和宿主机目录里的工具链一致。
 - `docker/entrypoint.sh` 仍负责容器首次启动时写入 `config/shell.json` 默认值，并对外挂 `data/plugins` 中的内置插件执行缺失补种与版本变更自动刷新；`rocketcat_plugin_built_in_command` 与 `rocketcat_plugin_adapt_iamthinking` 都会随镜像自动同步到外挂插件目录。
-- `docker-compose.yml`、`.env` 和 `.env.example` 已改为 Linux 风格的默认持久化路径 `/opt/rocketcatshell/...`，不再使用旧的 Windows `D:/docker/...` 示例。
+- `docker-compose.yml`、`.env` 和 `.env.example` 使用 Linux / Docker 友好的相对持久化路径 `./data/...`，不再使用旧的 Windows `D:/docker/...` 示例；如需改到 `/opt/rocketcatshell/...` 等宿主机固定目录，可在 `.env` 中覆盖。
+- WebUI 文件管理边界是容器内 `/app`，宿主机目录只有通过 compose 挂载到 `/app/config`、`/app/data/...`、`/app/logs` 等路径后才可见；这个边界只用于文件管理，不会改变 `ROCKETCAT_SHARED_MEDIA_DIR` / `ROCKETCAT_SHARED_MEDIA_HOST_DIR` 的共享媒体路径翻译语义。
 - 共享媒体导出仍保留在 Docker 版里：默认继续使用 `ROCKETCAT_SHARED_MEDIA_HOST_DIR` 路径传输，把容器内共享媒体目录翻译为宿主机可见路径；只有在路径对上游不可见，或 AstrBot 与 RocketCatShell 同为 Docker、更适合直接传 Base64 时，才建议启用 `enable_base64_media_transport`，或在首次启动前把 `.env` 里的 `ROCKETCAT_DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT=true`。Base64 是兼容兜底，不是 Docker 版默认快路径。
 
 ---
@@ -247,7 +265,8 @@ RocketCatShell 启动后会在本地启动一个独立 WebUI：本机直接运�
 - `网络配置`：查看 Bot 状态、创建 / 编辑 / 删除 Bot。
 - `基础信息`：查看每个 Bot 的账号信息、OneBot self ID、Rocket.Chat 服务器品牌头像和服务器名称。
 - `猫猫日志`：查看 RocketCatShell 与 `RocketCatPerf` 运行日志，可按级别和 `Perf` 开关过滤，并支持清空日志。
-- `基础设置`：管理 WebUI 登录密码、WebUI 端口、消息映射窗口条数上限，以及配置导出 / 导入。
+- `基础设置`：管理 WebUI 登录认证 / 文件管理鉴权密码、WebUI 端口、消息映射窗口条数上限，以及配置导出 / 导入。
+- `文件管理`：浏览容器内 `/app` 项目根目录，支持目录进入 / 返回、文本查看与允许范围内的编辑保存、图片预览、上传、重命名、移动、删除和打包下载；敏感持久化数据文件需要再次输入 WebUI 登录认证 / 文件管理鉴权密码。
 - `插件管理`：管理 RocketCatShell 本地插件，包括启停、设置、重载和卸载。
 
 ### WebUI 认证
@@ -256,16 +275,16 @@ RocketCatShell 启动后会在本地启动一个独立 WebUI：本机直接运�
 </p>
 
 - RocketCatShell 默认启用密码访问。
-- 初始登录密码为 `123456`。
+- 初始 WebUI 登录认证 / 文件管理鉴权密码为 `123456`。
 - 后端提供登录、登出、Cookie 会话和受保护 API 访问控制。
 - 会话失效时，前端会自动跳回登录页。
-- WebUI 登录密码不允许设置为空。
+- WebUI 登录认证 / 文件管理鉴权密码不允许设置为空。
 
 ### 配置导出 / 导入
 
 - 导出默认文件名为 `rocketcat_config.json`。
 - 顶层判别字段为 `Is rocketcat config`。
-- 导出内容包含所有 Bot 设置（包括 `room_info_cache_ttl_seconds` 与 `perf_trace_enabled`）、WebUI 登录密码、WebUI 端口、消息映射窗口条数上限和本地插件主配置。
+- 导出内容包含所有 Bot 设置（包括 `room_info_cache_ttl_seconds` 与 `perf_trace_enabled`）、WebUI 登录认证 / 文件管理鉴权密码、WebUI 端口、消息映射窗口条数上限和本地插件主配置。
 - 导入时会先校验判别字段；若不是 RocketCatShell 配置文件，则会返回失败提示。
 
 ---
@@ -339,7 +358,7 @@ pip install -r requirements.txt
 docker compose up -d --build
 ```
 
-默认会把持久化目录挂到 `/opt/rocketcatshell/...`；如果你要改宿主机挂载位置，优先修改 `.env` 里的 `ROCKETCAT_*_DIR` 和 `ROCKETCAT_SHARED_MEDIA_HOST_DIR`。
+默认会把持久化目录挂到当前目录下的 `./data/...`；如果你要改宿主机挂载位置，优先修改 `.env` 里的 `ROCKETCAT_*_DIR` 和 `ROCKETCAT_SHARED_MEDIA_HOST_DIR`。
 
 Docker 首次启动时，“基础设置”里的“启用 Base64 传输媒体”默认关闭；如果你希望新安装首次生成的 `shell.json` 直接开启它，可以在 `.env` 中把 `ROCKETCAT_DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT=true`。
 
@@ -404,7 +423,7 @@ RocketCatShell 在第一次安装、还没有保存过任何配置时，会自�
 
 - 本机直接运行时的 WebUI 地址：`http://127.0.0.1:5751/`
 - Docker Compose 默认宿主机访问地址：`http://127.0.0.1:5751/`（容器内 `webui_host=0.0.0.0`，再由 compose 负责端口发布）
-- WebUI 初始密码：`123456`
+- WebUI 登录认证 / 文件管理鉴权密码初始值：`123456`
 - 最大消息映射窗口条数：`1000`
 - Base64 媒体传输开关：`false`
 - 本机直接运行时默认 OneBot reverse WS 地址：`ws://127.0.0.1:6199/ws/`
@@ -456,7 +475,7 @@ http://127.0.0.1:5751/
 123456
 ```
 
-首次登录后建议立刻在 `基础设置` 页修改密码。
+首次登录后建议立刻在 `基础设置` 页修改 WebUI 登录认证 / 文件管理鉴权密码。
 
 ### 3. 创建第一个 Bot
 <p align="center">
@@ -502,7 +521,7 @@ http://127.0.0.1:5751/
 |--------|------|
 | `webui_host` | WebUI 监听主机；本机直接运行默认 `127.0.0.1`，Docker 容器首次启动生成的 `shell.json` 默认 `0.0.0.0`。 |
 | `webui_port` | WebUI 监听端口，默认 `5751`。 |
-| `webui_access_password` | WebUI 登录密码，默认 `123456`。 |
+| `webui_access_password` | WebUI 登录认证 / 文件管理鉴权密码，默认 `123456`。该密码同时用于登录 WebUI 和打开敏感持久化数据文件。 |
 | `message_index_max_entries` | 最大消息映射窗口条数，默认 `1000`；超出后会清理最早映射，并在达到重置阈值后自动重排当前窗口。 |
 | `enable_base64_media_transport` | 是否把可本地读取的图片/语音/视频优先转成 `base64://` 发送，默认 `false`；关闭时继续沿用共享目录路径模式。 |
 | `log_level` | 日志级别，默认 `INFO`。 |
