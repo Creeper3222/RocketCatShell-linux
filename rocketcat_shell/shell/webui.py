@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import contextlib
 import io
+import json
 import logging
 import mimetypes
+import os
 import secrets
 import shutil
+import signal
 import socket
+import struct
+import subprocess
 import threading
 import time
 import uuid
@@ -18,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import Body, FastAPI, HTTPException, Query, Request, UploadFile, status
+from fastapi import Body, FastAPI, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi import File as FastAPIFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -26,12 +32,26 @@ from fastapi.staticfiles import StaticFiles
 from ..__init__ import __version__
 from ..logger import logger
 
+try:
+    import fcntl
+    import pty
+    import select
+    import termios
+except Exception:  # pragma: no cover - Linux PTY modules are not available on Windows hosts.
+    fcntl = None
+    pty = None
+    select = None
+    termios = None
+
 
 _FILE_PREVIEW_LIMIT_BYTES = 1024 * 1024
 _FILE_UPLOAD_CHUNK_BYTES = 1024 * 1024
 _FILE_UPLOAD_LIMIT_BYTES = 100 * 1024 * 1024
 _FILE_UPLOAD_MAX_FILES = 20
 _FILE_EDIT_LIMIT_BYTES = 1024 * 1024
+_TERMINAL_BUFFER_LIMIT_CHARS = 200_000
+_TERMINAL_DEFAULT_COLS = 80
+_TERMINAL_DEFAULT_ROWS = 24
 _PROTECTED_FILE_EXACT_PATHS = {
     (".dockerignore",),
     (".env.example",),
@@ -200,6 +220,9 @@ class ShellWebUI:
         self._log_buffer = BridgeLogBuffer(max_entries=5000)
         self._log_handler = BridgeLogHandler(self._log_buffer)
         self._file_root = Path(self.manager.layout.project_root).resolve()
+        self._terminal_lock = asyncio.Lock()
+        self._terminal_sessions: dict[str, dict[str, Any]] = {}
+        self._terminal_order: list[str] = []
         self._app = FastAPI(title="RocketCat Shell", version=__version__)
         self._static_dir = Path(__file__).resolve().parent / "static"
         self._login_file = self._static_dir / "login.html"
@@ -280,6 +303,11 @@ class ShellWebUI:
         )
         self._app.add_api_route("/api/logs", self._handle_logs, methods=["GET"])
         self._app.add_api_route("/api/logs/clear", self._handle_clear_logs, methods=["POST"])
+        self._app.add_api_route("/api/terminal/list", self._handle_list_terminals, methods=["GET"])
+        self._app.add_api_route("/api/terminal/create", self._handle_create_terminal, methods=["POST"])
+        self._app.add_api_route("/api/terminal/{terminal_id}/close", self._handle_close_terminal, methods=["POST"])
+        self._app.add_api_route("/api/terminal/order", self._handle_update_terminal_order, methods=["PUT"])
+        self._app.add_api_websocket_route("/api/ws/terminal/{terminal_id}", self._handle_terminal_websocket)
         self._app.add_api_route("/api/files", self._handle_list_files, methods=["GET"])
         self._app.add_api_route("/api/files/read", self._handle_read_file, methods=["POST"])
         self._app.add_api_route("/api/files/write", self._handle_write_file, methods=["POST"])
@@ -420,6 +448,7 @@ class ShellWebUI:
                 self._bound_socket.close()
             finally:
                 self._bound_socket = None
+        await self._close_all_terminal_sessions()
         self._detach_log_handler()
         self._log_buffer.clear()
         if hasattr(self.manager, "clear_webui_runtime"):
@@ -537,6 +566,433 @@ class ShellWebUI:
         if request.client and request.client.host:
             return str(request.client.host)
         return "unknown"
+
+    def _extract_websocket_session_token(self, websocket: WebSocket) -> str:
+        return str(websocket.cookies.get(self._session_cookie_name, "") or "").strip()
+
+    async def _is_websocket_authenticated(self, websocket: WebSocket) -> bool:
+        if not self._auth_required:
+            return True
+
+        token = self._extract_websocket_session_token(websocket)
+        if not token:
+            return False
+
+        async with self._session_lock:
+            await self._cleanup_sessions_locked()
+            session = self._sessions.get(token)
+            if not session:
+                return False
+            session["last_active"] = time.time()
+            return True
+
+    def _get_terminal_command(self) -> list[str]:
+        shell = str(os.environ.get("SHELL") or "").strip()
+        if shell:
+            shell_path = Path(shell)
+            if shell_path.exists() or shutil.which(shell):
+                return [shell]
+
+        for candidate in ("/bin/bash", "/bin/sh", "sh"):
+            if Path(candidate).exists() or shutil.which(candidate):
+                return [candidate]
+        return ["/bin/sh"]
+
+    def _build_terminal_environment(self) -> dict[str, str]:
+        env = dict(os.environ)
+        env.setdefault("TERM", "xterm-256color")
+        env.setdefault("LANG", "C.UTF-8")
+        env.setdefault("LC_ALL", env.get("LANG", "C.UTF-8"))
+        return env
+
+    def _set_terminal_pty_size(self, master_fd: int, *, cols: int, rows: int) -> None:
+        if fcntl is None or termios is None:
+            return
+        size = struct.pack("HHHH", int(rows), int(cols), 0, 0)
+        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, size)
+
+    def _spawn_terminal_pty(self, *, cols: int, rows: int) -> tuple[subprocess.Popen[bytes], int]:
+        if pty is None:
+            raise RuntimeError("Linux PTY support is unavailable")
+
+        master_fd, slave_fd = pty.openpty()
+        try:
+            self._set_terminal_pty_size(master_fd, cols=cols, rows=rows)
+            process = subprocess.Popen(
+                self._get_terminal_command(),
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                cwd=str(self._file_root),
+                env=self._build_terminal_environment(),
+                close_fds=True,
+                start_new_session=True,
+            )
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(slave_fd)
+
+        with contextlib.suppress(Exception):
+            os.set_blocking(master_fd, False)
+        return process, master_fd
+
+    def _schedule_terminal_coroutine(self, loop: asyncio.AbstractEventLoop, coro: Any) -> None:
+        if loop.is_closed():
+            with contextlib.suppress(Exception):
+                coro.close()
+            return
+        loop.call_soon_threadsafe(asyncio.create_task, coro)
+
+    def _trim_terminal_buffer(self, value: str) -> str:
+        if len(value) <= _TERMINAL_BUFFER_LIMIT_CHARS:
+            return value
+        return value[-_TERMINAL_BUFFER_LIMIT_CHARS:]
+
+    def _serialize_terminal_session(self, session: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": session["id"],
+            "title": session.get("title") or session["id"],
+            "created_at": session.get("created_at", 0),
+            "last_access": session.get("last_access", 0),
+            "cwd": session.get("cwd", str(self._file_root)),
+        }
+
+    async def _create_terminal_session(self, *, cols: int, rows: int) -> dict[str, Any]:
+        terminal_id = str(uuid.uuid4())
+        now = time.time()
+        loop = asyncio.get_running_loop()
+        process, master_fd = self._spawn_terminal_pty(cols=cols, rows=rows)
+        stop_event = threading.Event()
+
+        session: dict[str, Any] = {
+            "id": terminal_id,
+            "title": terminal_id,
+            "backend": "linux-pty",
+            "process": process,
+            "pty_fd": master_fd,
+            "pty_stop": stop_event,
+            "created_at": now,
+            "last_access": now,
+            "cwd": str(self._file_root),
+            "cols": cols,
+            "rows": rows,
+            "buffer": "",
+            "sockets": set(),
+            "closing": False,
+            "seen_output": False,
+            "loop": loop,
+        }
+
+        async with self._terminal_lock:
+            self._terminal_sessions[terminal_id] = session
+            self._terminal_order.append(terminal_id)
+
+        reader_thread = threading.Thread(
+            target=self._read_terminal_pty_output,
+            args=(terminal_id, process, master_fd, stop_event, loop),
+            name=f"rocketcat-webui-pty-{terminal_id[:8]}",
+            daemon=True,
+        )
+        session["reader_thread"] = reader_thread
+        reader_thread.start()
+        return session
+
+    def _read_terminal_pty_output(
+        self,
+        terminal_id: str,
+        process: subprocess.Popen[bytes],
+        master_fd: int,
+        stop_event: threading.Event,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        exit_code: int | None = None
+        try:
+            while not stop_event.is_set():
+                ready = []
+                if select is not None:
+                    try:
+                        ready, _, _ = select.select([master_fd], [], [], 0.1)
+                    except (OSError, ValueError):
+                        break
+                if ready:
+                    try:
+                        payload = os.read(master_fd, 4096)
+                    except BlockingIOError:
+                        continue
+                    except OSError:
+                        break
+                    if not payload:
+                        break
+                    data = payload.decode("utf-8", errors="replace")
+                    self._schedule_terminal_coroutine(
+                        loop,
+                        self._broadcast_terminal_output(terminal_id, data),
+                    )
+                    continue
+                if process.poll() is not None:
+                    break
+            exit_code = process.poll()
+        except Exception as exc:
+            logger.warning("[RocketCatShell] WebUI PTY reader failed: id=%s err=%r", terminal_id, exc)
+        finally:
+            if exit_code is None:
+                with contextlib.suppress(Exception):
+                    exit_code = process.wait(timeout=0)
+            self._schedule_terminal_coroutine(
+                loop,
+                self._finish_terminal_session(terminal_id, exit_code),
+            )
+
+    async def _broadcast_terminal_output(self, terminal_id: str, data: str) -> None:
+        if not data:
+            return
+
+        async with self._terminal_lock:
+            session = self._terminal_sessions.get(terminal_id)
+            if not session:
+                return
+            if not session.get("seen_output"):
+                data = data.lstrip("\r\n")
+                session["seen_output"] = True
+            if not data:
+                return
+            session["buffer"] = self._trim_terminal_buffer(str(session.get("buffer") or "") + data)
+            session["last_access"] = time.time()
+            sockets = list(session.get("sockets") or [])
+
+        failed_sockets = []
+        message = {"type": "output", "data": data}
+        for websocket in sockets:
+            try:
+                await websocket.send_json(message)
+            except Exception:
+                failed_sockets.append(websocket)
+
+        if failed_sockets:
+            async with self._terminal_lock:
+                session = self._terminal_sessions.get(terminal_id)
+                if session:
+                    for websocket in failed_sockets:
+                        session["sockets"].discard(websocket)
+
+    async def _write_terminal_input(self, terminal_id: str, data: str) -> None:
+        async with self._terminal_lock:
+            session = self._terminal_sessions.get(terminal_id)
+            if not session:
+                return
+            process: subprocess.Popen[bytes] | None = session.get("process")
+            master_fd: int | None = session.get("pty_fd")
+            session["last_access"] = time.time()
+
+        if process is None or master_fd is None or process.poll() is not None:
+            return
+        try:
+            await asyncio.to_thread(os.write, master_fd, str(data).encode("utf-8", errors="replace"))
+        except OSError:
+            await self._finish_terminal_session(terminal_id, process.poll())
+
+    async def _resize_terminal(self, terminal_id: str, *, cols: int, rows: int) -> None:
+        cols = max(20, min(int(cols or _TERMINAL_DEFAULT_COLS), 300))
+        rows = max(5, min(int(rows or _TERMINAL_DEFAULT_ROWS), 120))
+        async with self._terminal_lock:
+            session = self._terminal_sessions.get(terminal_id)
+            if not session:
+                return
+            session["cols"] = cols
+            session["rows"] = rows
+            master_fd: int | None = session.get("pty_fd")
+
+        if master_fd is not None:
+            with contextlib.suppress(Exception):
+                self._set_terminal_pty_size(master_fd, cols=cols, rows=rows)
+
+    async def _finish_terminal_session(self, terminal_id: str, exit_code: int | None) -> None:
+        async with self._terminal_lock:
+            session = self._terminal_sessions.pop(terminal_id, None)
+            self._terminal_order = [item for item in self._terminal_order if item != terminal_id]
+            if not session:
+                return
+            sockets = list(session.get("sockets") or [])
+            session["sockets"].clear()
+            master_fd: int | None = session.get("pty_fd")
+            stop_event: threading.Event | None = session.get("pty_stop")
+
+        if stop_event:
+            stop_event.set()
+        if master_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(master_fd)
+
+        message = {
+            "type": "exit",
+            "data": f"\r\n[terminal exited with code {exit_code}]\r\n",
+            "exit_code": exit_code,
+            "id": terminal_id,
+        }
+        for websocket in sockets:
+            with contextlib.suppress(Exception):
+                await websocket.send_json(message)
+            with contextlib.suppress(Exception):
+                await websocket.close()
+
+    async def _close_terminal_session(self, terminal_id: str) -> bool:
+        async with self._terminal_lock:
+            session = self._terminal_sessions.pop(terminal_id, None)
+            self._terminal_order = [item for item in self._terminal_order if item != terminal_id]
+            if not session:
+                return False
+            session["closing"] = True
+            process: subprocess.Popen[bytes] | None = session.get("process")
+            master_fd: int | None = session.get("pty_fd")
+            stop_event: threading.Event | None = session.get("pty_stop")
+            sockets = list(session.get("sockets") or [])
+            session["sockets"].clear()
+            reader_thread: threading.Thread | None = session.get("reader_thread")
+
+        if stop_event:
+            stop_event.set()
+        if master_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(master_fd)
+
+        if process is not None and process.poll() is None:
+            with contextlib.suppress(ProcessLookupError, RuntimeError, OSError):
+                os.killpg(process.pid, signal.SIGTERM)
+            try:
+                await asyncio.to_thread(process.wait, timeout=2.0)
+            except Exception:
+                with contextlib.suppress(ProcessLookupError, RuntimeError, OSError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(process.wait, timeout=1.0)
+
+        if reader_thread and reader_thread.is_alive() and reader_thread is not threading.current_thread():
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(reader_thread.join, 1.0)
+
+        for websocket in sockets:
+            with contextlib.suppress(Exception):
+                await websocket.close()
+        return True
+
+    async def _close_all_terminal_sessions(self) -> None:
+        async with self._terminal_lock:
+            terminal_ids = list(self._terminal_sessions)
+        for terminal_id in terminal_ids:
+            await self._close_terminal_session(terminal_id)
+
+    async def _handle_list_terminals(self) -> dict[str, Any]:
+        async with self._terminal_lock:
+            ordered_ids = [item for item in self._terminal_order if item in self._terminal_sessions]
+            missing_ids = [item for item in self._terminal_sessions if item not in ordered_ids]
+            self._terminal_order = ordered_ids + missing_ids
+            items = [
+                self._serialize_terminal_session(self._terminal_sessions[terminal_id])
+                for terminal_id in self._terminal_order
+            ]
+        return {"items": items}
+
+    async def _handle_create_terminal(
+        self,
+        payload: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, Any]:
+        payload = payload or {}
+        cols = max(20, min(int(payload.get("cols") or _TERMINAL_DEFAULT_COLS), 240))
+        rows = max(5, min(int(payload.get("rows") or _TERMINAL_DEFAULT_ROWS), 80))
+        try:
+            session = await self._create_terminal_session(cols=cols, rows=rows)
+        except Exception as exc:
+            logger.error("[RocketCatShell] WebUI terminal create failed: %r", exc)
+            raise HTTPException(status_code=500, detail="鍒涘缓缁堢澶辫触") from exc
+        return self._serialize_terminal_session(session)
+
+    async def _handle_close_terminal(self, terminal_id: str) -> dict[str, Any]:
+        await self._close_terminal_session(terminal_id)
+        return {"ok": True}
+
+    async def _handle_update_terminal_order(
+        self,
+        payload: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, Any]:
+        payload = payload or {}
+        raw_order = payload.get("order") or []
+        if not isinstance(raw_order, list):
+            raise HTTPException(status_code=400, detail="缁堢椤哄簭蹇呴』鏄垪琛?")
+
+        async with self._terminal_lock:
+            known_ids = set(self._terminal_sessions)
+            next_order: list[str] = []
+            for raw_id in raw_order:
+                terminal_id = str(raw_id or "").strip()
+                if terminal_id in known_ids and terminal_id not in next_order:
+                    next_order.append(terminal_id)
+            next_order.extend(
+                terminal_id
+                for terminal_id in self._terminal_order
+                if terminal_id in known_ids and terminal_id not in next_order
+            )
+            next_order.extend(
+                terminal_id
+                for terminal_id in self._terminal_sessions
+                if terminal_id not in next_order
+            )
+            self._terminal_order = next_order
+            items = [
+                self._serialize_terminal_session(self._terminal_sessions[terminal_id])
+                for terminal_id in self._terminal_order
+            ]
+        return {"items": items}
+
+    async def _handle_terminal_websocket(self, websocket: WebSocket, terminal_id: str) -> None:
+        if not await self._is_websocket_authenticated(websocket):
+            await websocket.close(code=1008)
+            return
+
+        async with self._terminal_lock:
+            session = self._terminal_sessions.get(terminal_id)
+            if not session:
+                await websocket.close(code=1008)
+                return
+
+        await websocket.accept()
+        buffered_output = ""
+        async with self._terminal_lock:
+            session = self._terminal_sessions.get(terminal_id)
+            if not session:
+                await websocket.close(code=1008)
+                return
+            session["sockets"].add(websocket)
+            session["last_access"] = time.time()
+            buffered_output = str(session.get("buffer") or "")
+
+        if buffered_output:
+            await websocket.send_json({"type": "output", "data": buffered_output})
+
+        try:
+            while True:
+                raw_message = await websocket.receive_text()
+                try:
+                    message = json.loads(raw_message)
+                except json.JSONDecodeError:
+                    continue
+                message_type = message.get("type")
+                if message_type == "input":
+                    await self._write_terminal_input(terminal_id, str(message.get("data") or ""))
+                    continue
+                if message_type == "resize":
+                    try:
+                        cols = int(message.get("cols") or _TERMINAL_DEFAULT_COLS)
+                        rows = int(message.get("rows") or _TERMINAL_DEFAULT_ROWS)
+                    except (TypeError, ValueError):
+                        continue
+                    await self._resize_terminal(terminal_id, cols=cols, rows=rows)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            async with self._terminal_lock:
+                session = self._terminal_sessions.get(terminal_id)
+                if session:
+                    session["sockets"].discard(websocket)
 
     def _attach_log_handler(self) -> None:
         if self._log_handler not in logger.handlers:

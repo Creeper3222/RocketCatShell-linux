@@ -8,29 +8,29 @@ services:
       - "${ROCKETCAT_WEBUI_BIND_IP:-127.0.0.1}:${ROCKETCAT_WEBUI_PORT:-5751}:${ROCKETCAT_WEBUI_PORT:-5751}"
     volumes:
       - type: bind
-        source: ${ROCKETCAT_CONFIG_DIR:-./config}
+        source: ${ROCKETCAT_CONFIG_DIR:-/opt/rocketcatshell/config}
         target: /app/config
       - type: bind
-        source: ${ROCKETCAT_BOTS_DIR:-./data/bots}
+        source: ${ROCKETCAT_BOTS_DIR:-/opt/rocketcatshell/data/bots}
         target: /app/data/bots
       - type: bind
-        source: ${ROCKETCAT_SHARED_MEDIA_HOST_DIR:-./data/bots/_shared_media}
+        source: ${ROCKETCAT_SHARED_MEDIA_HOST_DIR:-/opt/rocketcatshell/data/bots/_shared_media}
         target: /app/data/bots/_shared_media
       - type: bind
-        source: ${ROCKETCAT_PLUGINS_DIR:-./data/plugins}
+        source: ${ROCKETCAT_PLUGINS_DIR:-/opt/rocketcatshell/data/plugins}
         target: /app/data/plugins
       - type: bind
-        source: ${ROCKETCAT_PLUGIN_DATA_DIR:-./data/plugin_data}
+        source: ${ROCKETCAT_PLUGIN_DATA_DIR:-/opt/rocketcatshell/data/plugin_data}
         target: /app/data/plugin_data
       - type: bind
-        source: ${ROCKETCAT_LOGS_DIR:-./logs}
+        source: ${ROCKETCAT_LOGS_DIR:-/opt/rocketcatshell/logs}
         target: /app/logs
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       ROCKETCAT_SHARED_MEDIA_DIR: /app/data/bots/_shared_media
-      ROCKETCAT_SHARED_MEDIA_HOST_DIR: ${ROCKETCAT_SHARED_MEDIA_HOST_DIR:-./data/bots/_shared_media}
+      ROCKETCAT_SHARED_MEDIA_HOST_DIR: ${ROCKETCAT_SHARED_MEDIA_HOST_DIR:-/opt/rocketcatshell/data/bots/_shared_media}
       ROCKETCAT_PERF_TRACE: ${ROCKETCAT_PERF_TRACE:-false}
       ROCKETCAT_WEBUI_HOST: ${ROCKETCAT_WEBUI_HOST:-0.0.0.0}
       ROCKETCAT_WEBUI_PORT: ${ROCKETCAT_WEBUI_PORT:-5751}

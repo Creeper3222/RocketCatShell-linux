@@ -4,7 +4,8 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>RocketCat Shell</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260615a" />
+    <link rel="stylesheet" href="/static/vendor/xterm/xterm.css?v=20260615diagicons1" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260615diagicons1" />
   </head>
   <body>
     <div class="shell-layout">
@@ -89,6 +90,15 @@
             </span>
             <span>文件管理</span>
           </button>
+          <button class="nav-item" type="button" data-page="terminal">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <path d="m4 17 6-5-6-5" />
+                <path d="M12 19h8" />
+              </svg>
+            </span>
+            <span>系统终端</span>
+          </button>
         </nav>
       </aside>
 
@@ -167,7 +177,15 @@
                 <div class="diagnostics-meter-copy">
                   <div>
                     <p class="status-label">Host CPU</p>
-                    <h3 class="diagnostics-meter-title">CPU 占用</h3>
+                    <h3 class="diagnostics-meter-title">
+                      <span class="diagnostics-meter-title-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24">
+                          <path d="M9 2h2v3H9V2Zm4 0h2v3h-2V2ZM9 19h2v3H9v-3Zm4 0h2v3h-2v-3ZM2 9h3v2H2V9Zm0 4h3v2H2v-2Zm17-4h3v2h-3V9Zm0 4h3v2h-3v-2Z" />
+                          <path d="M7 5h10a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Zm1.6 3.6v6.8h6.8V8.6H8.6Zm2.1 2.1h2.6v2.6h-2.6v-2.6Z" />
+                        </svg>
+                      </span>
+                      <span>CPU 占用</span>
+                    </h3>
                   </div>
                   <p id="diagnosticsCpuSummary" class="diagnostics-meter-summary">-</p>
                   <div class="diagnostics-meter-stats">
@@ -219,7 +237,14 @@
                 <div class="diagnostics-meter-copy">
                   <div>
                     <p class="status-label">System Memory</p>
-                    <h3 class="diagnostics-meter-title">内存占用</h3>
+                    <h3 class="diagnostics-meter-title">
+                      <span class="diagnostics-meter-title-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24">
+                          <path d="M5 3h10.2L19 6.8V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Zm10 1.5V8h3.5L15 4.5ZM6.6 8.2v3.9h2V8.2h-2Zm3.1 0v3.9h2V8.2h-2Zm3.1 0v3.9h2V8.2h-2Z" />
+                        </svg>
+                      </span>
+                      <span>内存占用</span>
+                    </h3>
                   </div>
                   <p id="diagnosticsMemorySummary" class="diagnostics-meter-summary">-</p>
                   <div class="diagnostics-meter-stats">
@@ -277,6 +302,11 @@
                 <p class="status-label">Snapshot / Journal</p>
                 <p id="diagnosticsRuntimeStorage" class="status-value">-</p>
               </article>
+              <article class="status-card rocketcat-version-card">
+                <p class="status-label">RocketCat 版本</p>
+                <p id="diagnosticsRocketCatVersion" class="status-value version-value">-</p>
+                <p class="status-detail">当前 WebUI 运行版本</p>
+              </article>
             </section>
 
             <div id="diagnosticsEmptyState" class="empty-state hidden">
@@ -306,6 +336,11 @@
             <article class="status-card">
               <p class="status-label">已连接</p>
               <p id="basicOnlineCount" class="status-value">0</p>
+            </article>
+            <article class="status-card rocketcat-version-card">
+              <p class="status-label">RocketCat 版本</p>
+              <p id="basicRocketCatVersion" class="status-value version-value">-</p>
+              <p class="status-detail">当前 WebUI 运行版本</p>
             </article>
             <article class="status-card wide">
               <p class="status-label">显示规则</p>
@@ -637,6 +672,37 @@
                 </thead>
                 <tbody id="fileTableBody"></tbody>
               </table>
+            </div>
+          </section>
+        </section>
+
+        <section id="terminalPage" class="page-view hidden">
+          <header class="page-header terminal-header">
+            <div>
+              <p class="eyebrow">RocketCat Shell</p>
+              <h1>系统终端</h1>
+            </div>
+            <div class="header-actions">
+              <button id="terminalCreateButton" class="terminal-create-button" type="button" aria-label="新建终端" title="新建终端">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 5v14" />
+                  <path d="M5 12h14" />
+                </svg>
+              </button>
+            </div>
+          </header>
+
+          <section class="terminal-panel">
+            <div id="terminalTabs" class="terminal-tabs hidden" role="tablist" aria-label="终端列表"></div>
+            <div id="terminalEmptyState" class="terminal-empty-state">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 5v14" />
+                <path d="M5 12h14" />
+              </svg>
+              <p>点击右上角按钮创建终端</p>
+            </div>
+            <div id="terminalWorkspace" class="terminal-workspace hidden">
+              <div id="terminalScreen" class="terminal-screen" aria-label="终端"></div>
             </div>
           </section>
         </section>
@@ -995,6 +1061,8 @@
 
     <div id="toast" class="toast hidden"></div>
 
-    <script src="/static/app.js?v=20260615a"></script>
+    <script src="/static/vendor/xterm/xterm.js?v=20260615diagicons1"></script>
+    <script src="/static/vendor/xterm/addon-fit.js?v=20260615diagicons1"></script>
+    <script src="/static/app.js?v=20260615diagicons1"></script>
   </body>
 </html>

@@ -20,12 +20,25 @@ const DEFAULT_FORM = {
 
 const ROCKETCAT_CONFIG_MARKER_FIELD = 'Is rocketcat config';
 const FILE_IMAGE_EXTENSIONS = new Set(['.bmp', '.gif', '.jpeg', '.jpg', '.png', '.webp']);
+const SIDEBAR_STORAGE_KEY = 'rocketcat_sidebar_open';
+
+function getStoredSidebarOpen() {
+  try {
+    const rawValue = window.localStorage.getItem(SIDEBAR_STORAGE_KEY);
+    return rawValue === null ? true : rawValue !== 'false';
+  } catch (_error) {
+    return true;
+  }
+}
 
 const state = {
   editingId: null,
   bots: [],
   status: null,
   currentPage: 'network',
+  ui: {
+    sidebarOpen: getStoredSidebarOpen(),
+  },
   network: {
     pollTimer: null,
   },
@@ -98,6 +111,15 @@ const state = {
       index: 0,
     },
   },
+  terminal: {
+    items: [],
+    activeId: '',
+    loaded: false,
+    sockets: new Map(),
+    terms: new Map(),
+    fitAddons: new Map(),
+    dragId: '',
+  },
 };
 
 function getSuggestedOnebotSelfId() {
@@ -115,7 +137,9 @@ function buildCreateDefaults() {
 }
 
 const elements = {
+  shellLayout: document.querySelector('.shell-layout'),
   navButtons: Array.from(document.querySelectorAll('[data-page]')),
+  sidebarToggleButtons: [],
   networkPage: document.getElementById('networkPage'),
   diagnosticsPage: document.getElementById('diagnosticsPage'),
   basicPage: document.getElementById('basicPage'),
@@ -123,6 +147,7 @@ const elements = {
   settingsPage: document.getElementById('settingsPage'),
   pluginsPage: document.getElementById('pluginsPage'),
   filesPage: document.getElementById('filesPage'),
+  terminalPage: document.getElementById('terminalPage'),
   bridgeStatus: document.getElementById('bridgeStatus'),
   mainBotStatus: document.getElementById('mainBotStatus'),
   webuiStatus: document.getElementById('webuiStatus'),
@@ -139,6 +164,7 @@ const elements = {
   basicEmptyState: document.getElementById('basicEmptyState'),
   basicEnabledCount: document.getElementById('basicEnabledCount'),
   basicOnlineCount: document.getElementById('basicOnlineCount'),
+  basicRocketCatVersion: document.getElementById('basicRocketCatVersion'),
   diagnosticsRefreshButton: document.getElementById('diagnosticsRefreshButton'),
   diagnosticsCpuSummary: document.getElementById('diagnosticsCpuSummary'),
   diagnosticsCpuCores: document.getElementById('diagnosticsCpuCores'),
@@ -165,6 +191,7 @@ const elements = {
   diagnosticsCacheNote: document.getElementById('diagnosticsCacheNote'),
   diagnosticsOnlineCount: document.getElementById('diagnosticsOnlineCount'),
   diagnosticsRuntimeStorage: document.getElementById('diagnosticsRuntimeStorage'),
+  diagnosticsRocketCatVersion: document.getElementById('diagnosticsRocketCatVersion'),
   diagnosticsGrid: document.getElementById('diagnosticsGrid'),
   diagnosticsEmptyState: document.getElementById('diagnosticsEmptyState'),
   banner: document.getElementById('statusBanner'),
@@ -292,6 +319,11 @@ const elements = {
   fileAuthCloseButton: document.getElementById('fileAuthCloseButton'),
   fileAuthCancelButton: document.getElementById('fileAuthCancelButton'),
   fileAuthSubmitButton: document.getElementById('fileAuthSubmitButton'),
+  terminalCreateButton: document.getElementById('terminalCreateButton'),
+  terminalTabs: document.getElementById('terminalTabs'),
+  terminalEmptyState: document.getElementById('terminalEmptyState'),
+  terminalWorkspace: document.getElementById('terminalWorkspace'),
+  terminalScreen: document.getElementById('terminalScreen'),
   toast: document.getElementById('toast'),
   logConsole: document.getElementById('logConsole'),
   logAutoScrollToggle: document.getElementById('logAutoScrollToggle'),
@@ -309,6 +341,86 @@ function showToast(message, kind = 'default') {
   showToast._timer = window.setTimeout(() => {
     elements.toast.className = 'toast hidden';
   }, 2600);
+}
+
+function getSidebarToggleIcon(open) {
+  if (open) {
+    return `
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M3 18h13v-2H3v2Z" />
+        <path d="M3 13h10v-2H3v2Z" />
+        <path d="M3 6v2h13V6H3Z" />
+        <path d="m21 15.59-3.58-3.59L21 8.41 19.59 7l-5 5 5 5L21 15.59Z" />
+      </svg>
+    `;
+  }
+  return `
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M3 18h18v-2H3v2Z" />
+      <path d="M3 13h18v-2H3v2Z" />
+      <path d="M3 6v2h18V6H3Z" />
+    </svg>
+  `;
+}
+
+function setSidebarOpen(open, { persist = true } = {}) {
+  state.ui.sidebarOpen = Boolean(open);
+  document.body.classList.toggle('sidebar-collapsed', !state.ui.sidebarOpen);
+  document.body.classList.toggle('sidebar-expanded', state.ui.sidebarOpen);
+
+  const title = state.ui.sidebarOpen ? '收起左侧栏' : '展开左侧栏';
+  for (const button of elements.sidebarToggleButtons) {
+    button.innerHTML = getSidebarToggleIcon(state.ui.sidebarOpen);
+    button.setAttribute('aria-label', title);
+    button.setAttribute('title', title);
+    button.setAttribute('aria-pressed', String(state.ui.sidebarOpen));
+  }
+
+  if (persist) {
+    try {
+      window.localStorage.setItem(SIDEBAR_STORAGE_KEY, String(state.ui.sidebarOpen));
+    } catch (_error) {
+      // Ignore storage failures in restricted browser modes.
+    }
+  }
+
+  window.setTimeout(() => {
+    if (state.currentPage === 'terminal' && state.terminal.activeId) {
+      fitTerminal(state.terminal.activeId);
+    }
+  }, 220);
+}
+
+function toggleSidebar() {
+  setSidebarOpen(!state.ui.sidebarOpen);
+}
+
+function setupSidebarToggleButtons() {
+  const headers = Array.from(document.querySelectorAll('.page-header'));
+  for (const header of headers) {
+    if (header.querySelector('[data-sidebar-toggle]')) {
+      continue;
+    }
+    const titleNode = header.firstElementChild;
+    if (!titleNode || titleNode.classList.contains('header-actions')) {
+      continue;
+    }
+
+    const titleGroup = document.createElement('div');
+    titleGroup.className = 'page-header-title-group';
+
+    const button = document.createElement('button');
+    button.className = 'sidebar-toggle-button';
+    button.type = 'button';
+    button.dataset.sidebarToggle = 'true';
+    button.addEventListener('click', toggleSidebar);
+
+    header.insertBefore(titleGroup, titleNode);
+    titleGroup.append(button, titleNode);
+  }
+
+  elements.sidebarToggleButtons = Array.from(document.querySelectorAll('[data-sidebar-toggle]'));
+  setSidebarOpen(state.ui.sidebarOpen, { persist: false });
 }
 
 async function requestJson(url, options = {}) {
@@ -452,6 +564,7 @@ function setActivePage(page) {
   elements.settingsPage.classList.toggle('hidden', page !== 'settings');
   elements.pluginsPage.classList.toggle('hidden', page !== 'plugins');
   elements.filesPage.classList.toggle('hidden', page !== 'files');
+  elements.terminalPage.classList.toggle('hidden', page !== 'terminal');
 
   for (const button of elements.navButtons) {
     const isActive = button.dataset.page === page;
@@ -534,6 +647,10 @@ async function activatePage(page, { forceReload = false } = {}) {
   }
   if (page === 'files') {
     await loadFiles({ forceReload, silent: false });
+    return;
+  }
+  if (page === 'terminal') {
+    await loadTerminals({ forceReload, silent: false });
   }
 }
 
@@ -686,6 +803,17 @@ function getDiagnosticAuthLabel(authState) {
   return String(authState || '-').trim() || '-';
 }
 
+function getRocketCatVersion(source = null) {
+  const payload = source || {};
+  return String(
+    payload.version
+      || payload.product_version
+      || payload.host?.product_version
+      || state.status?.version
+      || '-'
+  ).trim() || '-';
+}
+
 function stopNetworkPolling() {
   if (state.network.pollTimer) {
     window.clearTimeout(state.network.pollTimer);
@@ -829,6 +957,7 @@ function renderDiagnostics(payload) {
 
   elements.diagnosticsOnlineCount.textContent = `${Number(summary.online_bot_count) || 0} / ${Number(summary.enabled_bot_count) || 0}`;
   elements.diagnosticsRuntimeStorage.textContent = `${formatDiagnosticBytes(summary.total_runtime_snapshot_bytes)} / ${formatDiagnosticBytes(summary.total_runtime_journal_bytes)}`;
+  elements.diagnosticsRocketCatVersion.textContent = getRocketCatVersion(diagnostics);
 
   elements.diagnosticsEmptyState.classList.toggle('hidden', items.length > 0);
   elements.diagnosticsGrid.innerHTML = '';
@@ -907,6 +1036,7 @@ function renderBasicInfo(payload) {
 
   elements.basicEnabledCount.textContent = String(summary.enabled_count || 0);
   elements.basicOnlineCount.textContent = String(summary.online_count || 0);
+  elements.basicRocketCatVersion.textContent = getRocketCatVersion(payload);
   elements.basicEmptyState.classList.toggle('hidden', items.length > 0);
   elements.basicInfoGrid.innerHTML = '';
 
@@ -1492,6 +1622,328 @@ function escapeHtml(value) {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;');
+}
+
+function getTerminalItem(id) {
+  return state.terminal.items.find((item) => item.id === id) || null;
+}
+
+function getTerminalSocketUrl(id) {
+  const url = new URL(window.location.href);
+  url.protocol = url.protocol.replace('http', 'ws');
+  url.pathname = `/api/ws/terminal/${encodeURIComponent(id)}`;
+  url.search = '';
+  return url.toString();
+}
+
+function createTerminalRenderer(id) {
+  if (!id) {
+    return null;
+  }
+  const existing = state.terminal.terms.get(id);
+  if (existing) {
+    return existing;
+  }
+  if (typeof window.Terminal !== 'function') {
+    showToast('终端渲染组件未加载，请刷新页面', 'error');
+    return null;
+  }
+
+  const term = new window.Terminal({
+    allowTransparency: true,
+    convertEol: false,
+    cursorBlink: true,
+    cursorStyle: 'bar',
+    fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
+    fontSize: 16,
+    lineHeight: 1.25,
+    scrollback: 5000,
+    theme: {
+      background: '#ffffff00',
+      foreground: '#111016',
+      cursor: '#cf145a',
+      selectionBackground: '#cfd3d7',
+      black: '#111016',
+      red: '#cf145a',
+      green: '#208a5b',
+      yellow: '#aa7800',
+      blue: '#3267d6',
+      magenta: '#9f4cc9',
+      cyan: '#007f99',
+      white: '#7f7f7f',
+      brightBlack: '#777284',
+      brightRed: '#ef4f8c',
+      brightGreen: '#2bad72',
+      brightYellow: '#c99826',
+      brightBlue: '#4c83f1',
+      brightMagenta: '#b96bea',
+      brightCyan: '#14a0bd',
+      brightWhite: '#111016',
+    },
+  });
+
+  if (window.FitAddon?.FitAddon) {
+    const fitAddon = new window.FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
+    state.terminal.fitAddons.set(id, fitAddon);
+  }
+
+  term.onData((data) => sendTerminalInput(id, data));
+  state.terminal.terms.set(id, term);
+  return term;
+}
+
+function mountActiveTerminal() {
+  const id = state.terminal.activeId;
+  const screen = elements.terminalScreen;
+  if (!id || !screen) {
+    return;
+  }
+
+  const term = createTerminalRenderer(id);
+  if (!term) {
+    return;
+  }
+
+  if (!term.element) {
+    screen.replaceChildren();
+    term.open(screen);
+  } else if (term.element.parentElement !== screen) {
+    screen.replaceChildren();
+    screen.appendChild(term.element);
+  } else {
+    for (const child of Array.from(screen.children)) {
+      if (child !== term.element) {
+        child.remove();
+      }
+    }
+  }
+
+  fitTerminal(id);
+  window.requestAnimationFrame(() => {
+    term.focus();
+    fitTerminal(id);
+  });
+}
+
+function fitTerminal(id = state.terminal.activeId) {
+  const term = state.terminal.terms.get(id);
+  const fitAddon = state.terminal.fitAddons.get(id);
+  if (!term || !fitAddon || elements.terminalWorkspace?.classList.contains('hidden')) {
+    return;
+  }
+  try {
+    fitAddon.fit();
+  } catch (_error) {
+    return;
+  }
+  sendTerminalResize(id);
+}
+
+function sendTerminalResize(id) {
+  const term = state.terminal.terms.get(id);
+  const socket = state.terminal.sockets.get(id);
+  if (!term || !socket || socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  socket.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+}
+
+function writeTerminalOutput(id, data) {
+  const term = createTerminalRenderer(id);
+  if (!term || !data) {
+    return;
+  }
+  term.write(data);
+}
+
+function handleTerminalMessage(id, event) {
+  let payload = { type: 'output', data: String(event.data || '') };
+  try {
+    payload = JSON.parse(event.data);
+  } catch (_error) {
+    // Plain text output is accepted for compatibility.
+  }
+
+  if (payload.data) {
+    writeTerminalOutput(id, payload.data);
+  }
+  if (payload.type === 'exit') {
+    removeTerminalLocally(id);
+  }
+}
+
+function connectTerminal(id) {
+  if (!id || !getTerminalItem(id)) {
+    return null;
+  }
+  const existing = state.terminal.sockets.get(id);
+  if (existing && [WebSocket.CONNECTING, WebSocket.OPEN].includes(existing.readyState)) {
+    return existing;
+  }
+
+  const socket = new WebSocket(getTerminalSocketUrl(id));
+  state.terminal.sockets.set(id, socket);
+  socket.addEventListener('open', () => {
+    fitTerminal(id);
+  });
+  socket.addEventListener('message', (event) => handleTerminalMessage(id, event));
+  socket.addEventListener('close', () => {
+    if (state.terminal.sockets.get(id) === socket) {
+      state.terminal.sockets.delete(id);
+    }
+  });
+  socket.addEventListener('error', () => {
+    if (state.currentPage === 'terminal') {
+      showToast('终端连接失败', 'error');
+    }
+  });
+  return socket;
+}
+
+function sendTerminalInput(id, data) {
+  const socket = connectTerminal(id);
+  if (!socket) {
+    showToast('请先创建终端', 'error');
+    return false;
+  }
+  if (socket.readyState !== WebSocket.OPEN) {
+    showToast('终端正在连接，请稍后再试', 'error');
+    return false;
+  }
+  socket.send(JSON.stringify({ type: 'input', data }));
+  return true;
+}
+
+function removeTerminalLocally(id) {
+  const index = state.terminal.items.findIndex((item) => item.id === id);
+  state.terminal.items = state.terminal.items.filter((item) => item.id !== id);
+  const socket = state.terminal.sockets.get(id);
+  if (socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(socket.readyState)) {
+    socket.close();
+  }
+  state.terminal.sockets.delete(id);
+  state.terminal.fitAddons.delete(id);
+  const term = state.terminal.terms.get(id);
+  if (term) {
+    term.dispose();
+  }
+  state.terminal.terms.delete(id);
+
+  if (state.terminal.activeId === id) {
+    const fallback = state.terminal.items[Math.max(0, Math.min(index, state.terminal.items.length - 1))];
+    state.terminal.activeId = fallback?.id || '';
+  }
+  renderTerminals();
+}
+
+function renderTerminalTabs() {
+  if (!elements.terminalTabs) {
+    return;
+  }
+  elements.terminalTabs.innerHTML = state.terminal.items.map((item) => {
+    const isActive = item.id === state.terminal.activeId;
+    return `
+      <button
+        class="terminal-tab${isActive ? ' active' : ''}"
+        type="button"
+        role="tab"
+        draggable="true"
+        aria-selected="${isActive ? 'true' : 'false'}"
+        data-terminal-id="${escapeHtml(item.id)}"
+      >
+        <span class="terminal-tab-title">${escapeHtml(item.title || item.id)}</span>
+        <span class="terminal-tab-close" data-terminal-close="${escapeHtml(item.id)}" aria-label="关闭终端">×</span>
+      </button>
+    `;
+  }).join('');
+}
+
+function renderTerminals() {
+  const hasTerminals = state.terminal.items.length > 0;
+  elements.terminalTabs?.classList.toggle('hidden', !hasTerminals);
+  elements.terminalEmptyState?.classList.toggle('hidden', hasTerminals);
+  elements.terminalWorkspace?.classList.toggle('hidden', !hasTerminals);
+
+  if (hasTerminals && !getTerminalItem(state.terminal.activeId)) {
+    state.terminal.activeId = state.terminal.items[0]?.id || '';
+  }
+
+  renderTerminalTabs();
+  if (state.terminal.activeId) {
+    mountActiveTerminal();
+    connectTerminal(state.terminal.activeId);
+  }
+}
+
+async function loadTerminals({ forceReload = false, silent = false } = {}) {
+  if (state.terminal.loaded && !forceReload) {
+    renderTerminals();
+    return;
+  }
+  try {
+    const payload = await requestJson('/api/terminal/list');
+    state.terminal.items = Array.isArray(payload.items) ? payload.items : [];
+    if (!getTerminalItem(state.terminal.activeId)) {
+      state.terminal.activeId = state.terminal.items[0]?.id || '';
+    }
+    state.terminal.loaded = true;
+    renderTerminals();
+  } catch (error) {
+    if (!silent) {
+      showToast(error.message || '终端列表加载失败', 'error');
+    }
+    throw error;
+  }
+}
+
+async function createTerminal() {
+  const item = await requestJson('/api/terminal/create', {
+    method: 'POST',
+    body: JSON.stringify({ cols: 80, rows: 24 }),
+  });
+  state.terminal.items.push(item);
+  state.terminal.activeId = item.id;
+  state.terminal.loaded = true;
+  renderTerminals();
+  showToast('终端已创建', 'success');
+}
+
+async function closeTerminal(id) {
+  if (!id) {
+    return;
+  }
+  await requestJson(`/api/terminal/${encodeURIComponent(id)}/close`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+  removeTerminalLocally(id);
+}
+
+async function saveTerminalOrder() {
+  await requestJson('/api/terminal/order', {
+    method: 'PUT',
+    body: JSON.stringify({
+      order: state.terminal.items.map((item) => item.id),
+    }),
+  });
+}
+
+function reorderTerminalTabs(fromId, toId) {
+  if (!fromId || !toId || fromId === toId) {
+    return;
+  }
+  const fromIndex = state.terminal.items.findIndex((item) => item.id === fromId);
+  const toIndex = state.terminal.items.findIndex((item) => item.id === toId);
+  if (fromIndex < 0 || toIndex < 0) {
+    return;
+  }
+  const [moved] = state.terminal.items.splice(fromIndex, 1);
+  state.terminal.items.splice(toIndex, 0, moved);
+  renderTerminalTabs();
+  saveTerminalOrder().catch((error) => {
+    showToast(error.message || '终端顺序保存失败', 'error');
+  });
 }
 
 function normalizeFilePath(value = '') {
@@ -3174,6 +3626,62 @@ elements.fileDownloadSelectedButton?.addEventListener('click', async () => {
     showToast(error.message || '下载失败', 'error');
   }
 });
+elements.terminalCreateButton?.addEventListener('click', async () => {
+  try {
+    await createTerminal();
+  } catch (error) {
+    showToast(error.message || '创建终端失败', 'error');
+  }
+});
+elements.terminalTabs?.addEventListener('click', async (event) => {
+  const closeButton = event.target.closest('[data-terminal-close]');
+  if (closeButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    try {
+      await closeTerminal(closeButton.dataset.terminalClose || '');
+    } catch (error) {
+      showToast(error.message || '关闭终端失败', 'error');
+    }
+    return;
+  }
+
+  const tab = event.target.closest('[data-terminal-id]');
+  if (!tab) {
+    return;
+  }
+  state.terminal.activeId = tab.dataset.terminalId || '';
+  renderTerminals();
+});
+elements.terminalTabs?.addEventListener('dragstart', (event) => {
+  const tab = event.target.closest('[data-terminal-id]');
+  if (!tab) {
+    return;
+  }
+  state.terminal.dragId = tab.dataset.terminalId || '';
+  event.dataTransfer.effectAllowed = 'move';
+  event.dataTransfer.setData('text/plain', state.terminal.dragId);
+  tab.classList.add('dragging');
+});
+elements.terminalTabs?.addEventListener('dragover', (event) => {
+  if (!state.terminal.dragId) {
+    return;
+  }
+  event.preventDefault();
+  event.dataTransfer.dropEffect = 'move';
+});
+elements.terminalTabs?.addEventListener('drop', (event) => {
+  event.preventDefault();
+  const tab = event.target.closest('[data-terminal-id]');
+  if (!tab) {
+    return;
+  }
+  reorderTerminalTabs(state.terminal.dragId, tab.dataset.terminalId || '');
+});
+elements.terminalTabs?.addEventListener('dragend', (event) => {
+  event.target.closest('[data-terminal-id]')?.classList.remove('dragging');
+  state.terminal.dragId = '';
+});
 elements.fileSelectAllInput?.addEventListener('change', (event) => {
   setAllFileSelection(event.target.checked);
 });
@@ -3651,6 +4159,14 @@ window.addEventListener('keydown', (event) => {
     closeFileEditModal();
   }
 });
+
+window.addEventListener('resize', () => {
+  if (state.currentPage === 'terminal' && state.terminal.activeId) {
+    fitTerminal(state.terminal.activeId);
+  }
+});
+
+setupSidebarToggleButtons();
 
 Promise.all([
   loadData(),

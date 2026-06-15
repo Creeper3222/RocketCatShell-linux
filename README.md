@@ -7,18 +7,32 @@
 
 本项目的目标不是继续做一个“宿主里的桥接插件”，而是把 RocketCat 发展成一套真正独立的 `Rocket.Chat <-> OneBot v11` 桥接软件。
 
-这个 live 目录对应的是 RocketCatShell 的 Linux / Docker 迁移版：核心功能现已与 Windows `v0.1.7` rebuild 对齐，同时保留容器初始化、外部挂载目录、内置插件自动补种，以及 Docker 专属共享媒体路径翻译 / Base64 兼容策略等 docker 化包装层。
+这个 live 目录对应的是 RocketCatShell 的 Linux / Docker 迁移版：核心功能现已与 Windows `v0.1.8` rebuild 对齐，同时保留容器初始化、外部挂载目录、内置插件自动补种，以及 Docker 专属共享媒体路径翻译 / Base64 兼容策略等 docker 化包装层。
 
-> 当前 README 对应版本为 `v0.1.7`。`v0.1.3` 是破坏性架构重构基线，`v0.1.4` 统一收口性能优化，`v0.1.5` 补齐了内置指令与运维增强，`v0.1.6` 推进运行诊断可观测性和入站热路径性能收口，而 `v0.1.7` 开始补齐面向 Docker 迁移的内置文件管理能力。
+> 当前 README 对应版本为 `v0.1.8`。`v0.1.3` 是破坏性架构重构基线，`v0.1.4` 统一收口性能优化，`v0.1.5` 补齐了内置指令与运维增强，`v0.1.6` 推进运行诊断可观测性和入站热路径性能收口，`v0.1.7` 开始补齐面向 Docker 迁移的内置文件管理能力，而 `v0.1.8` 引入 NapCat 风格 WebUI 系统终端并优化媒体上传策略。
 
 这意味着：
 
 - RocketCatShell 自己拥有 `config/`、`data/`、`logs/` 目录边界。
-- RocketCatShell 自己提供本地 WebUI、登录认证、Bot 管理、插件管理和项目根目录内文件管理。
+- RocketCatShell 自己提供本地 WebUI、登录认证、Bot 管理、插件管理、项目根目录内文件管理和系统终端。
 - RocketCatShell 仍然可以作为 OneBot reverse WebSocket 客户端与 AstrBot 协同，但不再依赖 AstrBot 插件宿主才能运行。
 
 ---
 
+## v0.1.8（系统终端与媒体上传策略更新）
+
+`v0.1.8` 将 Windows live 已验证的 NapCat 风格 WebUI 终端迁移到 Docker / Linux 版，并针对容器环境使用 Linux PTY 实现，避免引入 Windows 专用的 `pywinpty` 依赖。
+- 新增 `系统终端` WebUI 页面，支持新建多个终端、切换终端、关闭终端、拖动终端标签排序，以及在 xterm 区域内直接输入命令。
+- Docker / Linux 版终端后端使用容器内 PTY，会话默认工作目录为 `/app`；shell 优先使用有效的 `$SHELL`，否则回退 `/bin/sh`，支持交互式程序、方向键历史、选择复制和窗口尺寸同步。
+- WebUI 左上角新增侧边栏展开 / 收起按钮；`基础信息` 与 `运行诊断` 页会直接展示当前 RocketCatShell 版本，运行诊断页 CPU / 内存图标也与 NapCat 风格对齐。
+- Bot 设置里的 `远程媒体大小上限(字节)` 现在同时约束远端媒体下载和媒体上传，默认仍为 `20971520`；上传或下载超过限制时会写入 error 日志，日志会包含 Bot、房间、文件名、实际大小和限制值等信息。
+- 普通房间媒体上传优先使用 Rocket.Chat 8.0.0+ 的 `rooms.media/:rid` + `rooms.mediaConfirm/:rid/:fileId`，失败时回退旧版 `rooms.upload/:rid`；每个 Bot 会独立记忆当前最适上传端点，并在服务器升级或接口变化后支持反向 fallback。
+- Docker 版共享媒体路径策略保持不变：本次只迁移上传端点选择、大小限制和日志行为，不改变 `ROCKETCAT_SHARED_MEDIA_DIR`、`ROCKETCAT_SHARED_MEDIA_HOST_DIR`、compose 挂载语义或 Base64 兼容模式。
+- `requirements.txt` 新增 `websockets`，用于 WebUI 终端 WebSocket；Linux / Docker 版不包含 Windows 专用 `pywinpty`。
+
+升级到 `v0.1.8` 不需要迁移现有配置或运行时数据；更新源码后重新构建镜像即可。如果浏览器已经打开旧版 WebUI，刷新页面以获取最新静态资源。
+
+---
 ## v0.1.7（内置文件管理更新）
 
 `v0.1.7` 的首要目标是把类似 NapCat 的内置文件管理能力迁移到 Docker / Linux 版，方便容器环境下直接在 WebUI 内浏览和管理 RocketCatShell 文件。文件管理根目录固定为容器内项目根 `/app`，只能访问 `/app` 内的相对路径；宿主机文件只有通过 `docker-compose.yml` 挂载到 `/app/...` 后才会出现在文件管理中。
@@ -107,7 +121,7 @@
 - `launcher.sh` 会先调用 `tools/check_requirements.py` 检查依赖，再在缺失或版本不兼容时自动安装并复检；`v0.1.5` 新增的 `psutil` 也包含在这条自动补装链路里。
 - `Dockerfile` 会把 `tools/` 一并打进镜像，保证容器内和宿主机目录里的工具链一致。
 - `docker/entrypoint.sh` 仍负责容器首次启动时写入 `config/shell.json` 默认值，并对外挂 `data/plugins` 中的内置插件执行缺失补种与版本变更自动刷新；`rocketcat_plugin_built_in_command` 与 `rocketcat_plugin_adapt_iamthinking` 都会随镜像自动同步到外挂插件目录。
-- `docker-compose.yml`、`.env` 和 `.env.example` 使用 Linux / Docker 友好的相对持久化路径 `./data/...`，不再使用旧的 Windows `D:/docker/...` 示例；如需改到 `/opt/rocketcatshell/...` 等宿主机固定目录，可在 `.env` 中覆盖。
+- `docker-compose.yml`、`.env` 和 `.env.example` 已改为 Linux 风格的默认持久化路径 `/opt/rocketcatshell/...`，不再使用旧的 Windows `D:/docker/...` 示例。
 - WebUI 文件管理边界是容器内 `/app`，宿主机目录只有通过 compose 挂载到 `/app/config`、`/app/data/...`、`/app/logs` 等路径后才可见；这个边界只用于文件管理，不会改变 `ROCKETCAT_SHARED_MEDIA_DIR` / `ROCKETCAT_SHARED_MEDIA_HOST_DIR` 的共享媒体路径翻译语义。
 - 共享媒体导出仍保留在 Docker 版里：默认继续使用 `ROCKETCAT_SHARED_MEDIA_HOST_DIR` 路径传输，把容器内共享媒体目录翻译为宿主机可见路径；只有在路径对上游不可见，或 AstrBot 与 RocketCatShell 同为 Docker、更适合直接传 Base64 时，才建议启用 `enable_base64_media_transport`，或在首次启动前把 `.env` 里的 `ROCKETCAT_DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT=true`。Base64 是兼容兜底，不是 Docker 版默认快路径。
 
@@ -144,7 +158,7 @@ AstrBot or other compatible OneBot-side workflow
 
 - 支持 Rocket.Chat 频道、私有群组、私聊消息桥接为 OneBot v11 语义。
 - 支持统一 Bot 注册表，不再使用主 bot / 副 bot 的分层持久化模型。
-- 内置独立 WebUI，可管理网络配置、基础信息、运行日志、基础设置和本地插件。
+- 内置独立 WebUI，可管理网络配置、基础信息、运行诊断、运行日志、文件管理、系统终端、基础设置和本地插件。
 - WebUI 默认启用登录门禁，初始密码为 `123456`。
 - 支持自定义 WebUI 端口，并在端口占用时自动回退到可用端口。
 - 支持配置导出 / 导入，统一打包 Bot 设置、WebUI 密码 / 端口、消息映射窗口条数上限和本地插件主配置。
@@ -358,7 +372,7 @@ pip install -r requirements.txt
 docker compose up -d --build
 ```
 
-默认会把持久化目录挂到当前目录下的 `./data/...`；如果你要改宿主机挂载位置，优先修改 `.env` 里的 `ROCKETCAT_*_DIR` 和 `ROCKETCAT_SHARED_MEDIA_HOST_DIR`。
+默认会把持久化目录挂到 `/opt/rocketcatshell/...`；如果你要改宿主机挂载位置，优先修改 `.env` 里的 `ROCKETCAT_*_DIR` 和 `ROCKETCAT_SHARED_MEDIA_HOST_DIR`。
 
 Docker 首次启动时，“基础设置”里的“启用 Base64 传输媒体”默认关闭；如果你希望新安装首次生成的 `shell.json` 直接开启它，可以在 `.env` 中把 `ROCKETCAT_DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT=true`。
 
@@ -531,7 +545,7 @@ http://127.0.0.1:5751/
 | `default_reconnect_delay` | 默认重连延迟。 |
 | `default_max_reconnect_attempts` | 默认最大连续重连次数。 |
 | `default_enable_subchannel_session_isolation` | 默认是否开启子频道会话隔离。 |
-| `default_remote_media_max_size` | 默认远端媒体大小上限。 |
+| `default_remote_media_max_size` | 默认远端媒体上传 / 下载大小上限。 |
 | `default_skip_own_messages` | 默认是否忽略机器人自己的消息。 |
 | `default_debug` | 默认是否开启调试日志。 |
 | `next_onebot_self_id` | 下一个建议的 OneBot self_id。 |
@@ -555,7 +569,7 @@ http://127.0.0.1:5751/
 | `reconnect_delay` | 断线重连等待秒数。 |
 | `max_reconnect_attempts` | 最大重连次数；`0` 表示不限次数。 |
 | `enable_subchannel_session_isolation` | 是否按子频道隔离上下文。 |
-| `remote_media_max_size` | 远端媒体大小上限。 |
+| `remote_media_max_size` | 当前 Bot 的远端媒体上传 / 下载大小上限。 |
 | `room_info_cache_ttl_seconds` | 房间信息缓存 TTL，单位秒，默认 `300`。 |
 | `perf_trace_enabled` | 是否输出入站性能追踪日志；也可被环境变量 `ROCKETCAT_PERF_TRACE` 覆盖。 |
 | `skip_own_messages` | 是否忽略自己发出的消息。 |

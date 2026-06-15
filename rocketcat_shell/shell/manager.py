@@ -356,6 +356,7 @@ class ShellManager:
         host = self._webui_host or settings.webui_host
         enabled_count = sum(1 for bot in self.bots if bot.enabled)
         return {
+            "version": __version__,
             "bridge_enabled": True,
             "main_bot_enabled": False,
             "independent_webui_enabled": True,
@@ -381,9 +382,10 @@ class ShellManager:
             if item is not None:
                 items.append(item)
 
-        items.sort(key=lambda item: str(item.get("client_name") or ""))
+        items.sort(key=lambda item: str(item.get("client_name") or ""))       
         online_count = sum(1 for item in items if item.get("status_code") == "online")
         return {
+            "version": __version__,
             "items": items,
             "summary": {
                 "enabled_count": len(items),
@@ -461,6 +463,7 @@ class ShellManager:
         total_runtime_snapshot_bytes = sum(int(item.get("runtime_snapshot_bytes") or 0) for item in items)
         total_runtime_journal_bytes = sum(int(item.get("runtime_journal_bytes") or 0) for item in items)
         return {
+            "version": __version__,
             "host": host_snapshot,
             "host_cache": host_cache,
             "host_error": host_error,
