@@ -217,29 +217,46 @@ class ShellManager:
         )
 
         candidate_bots = self._build_import_bots(raw_bots, defaults=settings)
+        candidate_plugin_configs = self._normalize_import_plugin_configs(raw_plugin_configs)
 
-        imported_plugin_count = 0
+        imported_plugin_count = len(candidate_plugin_configs)
         async with self._lock:
-            settings.webui_access_password = candidate_password
-            settings.webui_port = candidate_port
-            settings.message_index_max_entries = candidate_message_index_max_entries
-            settings.enable_base64_media_transport = candidate_enable_base64_media_transport
-            self.bots = candidate_bots
-            self._persist_after_bot_change_locked()
-
-            for plugin_id, plugin_config in raw_plugin_configs.items():
-                normalized_plugin_id = str(plugin_id or "").strip()
-                if not normalized_plugin_id:
-                    continue
-                if not isinstance(plugin_config, dict):
-                    raise ValueError(
-                        f"配置导入失败，插件 {normalized_plugin_id} 的主配置格式无效"
+            previous_settings_mapping = settings.to_mapping()
+            previous_bots = [bot.to_mapping() for bot in self.bots]
+            previous_plugin_config_files = self._snapshot_plugin_config_files()
+            try:
+                settings.webui_access_password = candidate_password
+                settings.webui_port = candidate_port
+                settings.message_index_max_entries = candidate_message_index_max_entries
+                settings.enable_base64_media_transport = candidate_enable_base64_media_transport
+                self.bots = candidate_bots
+                self._persist_after_bot_change_locked()
+                self._apply_import_plugin_configs(candidate_plugin_configs)
+            except Exception as exc:
+                try:
+                    restored_settings = ShellSettings.from_mapping(previous_settings_mapping)
+                    self.settings = restored_settings
+                    self.bots = [
+                        BotRecord.from_mapping(bot_mapping, defaults=restored_settings)
+                        for bot_mapping in previous_bots
+                    ]
+                    self._persist_after_bot_change_locked()
+                    self._restore_plugin_config_files(previous_plugin_config_files)
+                except Exception as rollback_exc:
+                    logger.exception(
+                        "[RocketCatShell] 配置导入失败且回滚失败 | error=%r | rollback_error=%r",
+                        exc,
+                        rollback_exc,
                     )
-                write_json(
-                    self.layout.plugins_config_dir / f"{normalized_plugin_id}_config.json",
-                    plugin_config,
+                    raise RuntimeError(
+                        "配置导入失败，且回滚失败，请检查配置目录与日志。"
+                    ) from rollback_exc
+
+                logger.warning(
+                    "[RocketCatShell] 配置导入失败，已回滚到导入前状态 | error=%r",
+                    exc,
                 )
-                imported_plugin_count += 1
+                raise
 
         self.plugin_manager.refresh()
         await self._reconcile_runtimes("configuration imported")
@@ -382,7 +399,7 @@ class ShellManager:
             if item is not None:
                 items.append(item)
 
-        items.sort(key=lambda item: str(item.get("client_name") or ""))       
+        items.sort(key=lambda item: str(item.get("client_name") or ""))
         online_count = sum(1 for item in items if item.get("status_code") == "online")
         return {
             "version": __version__,
@@ -453,6 +470,7 @@ class ShellManager:
                 str(item.get("client_name") or ""),
             )
         )
+
         online_bot_count = sum(1 for item in items if item.get("status_code") == "online")
         enabled_bot_count = sum(1 for item in items if item.get("enabled"))
         reconnecting_bot_count = sum(
@@ -462,6 +480,7 @@ class ShellManager:
         )
         total_runtime_snapshot_bytes = sum(int(item.get("runtime_snapshot_bytes") or 0) for item in items)
         total_runtime_journal_bytes = sum(int(item.get("runtime_journal_bytes") or 0) for item in items)
+
         return {
             "version": __version__,
             "host": host_snapshot,
@@ -897,6 +916,47 @@ class ShellManager:
     def _persist_shell_settings(self) -> None:
         settings = self._require_settings()
         write_json(self.layout.shell_settings_path, settings.to_mapping())
+
+    def _normalize_import_plugin_configs(
+        self,
+        raw_plugin_configs: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        normalized_plugin_configs: dict[str, dict[str, Any]] = {}
+        for plugin_id, plugin_config in raw_plugin_configs.items():
+            normalized_plugin_id = str(plugin_id or "").strip()
+            if not normalized_plugin_id:
+                continue
+            if not isinstance(plugin_config, dict):
+                raise ValueError(
+                    f"配置导入失败，插件 {normalized_plugin_id} 的主配置格式无效"
+                )
+            normalized_plugin_configs[normalized_plugin_id] = plugin_config
+        return normalized_plugin_configs
+
+    def _snapshot_plugin_config_files(self) -> dict[str, bytes]:
+        if not self.layout.plugins_config_dir.exists():
+            return {}
+
+        snapshot: dict[str, bytes] = {}
+        for config_path in sorted(self.layout.plugins_config_dir.glob("*_config.json")):
+            snapshot[config_path.name] = config_path.read_bytes()
+        return snapshot
+
+    def _apply_import_plugin_configs(self, plugin_configs: dict[str, dict[str, Any]]) -> None:
+        for plugin_id, plugin_config in plugin_configs.items():
+            write_json(
+                self.layout.plugins_config_dir / f"{plugin_id}_config.json",
+                plugin_config,
+            )
+
+    def _restore_plugin_config_files(self, snapshot: dict[str, bytes]) -> None:
+        self.layout.plugins_config_dir.mkdir(parents=True, exist_ok=True)
+        expected_names = set(snapshot)
+        for file_name, payload in snapshot.items():
+            (self.layout.plugins_config_dir / file_name).write_bytes(payload)
+        for config_path in self.layout.plugins_config_dir.glob("*_config.json"):
+            if config_path.name not in expected_names:
+                config_path.unlink(missing_ok=True)
 
     def _build_import_bots(
         self,

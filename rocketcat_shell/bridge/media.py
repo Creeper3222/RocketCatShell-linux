@@ -40,7 +40,7 @@ class RocketChatMediaBridge:
     ) -> None:
         config = self.client.config
         logger.error(
-            "[RocketChatOneBotBridge] %s, media exceeds bot remote_media_max_size: "
+            "[RocketChatOneBotBridge] %s，超过 bot 远程媒体大小上限: "
             "bot_id=%s bot_name=%s room_id=%s file=%s size=%s limit=%s source=%s",
             action,
             getattr(config, "bot_id", "") or "-",
@@ -64,7 +64,7 @@ class RocketChatMediaBridge:
         if file_size <= limit:
             return True
         self._log_media_size_limit_error(
-            "upload media failed",
+            "上传媒体失败",
             actual_size=file_size,
             limit=limit,
             room_id=room_id,
@@ -521,7 +521,7 @@ class RocketChatMediaBridge:
                 content_length = resp.content_length
                 if content_length is not None and content_length > limit:
                     self._log_media_size_limit_error(
-                        "download media failed",
+                        "下载媒体失败",
                         actual_size=content_length,
                         limit=limit,
                         source=url,
@@ -533,7 +533,7 @@ class RocketChatMediaBridge:
                     raw.extend(chunk)
                     if len(raw) > limit:
                         self._log_media_size_limit_error(
-                            "download media failed",
+                            "下载媒体失败",
                             actual_size=len(raw),
                             limit=limit,
                             source=url,
@@ -1072,7 +1072,7 @@ class RocketChatMediaBridge:
 
         fallback_endpoint = self._alternate_plain_upload_endpoint(primary_endpoint)
         logger.warning(
-            "[RocketChatOneBotBridge] plain upload endpoint fallback required: server=%s from=%s to=%s status=%s content_type=%s body=%s reason=%s",
+            "[RocketChatOneBotBridge] plain upload 端点需要回退: server=%s from=%s to=%s status=%s content_type=%s body=%s reason=%s",
             self.client.config.server_url,
             primary_endpoint,
             fallback_endpoint,
@@ -1094,7 +1094,7 @@ class RocketChatMediaBridge:
             self._plain_upload_endpoint_preference = fallback_endpoint
             if previous_endpoint != fallback_endpoint:
                 logger.info(
-                    "[RocketChatOneBotBridge] plain upload endpoint switched: server=%s from=%s to=%s",
+                    "[RocketChatOneBotBridge] plain upload 端点已切换: server=%s from=%s to=%s",
                     self.client.config.server_url,
                     previous_endpoint or primary_endpoint,
                     fallback_endpoint,
@@ -1453,7 +1453,7 @@ class RocketChatMediaBridge:
         url = await self.client._normalize_media_url(url)
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"}:
-            logger.warning(f"[RocketChatOneBotBridge] 鎷掔粷涓嬭浇涓嶆敮鎸佺殑濯掍綋鍗忚: {url}")
+            logger.warning(f"[RocketChatOneBotBridge] 拒绝下载不支持的媒体协议: {url}")
             return None, None
         if self.client._http_session is None:
             return None, None
@@ -1470,14 +1470,14 @@ class RocketChatMediaBridge:
                 max_redirects=3,
             ) as resp:
                 if resp.status >= 400:
-                    logger.error(f"[RocketChatOneBotBridge] 涓嬭浇濯掍綋澶辫触 {resp.status}: {url}")
+                    logger.error(f"[RocketChatOneBotBridge] 下载媒体失败 {resp.status}: {url}")
                     return None, None
 
                 limit = self._remote_media_size_limit()
                 content_length = resp.content_length
                 if content_length is not None and content_length > limit:
                     self._log_media_size_limit_error(
-                        "download media failed",
+                        "下载媒体失败",
                         actual_size=content_length,
                         limit=limit,
                         source=url,
@@ -1498,7 +1498,7 @@ class RocketChatMediaBridge:
                         downloaded += len(chunk)
                         if downloaded > limit:
                             self._log_media_size_limit_error(
-                                "download media failed",
+                                "下载媒体失败",
                                 actual_size=downloaded,
                                 limit=limit,
                                 source=url,
@@ -1515,7 +1515,7 @@ class RocketChatMediaBridge:
                         os.unlink(tmp_path)
                     raise
         except Exception as exc:
-            logger.error(f"[RocketChatOneBotBridge] 涓嬭浇濯掍綋寮傚父: {exc!r}")
+            logger.error(f"[RocketChatOneBotBridge] 下载媒体异常: {exc!r}")
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
             return None, None
@@ -1529,8 +1529,11 @@ class RocketChatMediaBridge:
         limit = self._remote_media_size_limit()
         estimated_size = (len(encoded) // 4) * 3
         if estimated_size > limit + 2:
-            logger.error(
-                f"[RocketChatOneBotBridge] Base64 濯掍綋澶勭悊澶辫触锛屾枃浠惰繃澶? {estimated_size} > {limit}"
+            self._log_media_size_limit_error(
+                "Base64 媒体处理失败",
+                actual_size=estimated_size,
+                limit=limit,
+                source="base64://",
             )
             return None, None
 
@@ -1542,10 +1545,10 @@ class RocketChatMediaBridge:
 
         if len(raw) > limit:
             self._log_media_size_limit_error(
-                "decode base64 media failed",
+                "Base64 媒体处理失败",
                 actual_size=len(raw),
                 limit=limit,
-                source="base64",
+                source="base64://",
             )
             return None, None
 

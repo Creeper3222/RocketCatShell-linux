@@ -732,12 +732,15 @@ class InboundTranslator:
         source_id: str,
         depth: int,
     ) -> dict[str, Any]:
+        media: list[dict[str, str]] = []
+        if self._payload_may_have_context_media(payload):
+            media = await self._extract_context_media_descriptors(payload)
         return {
             "depth": depth,
             "source_id": source_id,
             "sender_name": self._extract_context_sender_name(payload),
             "text": self._clean_quote_text(payload),
-            "media": await self._extract_context_media_descriptors(payload),
+            "media": media,
         }
 
     def _build_quote_media_segments(
@@ -769,6 +772,67 @@ class InboundTranslator:
 
     def _build_media_segment_from_descriptor(self, media: dict[str, Any]) -> dict[str, Any] | None:
         return self._rocketchat.media.build_onebot_segment_from_descriptor(media)
+
+    def _payload_may_have_context_media(self, payload: dict[str, Any]) -> bool:
+        if self._source_may_have_context_media(payload):
+            return True
+
+        urls = payload.get("urls")
+        if isinstance(urls, list):
+            for url_obj in urls:
+                if not isinstance(url_obj, dict):
+                    continue
+                meta = url_obj.get("meta") if isinstance(url_obj.get("meta"), dict) else {}
+                headers = url_obj.get("headers") if isinstance(url_obj.get("headers"), dict) else {}
+                content_type = (
+                    meta.get("contentType")
+                    or headers.get("contentType")
+                    or headers.get("content-type")
+                    or ""
+                )
+                if str(content_type).startswith("image/"):
+                    return True
+
+        attachments = payload.get("attachments")
+        if isinstance(attachments, dict):
+            attachments = [attachments]
+        if not isinstance(attachments, list):
+            return False
+
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            if attachment.get("message_link"):
+                continue
+            if self._payload_may_have_context_media(attachment):
+                return True
+        return False
+
+    @staticmethod
+    def _source_may_have_context_media(source: dict[str, Any]) -> bool:
+        for key in (
+            "files",
+            "file",
+            "fileUpload",
+            "type",
+            "mimeType",
+            "contentType",
+            "image_url",
+            "imageUrl",
+            "audio_url",
+            "audioUrl",
+            "video_url",
+            "videoUrl",
+            "title_link",
+            "titleLink",
+            "url",
+            "path",
+            "link",
+        ):
+            value = source.get(key)
+            if value:
+                return True
+        return False
 
     async def _extract_context_media_descriptors(
         self,

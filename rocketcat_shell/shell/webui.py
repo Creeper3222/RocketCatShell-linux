@@ -902,8 +902,8 @@ class ShellWebUI:
         try:
             session = await self._create_terminal_session(cols=cols, rows=rows)
         except Exception as exc:
-            logger.error("[RocketCatShell] WebUI terminal create failed: %r", exc)
-            raise HTTPException(status_code=500, detail="鍒涘缓缁堢澶辫触") from exc
+            logger.error("[RocketCatShell] WebUI 终端创建失败: %r", exc)
+            raise HTTPException(status_code=500, detail="创建终端失败") from exc
         return self._serialize_terminal_session(session)
 
     async def _handle_close_terminal(self, terminal_id: str) -> dict[str, Any]:
@@ -917,7 +917,7 @@ class ShellWebUI:
         payload = payload or {}
         raw_order = payload.get("order") or []
         if not isinstance(raw_order, list):
-            raise HTTPException(status_code=400, detail="缁堢椤哄簭蹇呴』鏄垪琛?")
+            raise HTTPException(status_code=400, detail="终端顺序必须是列表")
 
         async with self._terminal_lock:
             known_ids = set(self._terminal_sessions)
