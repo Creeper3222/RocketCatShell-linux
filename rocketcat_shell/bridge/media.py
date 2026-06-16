@@ -371,39 +371,17 @@ class RocketChatMediaBridge:
             "link",
         )
 
-        def collect_candidates(source: dict[str, Any]) -> None:
-            files_raw = source.get("files", [])
-            if isinstance(files_raw, dict):
-                candidates.append(files_raw)
-            elif isinstance(files_raw, list):
-                candidates.extend([item for item in files_raw if isinstance(item, dict)])
-
-            for key in ("file", "fileUpload"):
-                single_file = source.get(key)
-                if isinstance(single_file, dict):
-                    candidates.append(single_file)
-
-            if any(source.get(key) for key in media_shaped_keys):
-                candidates.append(source)
-
-        collect_candidates(payload)
-        for attachment in self.get_all_attachments_recursive(
-            payload,
-            skip_quote_attachments=skip_quote_attachments,
-        ):
-            collect_candidates(attachment)
-
-        for candidate in candidates:
+        async def append_candidate(candidate: dict[str, Any]) -> None:
             kind = self.classify_file_kind(candidate)
             materialized = await self._materialize_media_reference(candidate, kind)
             if not materialized:
-                continue
+                return
             file_ref = str(materialized.get("path") or materialized.get("url") or "")
             if not file_ref:
-                continue
+                return
             key = (kind, file_ref)
             if key in seen:
-                continue
+                return
             seen.add(key)
             media.append(
                 {
@@ -413,6 +391,40 @@ class RocketChatMediaBridge:
                     "path": str(materialized.get("path") or ""),
                 }
             )
+
+        async def process_source(source: dict[str, Any]) -> None:
+            files_raw = source.get("files", [])
+            if isinstance(files_raw, dict):
+                await append_candidate(files_raw)
+            elif isinstance(files_raw, list):
+                for item in files_raw:
+                    if isinstance(item, dict):
+                        await append_candidate(item)
+
+            for key in ("file", "fileUpload"):
+                single_file = source.get(key)
+                if isinstance(single_file, dict):
+                    await append_candidate(single_file)
+
+            if self._has_media_shaped_value(source, media_shaped_keys):
+                await append_candidate(source)
+
+        fast_candidates = self._can_fast_extract_attachment_descriptors(
+            payload,
+            skip_quote_attachments=skip_quote_attachments,
+            include_url_images=include_url_images,
+        )
+        if fast_candidates is not None:
+            for candidate in fast_candidates:
+                await append_candidate(candidate)
+            return media
+
+        await process_source(payload)
+        for attachment in self._iter_attachment_sources(
+            payload,
+            skip_quote_attachments=skip_quote_attachments,
+        ):
+            await process_source(attachment)
 
         if include_url_images:
             for url_obj in payload.get("urls", []):
