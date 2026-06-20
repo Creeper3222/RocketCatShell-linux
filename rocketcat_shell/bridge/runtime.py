@@ -16,6 +16,7 @@ from rocketcat_shell.plugin_system import (
 from .config import BridgeConfig
 from .hot_storage import RuntimeHotStoreBundle, build_runtime_hot_stores
 from .id_map import DurableIdMap
+from .media_publication import MediaPublicationService
 from .onebot_actions import OneBotActionHandler
 from .onebot_client import OneBotReverseWsClient
 from .paths import resolve_plugin_data_dir
@@ -39,7 +40,7 @@ class BridgeRuntime:
         data_dir: Path | None = None,
         instance_name: str = "bridge",
         message_index_max_entries: int = DurableIdMap._DEFAULT_MESSAGE_WINDOW_SIZE,
-        enable_base64_media_transport: bool = False,
+        media_publication_service: MediaPublicationService | None = None,
         disable_callback: DisableCallback | None = None,
         plugin_manager: RocketCatPluginManager | None = None,
     ):
@@ -53,7 +54,7 @@ class BridgeRuntime:
         self.message_index_max_entries = DurableIdMap.normalize_message_window_size(
             message_index_max_entries
         )
-        self.enable_base64_media_transport = bool(enable_base64_media_transport)
+        self.media_publication_service = media_publication_service
         self._disable_callback = disable_callback
         self._plugin_manager = plugin_manager
 
@@ -308,7 +309,7 @@ class BridgeRuntime:
 
         self.rocketchat = RocketChatClient(
             self.config,
-            enable_base64_media_transport=self.enable_base64_media_transport,
+            media_publication_service=self.media_publication_service,
             media_cache_dir=self.data_dir / "media_cache",
             on_message=self._handle_rocketchat_message,
             on_reconnect_exhausted=self._handle_reconnect_exhausted,

@@ -66,12 +66,13 @@ async def _run_async(args: argparse.Namespace) -> int:
 
     try:
         manager = ShellManager(layout)
-        await manager.initialize()
+        await manager.initialize(start_runtimes=False)
 
         if args.print_status:
             print(json.dumps(manager.build_status_payload(), ensure_ascii=False, indent=2))
 
         if args.once:
+            await manager.start_enabled_runtimes("shell once bootstrap")
             await manager.shutdown()
             return 0
 
@@ -91,15 +92,16 @@ async def _run_async(args: argparse.Namespace) -> int:
             access_password=settings.webui_access_password,
         )
         await webui.start()
-        logger.info("[RocketCatShell] WebUI started at %s", webui.url)
-
-        if settings.auto_open_browser and not args.no_browser:
-            try:
-                webbrowser.open(webui.url)
-            except Exception:
-                logger.warning("[RocketCatShell] Failed to open the browser automatically.")
-
         try:
+            await manager.start_enabled_runtimes("webui ready")
+            logger.info("[RocketCatShell] WebUI started at %s", webui.url)
+
+            if settings.auto_open_browser and not args.no_browser:
+                try:
+                    webbrowser.open(webui.url)
+                except Exception:
+                    logger.warning("[RocketCatShell] Failed to open the browser automatically.")
+
             await manager.run_forever()
         finally:
             await webui.stop()

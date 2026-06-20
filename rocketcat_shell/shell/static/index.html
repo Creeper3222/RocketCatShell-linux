@@ -486,21 +486,8 @@
               </section>
 
               <section class="form-section">
-                <h3>媒体传输模式</h3>
-                <label class="field-switch">
-                  <span>启用 Base64 传输媒体</span>
-                  <input id="settingsBase64MediaTransportInput" type="checkbox" />
-                  <i></i>
-                </label>
-                <p id="settingsBase64MediaHint" class="settings-helper">关闭时保持当前路径传输；开启后会把可本地读取的媒体改为 Base64 形式发送，更适合上游在 Docker 部署的情况，但 Base64 编/解码会增加花销，略微降低性能；若上游直接部署在宿主机上，推荐关闭。</p>
-                <div class="settings-actions">
-                  <button id="settingsBase64MediaSaveButton" class="action-button primary" type="button">保存媒体传输模式</button>
-                </div>
-              </section>
-
-              <section class="form-section">
                 <h3>配置文件</h3>
-                <p class="settings-helper">导出或导入当前所有 Bot 设置（包括房间信息缓存 TTL 与性能追踪开关）、WebUI 登录认证 / 文件管理鉴权密码、默认 WebUI 端口、消息映射窗口条数上限、Base64 媒体传输开关，以及全部插件主配置。</p>
+                <p class="settings-helper">导出或导入当前所有 Bot 设置（包括房间信息缓存 TTL 与性能追踪开关）、WebUI 登录认证 / 文件管理鉴权密码、默认 WebUI 端口、消息映射窗口条数上限，以及全部插件主配置。</p>
                 <div class="settings-actions">
                   <button id="settingsExportConfigButton" class="action-button subtle" type="button">导出配置</button>
                   <button id="settingsImportConfigButton" class="action-button primary" type="button">导入配置</button>

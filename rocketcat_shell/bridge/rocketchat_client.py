@@ -18,6 +18,7 @@ from rocketcat_shell.logger import logger
 from .config import BridgeConfig
 from .json_codec import json_dumps, json_dumps_compact, json_loads
 from .media import RocketChatMediaBridge
+from .media_publication import MediaPublicationService
 from .rocketchat_compat import (
     RocketChatCapabilities,
     RocketChatHTTPError,
@@ -60,13 +61,12 @@ class RocketChatClient:
     def __init__(
         self,
         config: BridgeConfig,
-        enable_base64_media_transport: bool = False,
+        media_publication_service: MediaPublicationService | None = None,
         media_cache_dir: str | os.PathLike[str] | None = None,
         on_message: MessageCallback | None = None,
         on_reconnect_exhausted: FailureCallback | None = None,
     ):
         self.config = config
-        self.enable_base64_media_transport = bool(enable_base64_media_transport)
         self._on_message = on_message
         self._on_reconnect_exhausted = on_reconnect_exhausted
         self._http_session: aiohttp.ClientSession | None = None
@@ -104,7 +104,11 @@ class RocketChatClient:
             enabled=bool(self.config.e2ee_password.strip()),
             password=self.config.e2ee_password.strip(),
         )
-        self.media = RocketChatMediaBridge(self, cache_dir=media_cache_dir)
+        self.media = RocketChatMediaBridge(
+            self,
+            cache_dir=media_cache_dir,
+            media_publication_service=media_publication_service,
+        )
         self._consecutive_reconnect_failures = 0
         self._last_rest_login_at = 0.0
         self._last_websocket_activity_at = 0.0
@@ -132,8 +136,8 @@ class RocketChatClient:
                 await self.media.start()
             except Exception as exc:
                 logger.warning(
-                    "[RocketChatOneBotBridge][E2EE] Docker 共享媒体目录初始化失败，"
-                    "将回退到当前可用媒体引用: %r",
+                    "[RocketChatOneBotBridge][E2EE] 媒体缓存目录初始化失败，"
+                    "RocketChat 媒体可能无法上报给 OneBot: %r",
                     exc,
                 )
             await self._detect_server_capabilities()

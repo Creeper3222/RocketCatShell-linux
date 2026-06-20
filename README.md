@@ -7,7 +7,7 @@
 
 本项目的目标不是继续做一个“宿主里的桥接插件”，而是把 RocketCat 发展成一套真正独立的 `Rocket.Chat <-> OneBot v11` 桥接软件。
 
-这个 live 目录对应的是 RocketCatShell 的 Linux / Docker 迁移版：核心功能现已与 Windows `v0.1.9` 对齐，同时保留容器初始化、外部挂载目录、内置插件自动补种、Linux PTY，以及 Docker 专属共享媒体路径翻译 / Base64 兼容策略等 docker 化包装层。
+这个 live 目录对应的是 RocketCatShell 的 Linux / Docker 迁移版：核心功能现已与 Windows `v0.1.9` 对齐，同时保留容器初始化、外部挂载目录、内置插件自动补种和 Linux PTY 等 Docker 包装层。RocketChat 媒体通过 RocketCatShell WebUI 端口上的令牌 HTTP URL 统一上报，不再要求与 AstrBot 配置共享目录。
 
 > 当前 README 对应版本为 `v0.1.9`。`v0.1.3` 是破坏性架构重构基线，`v0.1.4` 统一收口性能优化，`v0.1.5` 补齐了内置指令与运维增强，`v0.1.6` 推进运行诊断可观测性和入站热路径性能收口，`v0.1.7` 开始补齐面向 Docker 迁移的内置文件管理能力，`v0.1.8` 引入 NapCat 风格 WebUI 系统终端，而 `v0.1.9` 完善多引用、用户身份映射及 Rocket.Chat 7.10–8.5 兼容，并从本版本开始发布 `linux/amd64` 与 `linux/arm64` 镜像。
 
@@ -21,7 +21,7 @@
 
 ## v0.1.9（多引用、用户身份与多架构更新）
 
-`v0.1.9` 将 Windows 版已经实地验证的多引用和用户身份重构迁移到 Linux / Docker，同时保留容器环境的媒体共享、Linux PTY 和持久化边界。
+`v0.1.9` 将 Windows 版已经实地验证的多引用和用户身份重构迁移到 Linux / Docker，同时保留 Linux PTY 和容器持久化边界。
 
 - 非加密频道仅当当前消息包含两个及以上顶层 `attachments[*].message_link` 时进入多引用模式；正文中普通粘贴的多个消息链接不会被误判。
 - E2EE 频道会额外检查解密正文开头连续的空标签 Markdown 消息链接。仅在 `e2e=done` 且连续命中两条及以上引用时，才按原顺序归一化为多个顶层 OneBot `reply`，并剥离系统引用前缀。
@@ -31,7 +31,9 @@
 - WebUI 增加醒目的 User 映射入口以及映射搜索、刷新、保存、冲突高亮和删除重建操作。覆盖和删除使用 revision 校验，防止用旧页面覆盖新数据。
 - 哈希冲突会持久化到每个相关 Bot 的 `re_waring.json`，并在对应 Bot 每次加载时重新输出详细 warning。
 - Rocket.Chat 支持范围明确为 `7.10.x–8.5.x`：DDP 继续承担 resume 和订阅，业务 method 优先走 REST；8.x 固定使用 `rooms.media` + `rooms.mediaConfirm`，7.10 仅在现代端点明确不存在时回退旧上传接口。
-- E2EE 媒体、历史消息媒体和生图参考图继续使用 Docker 共享媒体目录。v0.1.9 热修复会按文件签名纠正缺失扩展名的解密图片，并优先把图片引用导出为 AstrBot 可访问的共享路径，避免生图插件拒绝 `base64://` 或 RocketCatShell 私有数据目录。
+- v0.1.9 热修复将 RocketChat → OneBot 的图片、音频和视频统一改为带高强度随机令牌的 HTTP URL；AstrBot 使用标准下载链路把媒体自动缓存到自身 `data/temp`，无需挂载 AstrBot 专属共享目录。普通频道、E2EE、多引用、多参考图和历史 `get_msg` 使用同一链路；E2EE 解密图片会按文件签名纠正 `.jpg/.png/.gif/.webp` 扩展名。
+- 媒体接口复用 WebUI 端口 `/_rocketcat/media/{bot_id}/{token}/{filename}`，令牌失效或文件不存在时返回 404，并设置 `no-store` 与 `nosniff`。宿主机 AstrBot 会自动收到 `127.0.0.1` URL，同网络 Docker AstrBot 默认使用 `rocketcatshell` 服务名；特殊网络可用 `ROCKETCAT_UPSTREAM_MEDIA_BASE_URL` 覆盖。
+- WebUI 已移除 Base64 媒体传输开关。旧 `shell.json` 和旧导入配置中的字段会被兼容忽略并在重新保存后清理；AstrBot → RocketChat 的协议级 `base64://` 上传以及历史 Base64 缓存解码能力继续保留。
 - 新增独立持久化挂载 `/app/data/user_identity`。升级前必须备份 `config/`、`data/bots/` 和 AstrBot 管理员配置，再运行 `tools/migrate_user_identity.py` 迁移旧 ID。
 - Docker Hub 从本版本开始同时发布 `linux/amd64` 与 `linux/arm64`，固定版本标签为 `v0.1.9`，稳定滚动标签为 `latest`。
 
@@ -47,7 +49,7 @@
 - WebUI 左上角新增侧边栏展开 / 收起按钮；`基础信息` 与 `运行诊断` 页会直接展示当前 RocketCatShell 版本，运行诊断页 CPU / 内存图标也与 NapCat 风格对齐。
 - Bot 设置里的 `远程媒体大小上限(字节)` 现在同时约束远端媒体下载和媒体上传，默认仍为 `20971520`；上传或下载超过限制时会写入 error 日志，日志会包含 Bot、房间、文件名、实际大小和限制值等信息。
 - 普通房间媒体上传优先使用 Rocket.Chat 8.0.0+ 的 `rooms.media/:rid` + `rooms.mediaConfirm/:rid/:fileId`，失败时回退旧版 `rooms.upload/:rid`；每个 Bot 会独立记忆当前最适上传端点，并在服务器升级或接口变化后支持反向 fallback。
-- Docker 版共享媒体路径策略保持不变：本次只迁移上传端点选择、大小限制和日志行为，不改变 `ROCKETCAT_SHARED_MEDIA_DIR`、`ROCKETCAT_SHARED_MEDIA_HOST_DIR`、compose 挂载语义或 Base64 兼容模式。
+- 本版本最初沿用旧媒体共享方式；该方式已由 v0.1.9 的统一令牌 HTTP 媒体上报取代。
 - `requirements.txt` 新增 `websockets`，用于 WebUI 终端 WebSocket；Linux / Docker 版不包含 Windows 专用 `pywinpty`。
 
 升级到 `v0.1.8` 不需要迁移现有配置或运行时数据；更新源码后重新构建镜像即可。如果浏览器已经打开旧版 WebUI，刷新页面以获取最新静态资源。
@@ -59,7 +61,7 @@
 
 - 新增 `文件管理` WebUI 页面，支持目录进入 / 返回、刷新、文件预览、图片全屏查看、文本编辑保存、新建文件或目录、上传、重命名、移动、删除和打包下载。
 - 新增文件 API：`GET /api/files`、`POST /api/files/read`、`POST /api/files/write`、`POST /api/files/create`、`POST /api/files/upload`、`POST /api/files/delete`、`POST /api/files/move`、`POST /api/files/rename`、`GET /api/files/preview`、`GET /api/files/download` 和 `POST /api/files/download`。
-- 文件管理 API 只接受 `/app` 内相对路径，拒绝 `..`、系统绝对路径、Windows 盘符路径和符号链接解析后的越界目标；这只约束 WebUI 文件管理边界，不改变 Docker 版共享媒体目录翻译或 Base64 兼容策略。
+- 文件管理 API 只接受 `/app` 内相对路径，拒绝 `..`、系统绝对路径、Windows 盘符路径和符号链接解析后的越界目标；媒体令牌接口只发布 RocketCatShell 已验证并缓存的文件，不放宽文件管理边界。
 - Docker 包装层和核心源码默认只读保护，包括 `rocketcat_shell/`、`tools/`、`docker/`、两个内置插件源码目录，以及 `requirements.txt`、`Dockerfile`、`docker-compose.yml`、`.dockerignore`、`.env.example`、`launcher.sh` 等发布与启动文件。
 - 用户挂载或创建在非保护目录中的文件仍可按规则管理。例如外部挂载到 `/app/data/plugins` 的非内置插件、`/app/data/plugin_data`、`/app/data/bots` 与 `/app/data/resource` 中的普通文件可浏览、上传、移动、删除或编辑。
 - 对明确的敏感持久化数据文件增加二次鉴权，包括 `config/shell.json`、`config/bots.json`、`config/plugins_config/*.json` 和 `data/bots/**/runtime_state.json`。鉴权密码复用 WebUI 登录认证 / 文件管理鉴权密码，密码只通过请求体提交；鉴权文件保存前会再次提示修改风险。
@@ -78,7 +80,7 @@
 - 运行诊断已从“网络配置”页拆分为独立导航页，并新增主机快照缓存状态、快照年龄、TTL 等元数据展示。WebUI 现在可以直接区分当前是缓存命中、实时采样还是采样失败，而不是只看到一份静态诊断结果。
 - 运行诊断页的主机 CPU / 内存摘要已升级为更直观的环形指示器视图，并补充系统总占用与 Shell 进程占用的双层视觉表达，配合在线 Bot / Snapshot / Journal 汇总，更适合长时间运行时做快速巡检。
 - OneBot reverse WebSocket 客户端现在会显式放宽 `aiohttp` 的入站消息大小上限，并在断链日志里补充 `close_code`。这修复了 AstrBot 侧较大的 `base64://` 图片动作在进入 RocketCatShell 前就触发 reverse WS 断开的问题；Docker / Linux 版在启用 Base64 兼容传输或接收较大的本地图片动作时，也不再被默认 `4 MiB` 帧限制提前截断。
-- Docker 版这里展示和 `#system` 返回的仍然是当前容器运行环境；容器外宿主机路径可见性、共享媒体目录翻译和 Base64 兼容策略没有被这次更新改写。
+- Docker 版这里展示和 `#system` 返回的仍然是当前容器运行环境；容器外宿主机路径可见性不受诊断页面影响，媒体上报由 v0.1.9 的令牌 HTTP 接口独立处理。
 - 入站翻译热路径继续做了针对性优化：引用上下文任务只在确实可能存在引用时才构建；回复来源解析结果复用，避免重复扫描正文；纯文本引用不再误走 quoted media 提取；消息注册表 entry 复制路径改为面向 JSON-like 结构的轻量 clone；媒体描述提取改为单次遍历并为扁平 attachment 场景增加快速路径，继续压低高频图片 / 引用 / 混合消息场景下的固定开销。
 - `tools/benchmark_inbound_translate.py` 现在支持 `--profile realistic`，可直接带入更接近真实环境的 room info / quote fetch / media delay，并新增 `quote_image`、`media_mix` 场景，避免只靠零延迟微基准得到过于理想化的结论。
 
@@ -159,9 +161,8 @@ docker run --rm \
 ```
 
   迁移工具会备份 Bot 旧映射文件、建立服务器级 SQLite、重建私聊绑定、清理废弃 self ID 配置字段，并写出 `identity_scope.json` 与 `user_identity_migration.json`。只有迁移清单明确命中的旧 AstrBot 管理员 ID 才会被替换。
-- WebUI 文件管理边界是容器内 `/app`，宿主机目录只有通过 compose 挂载到 `/app/config`、`/app/data/...`、`/app/logs` 等路径后才可见；这个边界只用于文件管理，不会改变 `ROCKETCAT_SHARED_MEDIA_DIR` / `ROCKETCAT_SHARED_MEDIA_HOST_DIR` 的共享媒体路径翻译语义。
-- 共享媒体导出使用两个独立路径：`ROCKETCAT_SHARED_MEDIA_SOURCE_DIR` 是 Docker 宿主机实际挂载源，`ROCKETCAT_SHARED_MEDIA_HOST_DIR` 是 OneBot 消息中交给 AstrBot 的可见路径。宿主机部署 AstrBot 时，两者都应指向 AstrBot 官方 `data/temp` 下的专用子目录；AstrBot 也在 Docker 时，应把同一宿主目录挂到 AstrBot 容器的 `data/temp` 内，并把后者填为 AstrBot 容器内路径。
-- `ROCKETCAT_PREFER_SHARED_MEDIA_PATH_FOR_IMAGES=true` 会让图片即使在 Base64 兼容模式开启时也优先走共享路径，保证多引用、多参考图和生图插件可读取；音频、视频等其它媒体仍可使用 Base64 兼容传输。
+- WebUI 文件管理边界是容器内 `/app`，宿主机目录只有通过 compose 挂载到 `/app/config`、`/app/data/...`、`/app/logs` 等路径后才可见。媒体发布接口仅通过不可预测令牌读取 RocketCatShell 自身缓存，不需要也不会映射 AstrBot 的 `data/temp`。
+- 当 OneBot 地址是 `host.docker.internal`、`localhost` 或回环地址时，媒体 URL 自动使用 `http://127.0.0.1:<WebUI端口>`；当 OneBot 指向其它 Docker 服务时，默认使用 `http://rocketcatshell:<WebUI端口>`。自定义服务名可设置 `ROCKETCAT_DOCKER_SERVICE_NAME`，远程代理或特殊网络可直接设置 `ROCKETCAT_UPSTREAM_MEDIA_BASE_URL`。
 - 官方镜像自 `v0.1.9` 起同时支持 `linux/amd64` 和 `linux/arm64`；Docker 会根据宿主机架构自动选择对应 manifest。
 
 ---
@@ -305,7 +306,7 @@ RocketCatShell 当前这一版明确不承诺合并转发消息语义。
 - Rocket.Chat 8.2+ 删除加密附件时产生的 `removed-file` 标记会在解密合并后保留。
 - Rocket.Chat 8.3+ E2EE REST 接口启用严格请求校验后，只提交对应端点允许的字段。
 - E2EE 多引用会从解密正文开头的系统引用前缀生成多个顶层 OneBot `reply`，普通正文链接不会被误判。
-- E2EE 解密媒体会写入 Docker 共享媒体目录，再按设置转换为宿主机路径或 `base64://`，与非加密频道使用同一套上游可见性策略。
+- E2EE 解密媒体会写入 RocketCatShell 自身缓存，按文件签名修正图片扩展名后发布为令牌 HTTP URL，与非加密频道使用同一套上游可见性策略。
 - 如果 E2EE 初始化失败，不会影响未加密房间的正常收发。
 
 ---
@@ -415,9 +416,7 @@ pip install -r requirements.txt
 docker compose up -d --build
 ```
 
-默认会把持久化目录挂到 `/opt/rocketcatshell/...`；如果你要改宿主机挂载位置，优先修改 `.env` 里的 `ROCKETCAT_*_DIR` 和 `ROCKETCAT_SHARED_MEDIA_HOST_DIR`。
-
-Docker 首次启动时，“基础设置”里的“启用 Base64 传输媒体”默认关闭；如果你希望新安装首次生成的 `shell.json` 直接开启它，可以在 `.env` 中把 `ROCKETCAT_DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT=true`。
+默认会把持久化目录挂到 `/opt/rocketcatshell/...`；如果你要改宿主机挂载位置，优先修改 `.env` 里的 `ROCKETCAT_*_DIR`。RocketChat → OneBot 媒体通过 WebUI 端口的令牌 HTTP URL 上报，不需要额外挂载 AstrBot 的媒体目录。
 
 
 
@@ -515,15 +514,13 @@ ws://127.0.0.1:6199/ws/
 ws://host.docker.internal:6200/ws/
 ```
 
-生图参考图必须落在 AstrBot 允许读取的安全根目录内。宿主机部署 AstrBot 时，可使用：
+RocketCatShell 会把 RocketChat 媒体上报为令牌 HTTP URL。宿主机 AstrBot 会通过发布到 `127.0.0.1:5751` 的 WebUI 端口下载，并按自身标准链路缓存到 `AstrBot/data/temp`；无需配置共享路径。若 AstrBot 与 RocketCatShell 位于同一 Docker 网络，确保 RocketCatShell 的服务名可解析；默认服务名为 `rocketcatshell`。
+
+特殊网络、反向代理或远程 AstrBot 可在 `.env` 中显式覆盖：
 
 ```text
-ROCKETCAT_SHARED_MEDIA_SOURCE_DIR=/path/to/AstrBot/data/temp/rocketcat_shared_media
-ROCKETCAT_SHARED_MEDIA_HOST_DIR=/path/to/AstrBot/data/temp/rocketcat_shared_media
-ROCKETCAT_PREFER_SHARED_MEDIA_PATH_FOR_IMAGES=true
+ROCKETCAT_UPSTREAM_MEDIA_BASE_URL=http://可被AstrBot访问的地址:5751
 ```
-
-如果 AstrBot 也运行在 Docker，请把 `ROCKETCAT_SHARED_MEDIA_SOURCE_DIR` 指向宿主机共享目录，同时将该目录挂载到 AstrBot 容器的 `data/temp/rocketcat_shared_media`，并把 `ROCKETCAT_SHARED_MEDIA_HOST_DIR` 设置为 AstrBot 容器内的对应绝对路径。Base64 模式可继续用于其它媒体，但当前生图插件不接受 `base64://` 参考图。
 
 ### 2. 启动 RocketCatShell
 
@@ -588,7 +585,6 @@ http://127.0.0.1:5751/
 | `webui_port` | WebUI 监听端口，默认 `5751`。 |
 | `webui_access_password` | WebUI 登录认证 / 文件管理鉴权密码，默认 `123456`。该密码同时用于登录 WebUI 和打开敏感持久化数据文件。 |
 | `message_index_max_entries` | 最大消息映射窗口条数，默认 `1000`；超出后会清理最早映射，并在达到重置阈值后自动重排当前窗口。 |
-| `enable_base64_media_transport` | 是否把可本地读取的图片/语音/视频优先转成 `base64://` 发送，默认 `false`；关闭时继续沿用共享目录路径模式。 |
 | `log_level` | 日志级别，默认 `INFO`。 |
 | `auto_open_browser` | 启动后是否自动打开浏览器。 |
 | `default_onebot_ws_url` | 新建 Bot 时使用的默认 OneBot reverse WS 地址。 |

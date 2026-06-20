@@ -277,6 +277,11 @@ class ShellWebUI:
             StaticFiles(directory=str(self._static_dir)),
             name="static",
         )
+        self._app.add_api_route(
+            "/_rocketcat/media/{bot_id}/{token}/{filename}",
+            self._handle_published_media,
+            methods=["GET"],
+        )
         self._app.add_api_route("/", self._handle_index, methods=["GET"])
         self._app.add_api_route("/api/status", self._handle_status, methods=["GET"])
         self._app.add_api_route("/api/diagnostics", self._handle_diagnostics, methods=["GET"])
@@ -1026,6 +1031,28 @@ class ShellWebUI:
         if self._auth_required and not await self._is_request_authenticated(request):
             return FileResponse(self._login_file)
         return FileResponse(self._static_dir / "index.html")
+
+    async def _handle_published_media(
+        self,
+        bot_id: str,
+        token: str,
+        filename: str,
+    ) -> FileResponse:
+        entry = self.manager.media_publication.resolve(
+            bot_id=bot_id,
+            token=token,
+            filename=filename,
+        )
+        if entry is None:
+            raise HTTPException(status_code=404, detail="媒体不存在或令牌已失效")
+        return FileResponse(
+            entry.file_path,
+            media_type=entry.content_type,
+            headers={
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     async def _handle_login(self, request: Request, payload: dict[str, Any]) -> JSONResponse:
         if not self._auth_required:

@@ -12,12 +12,13 @@ import aiohttp
 from ..__init__ import __version__
 from ..bridge.hot_storage import build_runtime_hot_stores
 from ..bridge.id_map import DurableIdMap
+from ..bridge.media_publication import MediaPublicationService
 from ..bridge.runtime import BridgeRuntime
 from ..bridge.user_identity import UserIdentityRegistry
 from ..diagnostics import build_runtime_diagnostic_item, collect_cached_host_diagnostics_with_meta
 from ..layout import ProjectLayout
 from ..logger import logger
-from ..models import BotRecord, DEFAULT_WEBUI_ACCESS_PASSWORD, ShellSettings, _coerce_bool
+from ..models import BotRecord, DEFAULT_WEBUI_ACCESS_PASSWORD, ShellSettings
 from ..plugin_system import RocketCatPluginManager
 from ..registry import BotRegistry
 from ..settings import load_or_create_shell_settings, read_json, write_json
@@ -33,6 +34,7 @@ class ShellManager:
         self.settings: ShellSettings | None = None
         self.registry = BotRegistry(layout.bot_registry_path)
         self.plugin_manager = RocketCatPluginManager(layout)
+        self.media_publication = MediaPublicationService()
         self.bots: list[BotRecord] = []
         self.runtimes: dict[str, BridgeRuntime] = {}
         self._lock = asyncio.Lock()
@@ -42,7 +44,7 @@ class ShellManager:
         self._webui_requested_port: int | None = None
         self._webui_actual_port: int | None = None
 
-    async def initialize(self) -> None:
+    async def initialize(self, *, start_runtimes: bool = True) -> None:
         self.layout.ensure_directories()
         await self.plugin_manager.initialize()
         self.settings = load_or_create_shell_settings(self.layout.shell_settings_path)
@@ -50,7 +52,8 @@ class ShellManager:
 
         self._persist_shell_settings()
         self.registry.save(self.bots)
-        await self._reconcile_runtimes("shell initialize")
+        if start_runtimes:
+            await self._reconcile_runtimes("shell initialize")
 
         logger.info(
             "[RocketCatShell] bootstrap ready | bots=%s | enabled=%s | active_runtimes=%s | project_root=%s",
@@ -76,11 +79,16 @@ class ShellManager:
         self._webui_host = str(host)
         self._webui_requested_port = int(requested_port)
         self._webui_actual_port = int(actual_port)
+        self.media_publication.configure_webui(port=actual_port)
 
     def clear_webui_runtime(self) -> None:
+        self.media_publication.clear_webui()
         self._webui_host = None
         self._webui_requested_port = None
         self._webui_actual_port = None
+
+    async def start_enabled_runtimes(self, reason: str = "webui ready") -> None:
+        await self._reconcile_runtimes(reason)
 
     def build_status_payload(self) -> dict[str, Any]:
         settings = self._require_settings()
@@ -135,7 +143,6 @@ class ShellManager:
             "webui_port_hint": self._build_webui_port_hint(settings),
             "message_index_max_entries": settings.message_index_max_entries,
             "message_index_hint": self._build_message_index_hint(settings.message_index_max_entries),
-            "enable_base64_media_transport": settings.enable_base64_media_transport,
             "message_index_reset_surrogate_id": DurableIdMap.message_reset_surrogate_id(
                 settings.message_index_max_entries
             ),
@@ -158,7 +165,6 @@ class ShellManager:
                 "webui_access_password": settings.webui_access_password,
                 "webui_port": settings.webui_port,
                 "message_index_max_entries": settings.message_index_max_entries,
-                "enable_base64_media_transport": settings.enable_base64_media_transport,
             },
             "bots": bots,
             "plugin_configs": plugin_configs,
@@ -205,14 +211,6 @@ class ShellManager:
         if candidate_message_index_max_entries <= 0:
             raise ValueError("配置导入失败，最大消息映射窗口条数必须是正整数")
 
-        candidate_enable_base64_media_transport = _coerce_bool(
-            raw_shell_settings.get(
-                "enable_base64_media_transport",
-                settings.enable_base64_media_transport,
-            ),
-            settings.enable_base64_media_transport,
-        )
-
         candidate_bots = self._build_import_bots(raw_bots, defaults=settings)
         candidate_plugin_configs = self._normalize_import_plugin_configs(raw_plugin_configs)
 
@@ -225,7 +223,6 @@ class ShellManager:
                 settings.webui_access_password = candidate_password
                 settings.webui_port = candidate_port
                 settings.message_index_max_entries = candidate_message_index_max_entries
-                settings.enable_base64_media_transport = candidate_enable_base64_media_transport
                 self.bots = candidate_bots
                 self._persist_after_bot_change_locked()
                 self._apply_import_plugin_configs(candidate_plugin_configs)
@@ -272,7 +269,6 @@ class ShellManager:
             "plugin_config_count": imported_plugin_count,
             "webui_port": candidate_port,
             "message_index_max_entries": candidate_message_index_max_entries,
-            "enable_base64_media_transport": candidate_enable_base64_media_transport,
             "message_index_summary": message_index_summary,
         }
 
@@ -280,7 +276,6 @@ class ShellManager:
         settings = self._require_settings()
         changes: list[str] = []
         should_apply_message_index_policy = False
-        should_reconcile_runtimes = False
 
         async with self._lock:
             if "webui_access_password" in payload:
@@ -315,15 +310,6 @@ class ShellManager:
                 changes.append("message_index")
                 should_apply_message_index_policy = True
 
-            if "enable_base64_media_transport" in payload:
-                candidate_enable_base64_media_transport = _coerce_bool(
-                    payload.get("enable_base64_media_transport"),
-                    settings.enable_base64_media_transport,
-                )
-                settings.enable_base64_media_transport = candidate_enable_base64_media_transport
-                changes.append("base64_media_transport")
-                should_reconcile_runtimes = True
-
             if not changes:
                 raise ValueError("未提供可更新的设置项")
 
@@ -334,9 +320,6 @@ class ShellManager:
                 force_compact=False,
                 reason="message mapping window settings updated",
             )
-
-        if should_reconcile_runtimes:
-            await self._reconcile_runtimes("media transport settings updated")
 
         if "password" in changes:
             logger.info("[RocketCatShell] WebUI 登录认证密码已更新。")
@@ -349,11 +332,6 @@ class ShellManager:
             logger.info(
                 "[RocketCatShell] 最大消息映射窗口条数已更新为 %s；现有映射窗口已按新规则整理。",
                 settings.message_index_max_entries,
-            )
-        if "base64_media_transport" in changes:
-            logger.info(
-                "[RocketCatShell] Base64 媒体传输已更新为 %s；运行中的 bridge runtime 已重新加载。",
-                "开启" if settings.enable_base64_media_transport else "关闭",
             )
         return await self.get_settings_state()
 
@@ -875,7 +853,7 @@ class ShellManager:
                     data_dir=self.layout.bots_dir / bot.bot_id,
                     instance_name=bot.name or bot.bot_id,
                     message_index_max_entries=self._require_settings().message_index_max_entries,
-                    enable_base64_media_transport=self._require_settings().enable_base64_media_transport,
+                    media_publication_service=self.media_publication,
                     disable_callback=lambda bot_id=bot.bot_id: self._disable_bot_after_failure(bot_id),
                     plugin_manager=self.plugin_manager,
                 )

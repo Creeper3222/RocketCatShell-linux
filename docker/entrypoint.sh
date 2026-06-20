@@ -27,7 +27,6 @@ payload = {
     "webui_port": int(os.environ.get("ROCKETCAT_WEBUI_PORT", "5751")),
     "webui_access_password": os.environ.get("ROCKETCAT_WEBUI_PASSWORD", "123456"),
     "message_index_max_entries": int(os.environ.get("ROCKETCAT_MESSAGE_INDEX_MAX_ENTRIES", "1000")),
-    "enable_base64_media_transport": os.environ.get("ROCKETCAT_DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT", "false").strip().lower() in {"1", "true", "yes", "on"},
     "log_level": os.environ.get("ROCKETCAT_LOG_LEVEL", "INFO"),
     "auto_open_browser": os.environ.get("ROCKETCAT_AUTO_OPEN_BROWSER", "false").strip().lower() in {"1", "true", "yes", "on"},
     "default_onebot_ws_url": os.environ.get("ROCKETCAT_DEFAULT_ONEBOT_WS_URL", "ws://host.docker.internal:6200/ws/"),
