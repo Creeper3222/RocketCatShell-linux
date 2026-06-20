@@ -177,23 +177,41 @@ class MessageStore:
         entry["surrogate_id"] = int(surrogate_id)
         event = entry.get("onebot_message")
         reply_source_id = str(entry.get("reply_source_id") or "").strip()
+        reply_source_ids = [
+            str(source_id)
+            for source_id in (entry.get("reply_source_ids") or [])
+            if str(source_id)
+        ]
         segments = entry.get("onebot_message_segments")
         if isinstance(event, dict):
             event["message_id"] = int(surrogate_id)
             reply_source_id = reply_source_id or str(event.get("rocketchat_reply_source_id") or "").strip()
+            if not reply_source_ids:
+                reply_source_ids = [
+                    str(source_id)
+                    for source_id in (event.get("rocketchat_reply_source_ids") or [])
+                    if str(source_id)
+                ]
             segments = event.get("message")
         if not isinstance(segments, list):
             return
 
         rewritten_segments: list[Any] = []
+        reply_index = 0
         for segment in segments:
             if not isinstance(segment, dict) or str(segment.get("type") or "") != "reply":
                 rewritten_segments.append(segment)
                 continue
-            if reply_source_id and reply_source_id in active_mappings:
+            current_reply_source_id = (
+                reply_source_ids[reply_index]
+                if reply_index < len(reply_source_ids)
+                else reply_source_id
+            )
+            reply_index += 1
+            if current_reply_source_id and current_reply_source_id in active_mappings:
                 updated_segment = deepcopy(segment)
                 updated_data = dict(updated_segment.get("data") or {})
-                updated_data["id"] = str(active_mappings[reply_source_id])
+                updated_data["id"] = str(active_mappings[current_reply_source_id])
                 updated_segment["data"] = updated_data
                 rewritten_segments.append(updated_segment)
 

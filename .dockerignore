@@ -6,4 +6,5 @@ __pycache__
 config
 logs
 data/bots
+data/user_identity
 data/plugin_data

@@ -24,6 +24,7 @@ from .rocketchat_client import RocketChatClient
 from .storage import JsonStore
 from .translator_inbound import InboundTranslator
 from .translator_outbound import OutboundMessageTranslator
+from .user_identity import UserIdentityIdMap, UserIdentityRegistry
 
 
 DisableCallback = Callable[[], Awaitable[None] | None]
@@ -59,12 +60,15 @@ class BridgeRuntime:
         self.config = BridgeConfig.from_mapping(raw_config)
         self.state_store = JsonStore(self.data_dir / "runtime_state.json")
         self._hot_store_bundle: RuntimeHotStoreBundle | None = None
+        self._base_id_map: DurableIdMap | None = None
         self._ensure_hot_store_bundle()
         self.rocketchat: RocketChatClient | None = None
         self.inbound_translator: InboundTranslator | None = None
         self.outbound_translator: OutboundMessageTranslator | None = None
         self.action_handler: OneBotActionHandler | None = None
         self.onebot: OneBotReverseWsClient | None = None
+        self.identity_registry: UserIdentityRegistry | None = None
+        self.identity_database_path: Path | None = None
         self._plugin_runtime_context: PluginExecutionContext | None = None
         self._runtime_plugins: list[RuntimePluginBinding] = []
         self._failure_task: asyncio.Task | None = None
@@ -305,58 +309,148 @@ class BridgeRuntime:
         self.rocketchat = RocketChatClient(
             self.config,
             enable_base64_media_transport=self.enable_base64_media_transport,
+            media_cache_dir=self.data_dir / "media_cache",
             on_message=self._handle_rocketchat_message,
             on_reconnect_exhausted=self._handle_reconnect_exhausted,
         )
-        self.inbound_translator = InboundTranslator(
-            rocketchat=self.rocketchat,
-            id_map=self.id_map,
-            messages=self.message_store,
-            private_rooms=self.private_room_store,
-            context_rooms=self.context_room_store,
-            self_id=self.config.onebot_self_id,
+
+        try:
+            # REST login must finish before realtime or OneBot starts. The
+            # immutable Rocket.Chat userId determines this bot's OneBot self_id.
+            await self.rocketchat.start(start_realtime=False)
+            await self._initialize_user_identity()
+            self.inbound_translator = InboundTranslator(
+                rocketchat=self.rocketchat,
+                id_map=self.id_map,
+                messages=self.message_store,
+                private_rooms=self.private_room_store,
+                context_rooms=self.context_room_store,
+                self_id=self.config.onebot_self_id,
+            )
+            self.outbound_translator = OutboundMessageTranslator(
+                rocketchat=self.rocketchat,
+                id_map=self.id_map,
+                messages=self.message_store,
+                private_rooms=self.private_room_store,
+                context_rooms=self.context_room_store,
+            )
+            self._plugin_runtime_context = PluginExecutionContext(
+                instance_name=self.instance_name,
+                bridge_config=self.config,
+                rocketchat=self.rocketchat,
+                id_map=self.id_map,
+                messages=self.message_store,
+                private_rooms=self.private_room_store,
+                context_rooms=self.context_room_store,
+                inbound=self.inbound_translator,
+                outbound=self.outbound_translator,
+            )
+            if self._plugin_manager is not None and self._plugin_runtime_context is not None:
+                self._runtime_plugins = await self._plugin_manager.create_runtime_plugins(self._plugin_runtime_context)
+            else:
+                self._runtime_plugins = []
+            self.action_handler = OneBotActionHandler(
+                config=self.config,
+                rocketchat=self.rocketchat,
+                id_map=self.id_map,
+                messages=self.message_store,
+                private_rooms=self.private_room_store,
+                context_rooms=self.context_room_store,
+                inbound=self.inbound_translator,
+                outbound=self.outbound_translator,
+                plugin_action_dispatcher=self._dispatch_plugin_action,
+            )
+            self.onebot = OneBotReverseWsClient(
+                self.config,
+                action_handler=self.action_handler.handle,
+                on_reconnect_exhausted=self._handle_reconnect_exhausted,
+            )
+            await self.rocketchat.start_realtime()
+            await self.onebot.start()
+        except Exception:
+            await self._stop_clients()
+            raise
+
+    async def _initialize_user_identity(self) -> None:
+        if self.rocketchat is None or not self.rocketchat.user_id:
+            raise RuntimeError("Rocket.Chat 登录尚未提供 userId")
+        if self._base_id_map is None or self._hot_store_bundle is None:
+            raise RuntimeError("runtime hot store 尚未初始化")
+
+        data_root = self.data_dir.parent.parent
+        warning_path = self.data_dir / "re_waring.json"
+        registry = UserIdentityRegistry.for_server(
+            data_root,
+            server_url=self.config.server_url,
+            cloud_workspace_id=self.rocketchat.cloud_workspace_id,
+            bot_id=self.config.bot_id,
+            warning_path=warning_path,
         )
-        self.outbound_translator = OutboundMessageTranslator(
-            rocketchat=self.rocketchat,
-            id_map=self.id_map,
-            messages=self.message_store,
-            private_rooms=self.private_room_store,
-            context_rooms=self.context_room_store,
+        bot_profile = self.rocketchat.bot_profile or {}
+        self_mapping = await registry.ensure_mapping(
+            self.rocketchat.user_id,
+            username=str(
+                bot_profile.get("username")
+                or self.rocketchat.bot_username
+                or self.config.username
+                or ""
+            ),
+            nickname=str(
+                bot_profile.get("name")
+                or bot_profile.get("nickname")
+                or self.rocketchat.bot_username
+                or self.config.username
+                or ""
+            ),
+            is_bot=True,
+            bot_id=self.config.bot_id,
         )
-        self._plugin_runtime_context = PluginExecutionContext(
-            instance_name=self.instance_name,
-            bridge_config=self.config,
-            rocketchat=self.rocketchat,
-            id_map=self.id_map,
-            messages=self.message_store,
-            private_rooms=self.private_room_store,
-            context_rooms=self.context_room_store,
-            inbound=self.inbound_translator,
-            outbound=self.outbound_translator,
-        )
-        if self._plugin_manager is not None and self._plugin_runtime_context is not None:
-            self._runtime_plugins = await self._plugin_manager.create_runtime_plugins(self._plugin_runtime_context)
-        else:
-            self._runtime_plugins = []
-        self.action_handler = OneBotActionHandler(
-            config=self.config,
-            rocketchat=self.rocketchat,
-            id_map=self.id_map,
-            messages=self.message_store,
-            private_rooms=self.private_room_store,
-            context_rooms=self.context_room_store,
-            inbound=self.inbound_translator,
-            outbound=self.outbound_translator,
-            plugin_action_dispatcher=self._dispatch_plugin_action,
-        )
-        self.onebot = OneBotReverseWsClient(
-            self.config,
-            action_handler=self.action_handler.handle,
-            on_reconnect_exhausted=self._handle_reconnect_exhausted,
+        self.identity_registry = registry
+        self.identity_database_path = registry.database_path
+        self.id_map = UserIdentityIdMap(self._base_id_map, registry)
+        self.config.onebot_self_id = self_mapping.onebot_id
+
+        private_bindings = self._hot_store_bundle.state_engine.get_private_room_source_bindings()
+        rebuilt_private_surrogates: dict[int, str] = {}
+        for user_source_id, room_source_id in private_bindings.items():
+            mapping = await registry.ensure_mapping(
+                user_source_id,
+                bot_id=self.config.bot_id,
+            )
+            rebuilt_private_surrogates[mapping.onebot_id] = room_source_id
+        self._hot_store_bundle.state_engine.replace_private_room_surrogate_bindings(
+            rebuilt_private_surrogates
         )
 
-        await self.onebot.start()
-        await self.rocketchat.start()
+        identity_scope_path = self.data_dir / "identity_scope.json"
+        await asyncio.to_thread(
+            identity_scope_path.write_text,
+            (
+                "{\n"
+                f'  "scope_key": {self._json_string(registry.scope_key)},\n'
+                f'  "database_path": {self._json_string(str(registry.database_path))},\n'
+                f'  "onebot_self_id": {self.config.onebot_self_id}\n'
+                "}\n"
+            ),
+            "utf-8",
+        )
+        await registry.sync_warning_file(
+            bot_id=self.config.bot_id,
+            warning_path=warning_path,
+        )
+        registry.repeat_persisted_warnings()
+        logger.info(
+            "[RocketChatOneBotBridge] bot 用户哈希映射就绪 | "
+            "userId=%s | onebot_self_id=%s | algorithm=sha256-linear-v1",
+            self.rocketchat.user_id,
+            self.config.onebot_self_id,
+        )
+
+    @staticmethod
+    def _json_string(value: str) -> str:
+        import json
+
+        return json.dumps(str(value), ensure_ascii=False)
 
     async def _stop_clients(self) -> None:
         runtime_context = self._plugin_runtime_context
@@ -374,6 +468,10 @@ class BridgeRuntime:
         self.onebot = None
         self._plugin_runtime_context = None
         self._runtime_plugins = []
+        self.identity_registry = None
+        self.identity_database_path = None
+        if self._base_id_map is not None:
+            self.id_map = self._base_id_map
 
     def _ensure_hot_store_bundle(self) -> None:
         if self._hot_store_bundle is not None:
@@ -383,7 +481,8 @@ class BridgeRuntime:
             message_window_size=self.message_index_max_entries,
         )
         self.message_store = self._hot_store_bundle.message_store
-        self.id_map = self._hot_store_bundle.id_map
+        self._base_id_map = self._hot_store_bundle.id_map
+        self.id_map = self._base_id_map
         self.private_room_store = self._hot_store_bundle.private_room_store
         self.context_room_store = self._hot_store_bundle.context_room_store
 

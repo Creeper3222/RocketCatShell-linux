@@ -12,6 +12,5 @@
   "default_enable_subchannel_session_isolation": true,
   "default_remote_media_max_size": 20971520,
   "default_skip_own_messages": true,
-  "default_debug": false,
-  "next_onebot_self_id": 910001
+  "default_debug": false
 }

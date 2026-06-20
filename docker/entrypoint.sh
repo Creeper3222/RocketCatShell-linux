@@ -10,6 +10,7 @@ EXAMPLES_DIR="/opt/rocketcat/examples"
 mkdir -p \
     "$CONFIG_DIR/plugins_config" \
     "$APP_DIR/data/bots" \
+    "$APP_DIR/data/user_identity" \
     "$PLUGINS_DIR" \
     "$APP_DIR/data/plugin_data" \
     "$APP_DIR/logs"
@@ -37,7 +38,6 @@ payload = {
     "default_remote_media_max_size": int(os.environ.get("ROCKETCAT_DEFAULT_REMOTE_MEDIA_MAX_SIZE", "20971520")),
     "default_skip_own_messages": os.environ.get("ROCKETCAT_DEFAULT_SKIP_OWN_MESSAGES", "true").strip().lower() in {"1", "true", "yes", "on"},
     "default_debug": os.environ.get("ROCKETCAT_DEFAULT_DEBUG", "false").strip().lower() in {"1", "true", "yes", "on"},
-    "next_onebot_self_id": int(os.environ.get("ROCKETCAT_NEXT_ONEBOT_SELF_ID", "910001")),
 }
 config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 PY

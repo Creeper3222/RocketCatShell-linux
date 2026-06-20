@@ -3,7 +3,7 @@ from __future__ import annotations
 import secrets
 from pathlib import Path
 
-from .models import DEFAULT_START_SELF_ID, BotRecord, ShellSettings
+from .models import BotRecord, ShellSettings
 from .settings import read_json, write_json
 
 
@@ -30,13 +30,6 @@ class BotRegistry:
 
     def save(self, bots: list[BotRecord]) -> None:
         write_json(self.path, {"bots": [bot.to_mapping() for bot in bots]})
-
-    def next_suggested_self_id(self, bots: list[BotRecord], *, floor: int = DEFAULT_START_SELF_ID) -> int:
-        current_max = int(floor) - 1
-        for bot in bots:
-            if bot.onebot_self_id > current_max:
-                current_max = bot.onebot_self_id
-        return current_max + 1
 
     def _generate_bot_id(self) -> str:
         return f"bot_{secrets.token_hex(4)}"

@@ -29,7 +29,6 @@ class MessageWindowSnapshot:
 
 class DurableIdMap:
     _BASES = {
-        "user": 1000000000,
         "room": 2000000000,
         "message": 3000000000,
         "thread": 4000000000,

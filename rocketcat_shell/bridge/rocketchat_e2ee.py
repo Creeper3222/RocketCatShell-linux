@@ -281,6 +281,36 @@ class EncryptedMediaUpload:
 
 class RocketChatE2EEManager:
     _MEDIA_ENCRYPT_CHUNK_SIZE = 1024 * 1024
+    _GET_QUERY_FIELDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+        "/api/v1/e2e.fetchMyKeys": (frozenset(), frozenset()),
+        "/api/v1/e2e.getUsersOfRoomWithoutKey": (
+            frozenset({"rid"}),
+            frozenset(),
+        ),
+        "/api/v1/subscriptions.get": (frozenset(), frozenset()),
+    }
+    _POST_PAYLOAD_FIELDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+        "/api/v1/e2e.setUserPublicAndPrivateKeys": (
+            frozenset({"public_key", "private_key"}),
+            frozenset({"force"}),
+        ),
+        "/api/v1/e2e.acceptSuggestedGroupKey": (
+            frozenset({"rid"}),
+            frozenset(),
+        ),
+        "/api/v1/e2e.setRoomKeyID": (
+            frozenset({"rid", "keyID"}),
+            frozenset(),
+        ),
+        "/api/v1/e2e.updateGroupKey": (
+            frozenset({"rid", "uid", "key"}),
+            frozenset(),
+        ),
+        "/api/v1/e2e.provideUsersSuggestedGroupKeys": (
+            frozenset({"usersSuggestedGroupKeys"}),
+            frozenset(),
+        ),
+    }
 
     def __init__(self, client: Any, enabled: bool, password: str) -> None:
         self.client = client
@@ -381,9 +411,62 @@ class RocketChatE2EEManager:
         if decrypted is None:
             return None
 
+        merged = self._merge_decrypted_message(raw_msg, decrypted)
+        merged["e2e"] = "done"
+        return merged
+
+    @staticmethod
+    def _merge_decrypted_message(
+        raw_msg: dict[str, Any],
+        decrypted: dict[str, Any],
+    ) -> dict[str, Any]:
+        raw_attachments = raw_msg.get("attachments")
+        removed_attachments = (
+            [
+                dict(attachment)
+                for attachment in raw_attachments
+                if isinstance(attachment, dict)
+                and attachment.get("type") == "removed-file"
+            ]
+            if isinstance(raw_attachments, list)
+            else []
+        )
+
         merged = dict(raw_msg)
         merged.update(decrypted)
-        merged["e2e"] = "done"
+        decrypted_attachments = decrypted.get("attachments")
+        if not removed_attachments or not isinstance(decrypted_attachments, list):
+            return merged
+
+        deleted_all = next(
+            (
+                attachment
+                for attachment in removed_attachments
+                if not attachment.get("fileId")
+            ),
+            None,
+        )
+        removed_by_file_id = {
+            str(attachment.get("fileId")): attachment
+            for attachment in removed_attachments
+            if attachment.get("fileId")
+        }
+        fallback_file_id = str((merged.get("file") or {}).get("_id") or "")
+        reconciled: list[Any] = []
+        for attachment in decrypted_attachments:
+            if not isinstance(attachment, dict) or attachment.get("type") != "file":
+                reconciled.append(attachment)
+                continue
+            if deleted_all is not None:
+                reconciled.append(dict(deleted_all))
+                continue
+            file_id = str(attachment.get("fileId") or fallback_file_id)
+            reconciled.append(
+                dict(removed_by_file_id[file_id])
+                if file_id and file_id in removed_by_file_id
+                else attachment
+            )
+        merged["attachments"] = reconciled
         return merged
 
     async def build_send_message(
@@ -584,7 +667,9 @@ class RocketChatE2EEManager:
 
         payload: dict[str, Any] = {
             "t": "e2e",
+            "msg": "",
             "content": encrypted_content,
+            "fileContent": file_content["encrypted"],
         }
         if tmid:
             payload["tmid"] = tmid
@@ -700,7 +785,7 @@ class RocketChatE2EEManager:
         if expected_ws is not None and not self._is_expected_ws_active(expected_ws):
             return False
         try:
-            await self.client._ddp_call("e2e.requestSubscriptionKeys", [])
+            await self.client.call_realtime_method("e2e.requestSubscriptionKeys", [])
             return True
         except Exception as exc:
             logger.warning(
@@ -926,20 +1011,118 @@ class RocketChatE2EEManager:
         params: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         url = f"{self.client.config.server_url}{path}"
-        if self.client._http_session is None:
-            raise RuntimeError("Rocket.Chat HTTP session 尚未初始化")
-        async with self.client._http_session.get(url, params=params, headers=self.client._auth_headers()) as resp:
-            data = await resp.json(content_type=None, loads=json_loads)
+        strict_params = self._build_strict_fields(
+            path,
+            params or {},
+            self._GET_QUERY_FIELDS,
+            kind="query",
+        )
+        data = await self.client._request_json(
+            "GET",
+            url,
+            params=strict_params or None,
+            headers=self.client._auth_headers(),
+        )
         if not data.get("success"):
             raise RuntimeError(f"GET {path} failed: {data}")
         return data
 
     async def _rest_post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         url = f"{self.client.config.server_url}{path}"
-        if self.client._http_session is None:
-            raise RuntimeError("Rocket.Chat HTTP session 尚未初始化")
-        async with self.client._http_session.post(url, json=payload, headers=self.client._auth_headers()) as resp:
-            data = await resp.json(content_type=None, loads=json_loads)
+        strict_payload = self._build_strict_post_payload(path, payload)
+        data = await self.client._request_json(
+            "POST",
+            url,
+            json=strict_payload,
+            headers=self.client._auth_headers(),
+        )
         if not data.get("success"):
             raise RuntimeError(f"POST {path} failed: {data}")
         return data
+
+    @classmethod
+    def _build_strict_post_payload(
+        cls,
+        path: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        result = cls._build_strict_fields(
+            path,
+            payload,
+            cls._POST_PAYLOAD_FIELDS,
+            kind="payload",
+        )
+        if path == "/api/v1/e2e.provideUsersSuggestedGroupKeys":
+            room_map = result["usersSuggestedGroupKeys"]
+            if not isinstance(room_map, dict):
+                raise ValueError("usersSuggestedGroupKeys must be an object")
+            for room_id, entries in room_map.items():
+                if not isinstance(room_id, str) or not room_id:
+                    raise ValueError("usersSuggestedGroupKeys room IDs must be non-empty strings")
+                if not isinstance(entries, list):
+                    raise ValueError(
+                        f"usersSuggestedGroupKeys[{room_id!r}] must be an array"
+                    )
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        raise ValueError(
+                            f"usersSuggestedGroupKeys[{room_id!r}] entries must be objects"
+                        )
+                    entry_keys = frozenset(entry)
+                    missing = frozenset({"_id", "key"}) - entry_keys
+                    unknown = entry_keys - frozenset({"_id", "key", "oldKeys"})
+                    if missing or unknown:
+                        raise ValueError(
+                            f"invalid suggested group key entry for room {room_id!r}: "
+                            f"missing={sorted(missing)} unknown={sorted(unknown)}"
+                        )
+                    old_keys = entry.get("oldKeys")
+                    if old_keys is None:
+                        continue
+                    if not isinstance(old_keys, list):
+                        raise ValueError(
+                            f"oldKeys for room {room_id!r} must be an array"
+                        )
+                    for old_key in old_keys:
+                        if not isinstance(old_key, dict):
+                            raise ValueError(
+                                f"oldKeys for room {room_id!r} must contain objects"
+                            )
+                        old_key_unknown = frozenset(old_key) - frozenset(
+                            {"e2eKeyId", "ts", "E2EKey"}
+                        )
+                        if old_key_unknown:
+                            raise ValueError(
+                                f"invalid oldKeys entry for room {room_id!r}: "
+                                f"unknown={sorted(old_key_unknown)}"
+                            )
+        return result
+
+    @staticmethod
+    def _build_strict_fields(
+        path: str,
+        values: dict[str, Any],
+        schemas: dict[str, tuple[frozenset[str], frozenset[str]]],
+        *,
+        kind: str,
+    ) -> dict[str, Any]:
+        schema = schemas.get(path)
+        if schema is None:
+            raise ValueError(f"unsupported E2EE {kind} endpoint: {path}")
+        required, optional = schema
+        keys = frozenset(values)
+        missing = required - keys
+        unknown = keys - required - optional
+        if missing:
+            raise ValueError(
+                f"E2EE {kind} missing required fields for {path}: {sorted(missing)}"
+            )
+        if unknown:
+            raise ValueError(
+                f"E2EE {kind} contains unknown fields for {path}: {sorted(unknown)}"
+            )
+        return {
+            key: values[key]
+            for key in (*sorted(required), *sorted(optional))
+            if key in values
+        }

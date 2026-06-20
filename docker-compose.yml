@@ -14,6 +14,9 @@ services:
         source: ${ROCKETCAT_BOTS_DIR:-/opt/rocketcatshell/data/bots}
         target: /app/data/bots
       - type: bind
+        source: ${ROCKETCAT_USER_IDENTITY_DIR:-/opt/rocketcatshell/data/user_identity}
+        target: /app/data/user_identity
+      - type: bind
         source: ${ROCKETCAT_SHARED_MEDIA_HOST_DIR:-/opt/rocketcatshell/data/bots/_shared_media}
         target: /app/data/bots/_shared_media
       - type: bind
@@ -47,4 +50,3 @@ services:
       ROCKETCAT_DEFAULT_REMOTE_MEDIA_MAX_SIZE: ${ROCKETCAT_DEFAULT_REMOTE_MEDIA_MAX_SIZE:-20971520}
       ROCKETCAT_DEFAULT_SKIP_OWN_MESSAGES: ${ROCKETCAT_DEFAULT_SKIP_OWN_MESSAGES:-true}
       ROCKETCAT_DEFAULT_DEBUG: ${ROCKETCAT_DEFAULT_DEBUG:-false}
-      ROCKETCAT_NEXT_ONEBOT_SELF_ID: ${ROCKETCAT_NEXT_ONEBOT_SELF_ID:-910001}

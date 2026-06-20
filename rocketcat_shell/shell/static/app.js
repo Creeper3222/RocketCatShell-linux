@@ -7,7 +7,6 @@ const DEFAULT_FORM = {
   e2ee_password: '',
   onebot_ws_url: '',
   onebot_access_token: '',
-  onebot_self_id: 910001,
   reconnect_delay: 5.0,
   max_reconnect_attempts: 10,
   enable_subchannel_session_isolation: true,
@@ -120,20 +119,19 @@ const state = {
     fitAddons: new Map(),
     dragId: '',
   },
+  userMappings: {
+    botId: '',
+    items: [],
+    total: 0,
+    offset: 0,
+    limit: 50,
+    search: '',
+    ready: false,
+  },
 };
 
-function getSuggestedOnebotSelfId() {
-  const suggested = Number(state.status?.suggested_onebot_self_id);
-  return Number.isFinite(suggested) && suggested > 0
-    ? suggested
-    : DEFAULT_FORM.onebot_self_id;
-}
-
 function buildCreateDefaults() {
-  return {
-    ...DEFAULT_FORM,
-    onebot_self_id: getSuggestedOnebotSelfId(),
-  };
+  return { ...DEFAULT_FORM };
 }
 
 const elements = {
@@ -247,6 +245,22 @@ const elements = {
   closeModalButton: document.getElementById('closeModalButton'),
   cancelButton: document.getElementById('cancelButton'),
   submitButton: document.getElementById('submitButton'),
+  openUserMappingsButton: document.getElementById('openUserMappingsButton'),
+  userMappingsButtonHint: document.getElementById('userMappingsButtonHint'),
+  userMappingsModal: document.getElementById('userMappingsModal'),
+  userMappingsModalTitle: document.getElementById('userMappingsModalTitle'),
+  userMappingsCloseButton: document.getElementById('userMappingsCloseButton'),
+  userMappingsDoneButton: document.getElementById('userMappingsDoneButton'),
+  userMappingsSearchInput: document.getElementById('userMappingsSearchInput'),
+  userMappingsSearchButton: document.getElementById('userMappingsSearchButton'),
+  userMappingsRefreshButton: document.getElementById('userMappingsRefreshButton'),
+  userMappingsSummary: document.getElementById('userMappingsSummary'),
+  userMappingsNotice: document.getElementById('userMappingsNotice'),
+  userMappingsTableBody: document.getElementById('userMappingsTableBody'),
+  userMappingsEmpty: document.getElementById('userMappingsEmpty'),
+  userMappingsPrevButton: document.getElementById('userMappingsPrevButton'),
+  userMappingsNextButton: document.getElementById('userMappingsNextButton'),
+  userMappingsPageLabel: document.getElementById('userMappingsPageLabel'),
   pluginModal: document.getElementById('pluginModal'),
   pluginModalTitle: document.getElementById('pluginModalTitle'),
   pluginModalMeta: document.getElementById('pluginModalMeta'),
@@ -442,7 +456,13 @@ async function requestJson(url, options = {}) {
     throw new Error(payload.error || payload.detail || '登录已失效，请重新登录');
   }
   if (!response.ok) {
-    throw new Error(payload.error || payload.detail || '请求失败');
+    const detail = payload.error || payload.detail;
+    const message = typeof detail === 'string'
+      ? detail
+      : detail?.message
+        ? `${detail.message}${detail.occupant?.user_id ? `（占用者：${detail.occupant.user_id} / ${detail.occupant.onebot_id}）` : ''}`
+        : '请求失败';
+    throw new Error(message);
   }
   return payload;
 }
@@ -990,6 +1010,18 @@ function renderDiagnostics(payload) {
         <div class="diagnostics-row">
           <span>Rocket.Chat</span>
           <strong>${escapeHtml(item.server_url || '-')}</strong>
+        </div>
+        <div class="diagnostics-row">
+          <span>服务端版本</span>
+          <strong>${escapeHtml(`${item.server_version || 'unknown'} · ${item.compatibility_status || 'unknown'}`)}</strong>
+        </div>
+        <div class="diagnostics-row">
+          <span>上传端点</span>
+          <strong>${escapeHtml(item.upload_endpoint || '-')}</strong>
+        </div>
+        <div class="diagnostics-row">
+          <span>Method 传输</span>
+          <strong>${escapeHtml(`${item.method_transport || '-'} · 回退 ${item.method_rest_fallbacks ?? 0} 次`)}</strong>
         </div>
         <div class="diagnostics-row">
           <span>OneBot self_id</span>
@@ -3176,12 +3208,194 @@ function openModal(bot = null) {
   state.editingId = bot?.id || null;
   elements.modalTitle.textContent = bot ? `编辑 Bot：${bot.name}` : '新建 Bot';
   setFormData(bot || buildCreateDefaults());
+  if (elements.openUserMappingsButton) {
+    const mappingReady = Boolean(bot?.user_mapping_ready);
+    elements.openUserMappingsButton.disabled = !bot || !mappingReady;
+    elements.openUserMappingsButton.dataset.botId = bot?.id || '';
+    elements.userMappingsButtonHint.textContent = !bot
+      ? '保存并首次成功登录后即可审查映射。'
+      : mappingReady
+        ? `当前 bot self_id：${bot.onebot_self_id}`
+        : '尚未建立映射，请先让该 bot 成功登录 Rocket.Chat。';
+  }
   elements.modal.classList.remove('hidden');
 }
 
 function closeModal() {
   state.editingId = null;
   elements.modal.classList.add('hidden');
+}
+
+async function openUserMappings(botId) {
+  if (!botId) {
+    return;
+  }
+  state.userMappings = {
+    botId,
+    items: [],
+    total: 0,
+    offset: 0,
+    limit: 50,
+    search: '',
+    ready: false,
+  };
+  elements.userMappingsSearchInput.value = '';
+  elements.userMappingsModal.classList.remove('hidden');
+  await loadUserMappings();
+}
+
+function closeUserMappings() {
+  elements.userMappingsModal.classList.add('hidden');
+}
+
+async function loadUserMappings() {
+  const mappingState = state.userMappings;
+  const query = new URLSearchParams({
+    search: mappingState.search,
+    offset: String(mappingState.offset),
+    limit: String(mappingState.limit),
+  });
+  const payload = await requestJson(
+    `/api/bots/${encodeURIComponent(mappingState.botId)}/user-mappings?${query.toString()}`,
+  );
+  mappingState.items = payload.items || [];
+  mappingState.total = Number(payload.total || 0);
+  mappingState.offset = Number(payload.offset || 0);
+  mappingState.limit = Number(payload.limit || 50);
+  mappingState.ready = Boolean(payload.ready);
+  elements.userMappingsModalTitle.textContent = `User 映射：${payload.bot_name || mappingState.botId}`;
+  renderUserMappings(payload);
+}
+
+function renderUserMappings(payload) {
+  const mappingState = state.userMappings;
+  const items = mappingState.items;
+  elements.userMappingsTableBody.innerHTML = '';
+  elements.userMappingsEmpty.classList.toggle('hidden', items.length > 0);
+  elements.userMappingsNotice.classList.toggle('hidden', payload.ready !== false);
+  elements.userMappingsNotice.textContent = payload.ready === false
+    ? '该 bot 尚未成功登录 Rocket.Chat，因此还没有可审查的映射。'
+    : '';
+  elements.userMappingsSummary.textContent = payload.ready === false
+    ? '映射未建立'
+    : `共 ${mappingState.total} 条 · ${payload.algorithm || 'sha256-linear-v1'}`;
+
+  for (const item of items) {
+    const row = document.createElement('tr');
+    if (item.conflict_role === 'incumbent') {
+      row.classList.add('identity-conflict-incumbent');
+    } else if (item.conflict_role === 'displaced') {
+      row.classList.add('identity-conflict-displaced');
+    }
+    const badges = [];
+    if (item.is_bot) badges.push('<span class="identity-badge bot">BOT</span>');
+    if (item.manual_override) badges.push('<span class="identity-badge override">自定义</span>');
+    if (item.synthetic) badges.push('<span class="identity-badge synthetic">测试</span>');
+    if (item.conflict_role === 'incumbent') badges.push('<span class="identity-badge incumbent">先入槽位</span>');
+    if (item.conflict_role === 'displaced') badges.push('<span class="identity-badge displaced">后入偏移</span>');
+    row.innerHTML = `
+      <td><code>${escapeHtml(item.user_id)}</code></td>
+      <td>${escapeHtml(item.username || '-')}</td>
+      <td>${escapeHtml(item.nickname || '-')}</td>
+      <td>
+        <input class="identity-onebot-input" type="text" inputmode="numeric"
+          value="${escapeHtml(String(item.onebot_id))}"
+          data-identity-user-id="${escapeHtml(item.user_id)}"
+          data-identity-revision="${escapeHtml(String(item.revision))}" />
+      </td>
+      <td>
+        <code>${escapeHtml(String(item.primary_onebot_id))}</code>
+        <small>偏移 ${escapeHtml(String(item.probe_offset))}</small>
+      </td>
+      <td><div class="identity-badges">${badges.join('') || '<span class="identity-badge normal">正常</span>'}</div></td>
+      <td>
+        <div class="identity-action-stack">
+          <button class="action-button subtle identity-save-button" type="button"
+            data-identity-save="${escapeHtml(item.user_id)}">保存</button>
+          <button class="action-button danger-button identity-delete-button" type="button"
+            data-identity-delete="${escapeHtml(item.user_id)}"
+            data-identity-label="${escapeHtml(item.nickname || item.username || item.user_id)}">删除</button>
+        </div>
+      </td>
+    `;
+    elements.userMappingsTableBody.appendChild(row);
+  }
+
+  const pageCount = Math.max(1, Math.ceil(mappingState.total / mappingState.limit));
+  const currentPage = Math.min(pageCount, Math.floor(mappingState.offset / mappingState.limit) + 1);
+  elements.userMappingsPageLabel.textContent = `${currentPage} / ${pageCount}`;
+  elements.userMappingsPrevButton.disabled = mappingState.offset <= 0;
+  elements.userMappingsNextButton.disabled =
+    mappingState.offset + mappingState.limit >= mappingState.total;
+}
+
+function getUserMappingInput(userId) {
+  return Array.from(
+    elements.userMappingsTableBody.querySelectorAll('[data-identity-user-id]'),
+  ).find((item) => item.dataset.identityUserId === userId);
+}
+
+async function saveUserMapping(userId) {
+  const input = getUserMappingInput(userId);
+  if (!input) {
+    return;
+  }
+  const onebotId = String(input.value || '').trim();
+  if (!/^\d{11}$/.test(onebotId)) {
+    throw new Error('OneBot ID 必须是 11 位数字');
+  }
+  const revision = Number(input.dataset.identityRevision || 0);
+  const result = await requestJson(
+    `/api/bots/${encodeURIComponent(state.userMappings.botId)}/user-mappings/${encodeURIComponent(userId)}`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({
+        onebot_id: onebotId,
+        revision,
+      }),
+    },
+  );
+  if ((result.restart_errors || []).length > 0) {
+    showToast('映射已保存，但部分 bot 自动重启失败，请查看猫猫日志。', 'error');
+  } else {
+    showToast('用户 OneBot ID 已保存，相关运行中 bot 已安全重启。', 'success');
+  }
+  await loadData();
+  await loadUserMappings();
+}
+
+async function deleteUserMapping(userId, label = '') {
+  const input = getUserMappingInput(userId);
+  if (!input) {
+    return;
+  }
+  const revision = Number(input.dataset.identityRevision || 0);
+  const displayName = String(label || userId || '').trim();
+  const confirmed = window.confirm(
+    `确认删除映射「${displayName}」吗？\n\n这会删除该用户在当前 server 范围内的共享映射，并重启相关 bot，方便后续重新建映射测试。`,
+  );
+  if (!confirmed) {
+    return;
+  }
+  if (state.userMappings.items.length === 1 && state.userMappings.offset > 0) {
+    state.userMappings.offset = Math.max(0, state.userMappings.offset - state.userMappings.limit);
+  }
+  const result = await requestJson(
+    `/api/bots/${encodeURIComponent(state.userMappings.botId)}/user-mappings/${encodeURIComponent(userId)}`,
+    {
+      method: 'DELETE',
+      body: JSON.stringify({
+        revision,
+      }),
+    },
+  );
+  if ((result.restart_errors || []).length > 0) {
+    showToast('映射已删除，但部分 bot 自动重启失败，请查看猫猫日志。', 'error');
+  } else {
+    showToast('用户映射已删除，相关运行中 bot 已安全重启。', 'success');
+  }
+  await loadData();
+  await loadUserMappings();
 }
 
 async function loadData() {
@@ -3700,6 +3914,90 @@ for (const button of elements.navButtons) {
     elements.pluginUninstallCancelButton?.addEventListener('click', closePluginUninstallModal);
 elements.closeModalButton?.addEventListener('click', closeModal);
 elements.cancelButton?.addEventListener('click', closeModal);
+elements.openUserMappingsButton?.addEventListener('click', async () => {
+  try {
+    await openUserMappings(elements.openUserMappingsButton.dataset.botId || '');
+  } catch (error) {
+    showToast(error.message || '用户映射加载失败', 'error');
+  }
+});
+elements.userMappingsCloseButton?.addEventListener('click', closeUserMappings);
+elements.userMappingsDoneButton?.addEventListener('click', closeUserMappings);
+elements.userMappingsSearchButton?.addEventListener('click', async () => {
+  state.userMappings.search = String(elements.userMappingsSearchInput?.value || '').trim();
+  state.userMappings.offset = 0;
+  try {
+    await loadUserMappings();
+  } catch (error) {
+    showToast(error.message || '用户映射搜索失败', 'error');
+  }
+});
+elements.userMappingsSearchInput?.addEventListener('keydown', async (event) => {
+  if (event.key !== 'Enter') {
+    return;
+  }
+  event.preventDefault();
+  elements.userMappingsSearchButton?.click();
+});
+elements.userMappingsRefreshButton?.addEventListener('click', async () => {
+  const button = elements.userMappingsRefreshButton;
+  button.disabled = true;
+  try {
+    await loadUserMappings();
+    showToast('用户映射列表已刷新', 'success');
+  } catch (error) {
+    showToast(error.message || '用户映射刷新失败', 'error');
+  } finally {
+    button.disabled = false;
+  }
+});
+elements.userMappingsPrevButton?.addEventListener('click', async () => {
+  state.userMappings.offset = Math.max(
+    0,
+    state.userMappings.offset - state.userMappings.limit,
+  );
+  try {
+    await loadUserMappings();
+  } catch (error) {
+    showToast(error.message || '用户映射翻页失败', 'error');
+  }
+});
+elements.userMappingsNextButton?.addEventListener('click', async () => {
+  state.userMappings.offset += state.userMappings.limit;
+  try {
+    await loadUserMappings();
+  } catch (error) {
+    state.userMappings.offset = Math.max(
+      0,
+      state.userMappings.offset - state.userMappings.limit,
+    );
+    showToast(error.message || '用户映射翻页失败', 'error');
+  }
+});
+elements.userMappingsTableBody?.addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-identity-save], [data-identity-delete]');
+  if (!button) {
+    return;
+  }
+  button.disabled = true;
+  try {
+    if (button.dataset.identityDelete) {
+      await deleteUserMapping(
+        button.dataset.identityDelete || '',
+        button.dataset.identityLabel || '',
+      );
+    } else {
+      await saveUserMapping(button.dataset.identitySave || '');
+    }
+  } catch (error) {
+    showToast(
+      error.message || (button.dataset.identityDelete ? '用户映射删除失败' : '用户映射保存失败'),
+      'error',
+    );
+  } finally {
+    button.disabled = false;
+  }
+});
 elements.filePreviewCloseButton?.addEventListener('click', closeFilePreviewModal);
 elements.filePreviewCancelButton?.addEventListener('click', closeFilePreviewModal);
 elements.fileImageViewerCloseButton?.addEventListener('click', closeFileImageViewer);
@@ -3946,6 +4244,11 @@ elements.pluginUninstallModal?.addEventListener('click', (event) => {
     closePluginUninstallModal();
   }
 });
+elements.userMappingsModal?.addEventListener('click', (event) => {
+  if (event.target === elements.userMappingsModal) {
+    closeUserMappings();
+  }
+});
 elements.filePreviewModal?.addEventListener('click', (event) => {
   if (event.target === elements.filePreviewModal) {
     closeFilePreviewModal();
@@ -4146,6 +4449,7 @@ window.addEventListener('keydown', (event) => {
   }
   if (event.key === 'Escape') {
     closeModal();
+    closeUserMappings();
     closePluginModal();
     closePluginUninstallModal();
     closeFileImageViewer();

@@ -84,8 +84,12 @@ class OneBotActionHandler:
                 return _failed("当前没有启用可处理 set_msg_emoji_like 的 RocketCat 插件", retcode=1404)
             if action == "get_login_info":
                 return _ok({"user_id": self._config.onebot_self_id, "nickname": self._rocketchat.bot_username or self._config.username})
-            if action in {"send_group_forward_msg", "send_private_forward_msg"}:
-                return _failed("v1 暂不支持合并转发消息")
+            if action in {
+                "get_forward_msg",
+                "send_group_forward_msg",
+                "send_private_forward_msg",
+            }:
+                return _failed("当前版本暂不支持合并转发消息", retcode=1404)
             return _failed(f"未实现的 OneBot 动作: {action}", retcode=1404)
         except Exception as exc:
             return _failed(str(exc), retcode=1500)
@@ -199,9 +203,12 @@ class OneBotActionHandler:
         return True
 
     async def _handle_get_msg(self, params: dict[str, Any]) -> dict[str, Any]:
-        event = await self._inbound.hydrate(params.get("message_id"))
+        message_id = params.get("message_id")
+        if message_id is None:
+            message_id = params.get("id")
+        event = await self._inbound.hydrate(message_id)
         if not event:
-            return _failed(f"找不到消息: {params.get('message_id')}", retcode=1404)
+            return _failed(f"找不到消息: {message_id}", retcode=1404)
         return _ok(event)
 
     async def _handle_get_group_info(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -271,7 +278,9 @@ class OneBotActionHandler:
         if str(user_id) == str(self._config.onebot_self_id):
             resolved_user_id = self._config.onebot_self_id
         else:
-            resolved_user_id = (await self._id_map.get_or_create("user", user_source_id)).surrogate_id
+            resolved_user_id = (
+                await self._ensure_user_mapping(user_source_id, user_info)
+            ).surrogate_id
         return _ok(
             {
                 "user_id": resolved_user_id,
@@ -309,7 +318,7 @@ class OneBotActionHandler:
         cached: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         user_info = cached or await self._rocketchat.get_user_info(user_source_id)
-        mapping = await self._id_map.get_or_create("user", user_source_id)
+        mapping = await self._ensure_user_mapping(user_source_id, user_info)
         role = self._pick_member_role(user_info)
         reported_group_id = group_id
         if reported_group_id is None:
@@ -331,6 +340,22 @@ class OneBotActionHandler:
             "title_expire_time": 0,
             "card_changeable": False,
         }
+
+    async def _ensure_user_mapping(
+        self,
+        user_source_id: str,
+        user_info: dict[str, Any] | None = None,
+    ):
+        profile = user_info or {}
+        ensure_user = getattr(self._id_map, "ensure_user", None)
+        if callable(ensure_user):
+            return await ensure_user(
+                user_source_id,
+                username=str(profile.get("username") or ""),
+                nickname=str(profile.get("name") or profile.get("nickname") or ""),
+                is_bot=str(user_source_id) == str(self._rocketchat.user_id or ""),
+            )
+        return await self._id_map.get_or_create("user", user_source_id)
 
     def _pick_member_role(self, user_info: dict[str, Any]) -> str:
         roles = user_info.get("roles")

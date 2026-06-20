@@ -18,6 +18,11 @@ from .storage import ContextRoomStore, MessageStore, PrivateRoomStore
 
 class InboundTranslator:
     _QUOTE_PATTERN = re.compile(r"\[[^\]]*\]\(([^)]*msg=[^)]*)\)|(https?://\S*msg=\S+)", re.IGNORECASE)
+    _E2EE_QUOTE_PREFIX_LINE_PATTERN = re.compile(
+        r"[ \t]*\[[ \t]*\]\((?P<url>https?://[^)\r\n]*[?&]msg=[^)\r\n]+)\)"
+        r"[ \t]*(?:\r?\n|$)",
+        re.IGNORECASE,
+    )
     _MAX_QUOTE_DEPTH = 2
 
     def __init__(
@@ -46,9 +51,31 @@ class InboundTranslator:
 
         quote_contexts_task: asyncio.Task[list[dict[str, Any]]] | None = None
         reply_source_id: str | None = None
+        multi_reply_source_ids: list[str] = []
+        multi_reply_ids: list[int] = []
+        multi_quote_nodes: list[dict[str, Any]] = []
+        multi_quote_fallbacks: list[bool] = []
         cleaned_text = str(raw_msg.get("msg") or "")
+        top_level_quotes = self._extract_top_level_quote_attachments(raw_msg)
+        e2ee_prefix_quotes, e2ee_cleaned_text = self._extract_e2ee_multi_quote_prefix(
+            raw_msg
+        )
+        uses_e2ee_prefix_quotes = (
+            len(top_level_quotes) < 2 and len(e2ee_prefix_quotes) >= 2
+        )
+        if uses_e2ee_prefix_quotes:
+            top_level_quotes = e2ee_prefix_quotes
+        is_multi_quote = len(top_level_quotes) >= 2
+        if is_multi_quote:
+            multi_reply_source_ids = [source_id for _attachment, source_id in top_level_quotes]
         may_have_quote_contexts = self._may_have_quote_contexts(raw_msg)
-        if may_have_quote_contexts:
+        if is_multi_quote:
+            cleaned_text = (
+                e2ee_cleaned_text
+                if uses_e2ee_prefix_quotes
+                else self._QUOTE_PATTERN.sub("", cleaned_text).strip()
+            )
+        elif may_have_quote_contexts:
             reply_source_id, cleaned_text = self._extract_reply_source_id(raw_msg)
             quote_contexts_task = asyncio.create_task(
                 self._build_quote_contexts(
@@ -64,7 +91,19 @@ class InboundTranslator:
                 room_type = str(room_info.get("t") or "c")
             with perf_stage(perf_trace, "mapping_alloc"):
                 room_mapping = await self._get_or_create_mapping("room", room_id, batch=runtime_batch)
-                sender_mapping = await self._get_or_create_mapping("user", sender_source_id, batch=runtime_batch)
+                sender_mapping = await self._ensure_user_mapping(
+                    sender_source_id,
+                    username=str(sender.get("username") or ""),
+                    nickname=str(sender.get("name") or ""),
+                )
+                if is_multi_quote:
+                    for quoted_source_id in multi_reply_source_ids:
+                        quoted_mapping = await self._get_or_create_mapping(
+                            "message",
+                            quoted_source_id,
+                            batch=runtime_batch,
+                        )
+                        multi_reply_ids.append(int(quoted_mapping.surrogate_id))
                 message_mapping = await self._get_or_create_mapping("message", source_message_id, batch=runtime_batch)
                 context_source_id = self._build_group_context_source_id(room_type, room_id)
                 context_surrogate_id = await self._resolve_context_surrogate_id(
@@ -110,7 +149,16 @@ class InboundTranslator:
                 )
             with perf_stage(perf_trace, "quote_contexts"):
                 quote_contexts = []
-                if quote_contexts_task is not None:
+                if is_multi_quote:
+                    (
+                        multi_quote_nodes,
+                        quote_contexts,
+                        multi_quote_fallbacks,
+                    ) = await self._build_multi_quote_snapshots(
+                        top_level_quotes,
+                        batch=runtime_batch,
+                    )
+                elif quote_contexts_task is not None:
                     quote_contexts = await quote_contexts_task
             with perf_stage(perf_trace, "mention_metadata"):
                 mention_metadata = await self._extract_mention_metadata(raw_msg, batch=runtime_batch)
@@ -123,14 +171,23 @@ class InboundTranslator:
                 current_media = await self._extract_context_media_descriptors(raw_msg)
             with perf_stage(perf_trace, "media_segments"):
                 media_segments = self._rocketchat.media.build_onebot_segments_from_descriptors(current_media)
-            quote_media_segments = self._build_quote_media_segments(
-                quote_contexts,
-                max_depth=self._MAX_QUOTE_DEPTH,
+            quote_media_segments = (
+                []
+                if is_multi_quote
+                else self._build_quote_media_segments(
+                    quote_contexts,
+                    max_depth=self._MAX_QUOTE_DEPTH,
+                )
             )
             quote_context_block = self._format_quote_context_block(quote_contexts)
 
             segments: list[dict] = []
-            if reply_source_id:
+            if multi_reply_ids:
+                segments.extend(
+                    {"type": "reply", "data": {"id": str(reply_id)}}
+                    for reply_id in multi_reply_ids
+                )
+            elif reply_source_id:
                 reply_mapping = await self._get_or_create_mapping(
                     "message",
                     reply_source_id,
@@ -195,6 +252,7 @@ class InboundTranslator:
                 "rocketchat_current_message_text": message_text,
                 "rocketchat_current_message_line": current_message_line,
                 "rocketchat_reply_source_id": reply_source_id,
+                "rocketchat_reply_source_ids": list(multi_reply_source_ids),
                 "rocketchat_reply_sender_name": str(direct_reply_context.get("sender_name") or ""),
                 "rocketchat_reply_message_text": str(direct_reply_context.get("text") or ""),
                 "rocketchat_room_source_id": room_id,
@@ -211,7 +269,18 @@ class InboundTranslator:
                 event["group_id"] = context_surrogate_id if context_surrogate_id is not None else room_mapping.surrogate_id
                 event["group_name"] = room_name
 
-            if quote_contexts:
+            if is_multi_quote:
+                logger.info(
+                    self._format_inbound_multi_quote_log(
+                        room_context_label=room_context_label,
+                        sender_name=sender_name,
+                        sender_surrogate_id=sender_mapping.surrogate_id,
+                        current_message_line=current_message_line,
+                        reply_ids=multi_reply_ids,
+                        quote_contexts=quote_contexts,
+                    )
+                )
+            elif quote_contexts:
                 logger.info(
                     self._format_inbound_quote_log(
                         room_context_label=room_context_label,
@@ -232,6 +301,40 @@ class InboundTranslator:
                 )
 
             with perf_stage(perf_trace, "message_store"):
+                if is_multi_quote:
+                    for (
+                        (_attachment, quoted_source_id),
+                        quoted_surrogate_id,
+                        node,
+                        context,
+                        used_attachment_snapshot,
+                    ) in zip(
+                        top_level_quotes,
+                        multi_reply_ids,
+                        multi_quote_nodes,
+                        quote_contexts,
+                        multi_quote_fallbacks,
+                        strict=True,
+                    ):
+                        if not used_attachment_snapshot:
+                            continue
+                        await self._put_multi_quote_fallback_entry(
+                            source_id=quoted_source_id,
+                            surrogate_id=quoted_surrogate_id,
+                            node=node,
+                            context=context,
+                            room_source_id=room_id,
+                            room_surrogate_id=room_mapping.surrogate_id,
+                            room_type=room_type,
+                            room_name=room_name,
+                            room_slug=room_slug,
+                            room_label=room_context_label,
+                            context_source_id=context_source_id,
+                            context_surrogate_id=context_surrogate_id,
+                            group_id=event.get("group_id"),
+                            group_name=event.get("group_name"),
+                            batch=runtime_batch,
+                        )
                 await self._put_message_entry(
                     {
                         "source_id": source_message_id,
@@ -259,6 +362,7 @@ class InboundTranslator:
                         "raw_message": combined_raw_message,
                         "self_id": self._self_id,
                         "reply_source_id": reply_source_id,
+                        "reply_source_ids": list(multi_reply_source_ids),
                         "quote_media_segments": quote_media_segments,
                         "current_message_line": current_message_line,
                         "room_label": room_context_label,
@@ -278,7 +382,15 @@ class InboundTranslator:
         cached = await self._messages.get_by_surrogate(surrogate_message_id)
         cached_event = self._extract_cached_event(cached)
         source_id = str(cached.get("source_id") or "") if isinstance(cached, dict) else ""
-        if cached_event and not self._should_refresh_cached_reply_message(cached):
+        cached_media_ready = bool(
+            cached_event
+            and self._rocketchat.media.prepare_cached_onebot_event_media(cached_event)
+        )
+        if (
+            cached_event
+            and cached_media_ready
+            and not self._should_refresh_cached_reply_message(cached)
+        ):
             return cached_event
 
         if not source_id:
@@ -361,6 +473,11 @@ class InboundTranslator:
                 )
             ),
             "rocketchat_reply_source_id": str(entry.get("reply_source_id") or ""),
+            "rocketchat_reply_source_ids": [
+                str(source_id)
+                for source_id in (entry.get("reply_source_ids") or [])
+                if str(source_id)
+            ],
             "rocketchat_reply_sender_name": str(
                 entry.get("reply_sender_name") or direct_reply_context.get("sender_name") or ""
             ),
@@ -392,10 +509,15 @@ class InboundTranslator:
             return True
         if cached.get("reply_source_id"):
             return True
+        if cached.get("reply_source_ids"):
+            return True
         event = cached.get("onebot_message")
         if not isinstance(event, dict):
             return False
-        return bool(event.get("rocketchat_reply_source_id"))
+        return bool(
+            event.get("rocketchat_reply_source_id")
+            or event.get("rocketchat_reply_source_ids")
+        )
 
     def _begin_runtime_batch(self) -> Any | None:
         begin_batch = getattr(self._id_map, "begin_batch", None)
@@ -421,11 +543,33 @@ class InboundTranslator:
             return
 
     async def _get_or_create_mapping(self, namespace: str, source_id: str, *, batch: Any = None) -> Any:
+        # User identities live in the server-scoped SQLite registry. They must
+        # not enter the per-bot hot-state mutation batch.
+        if namespace == "user":
+            return await self._id_map.get_or_create(namespace, source_id)
         if batch is not None:
             getter = getattr(batch, "get_or_create_mapping", None)
             if callable(getter):
                 return getter(namespace, source_id)
         return await self._id_map.get_or_create(namespace, source_id)
+
+    async def _ensure_user_mapping(
+        self,
+        user_id: str,
+        *,
+        username: str = "",
+        nickname: str = "",
+        is_bot: bool = False,
+    ) -> Any:
+        ensure_user = getattr(self._id_map, "ensure_user", None)
+        if callable(ensure_user):
+            return await ensure_user(
+                user_id,
+                username=username,
+                nickname=nickname,
+                is_bot=is_bot,
+            )
+        return await self._id_map.get_or_create("user", user_id)
 
     async def _bind_private_room(
         self,
@@ -457,6 +601,81 @@ class InboundTranslator:
                 putter(entry)
                 return
         await self._messages.put(entry)
+
+    async def _put_multi_quote_fallback_entry(
+        self,
+        *,
+        source_id: str,
+        surrogate_id: int,
+        node: dict[str, Any],
+        context: dict[str, Any],
+        room_source_id: str,
+        room_surrogate_id: int,
+        room_type: str,
+        room_name: str,
+        room_slug: str,
+        room_label: str,
+        context_source_id: str,
+        context_surrogate_id: int | None,
+        group_id: int | None,
+        group_name: str | None,
+        batch: Any = None,
+    ) -> None:
+        sender = node.get("sender") if isinstance(node.get("sender"), dict) else {}
+        sender_surrogate_id = int(sender.get("user_id") or 0)
+        sender_name = str(
+            sender.get("nickname")
+            or context.get("sender_name")
+            or context.get("sender_source_id")
+            or source_id
+        )
+        message_text = str(context.get("text") or "")
+        media = context.get("media") if isinstance(context.get("media"), list) else []
+        current_message_line = self._format_current_message_line(
+            room_context_label=room_label,
+            sender_name=sender_name,
+            message_text=message_text,
+            mention_names=[],
+            media=media,
+        )
+        await self._put_message_entry(
+            {
+                "source_id": source_id,
+                "surrogate_id": int(surrogate_id),
+                "room_source_id": room_source_id,
+                "room_surrogate_id": int(room_surrogate_id),
+                "room_type": room_type,
+                "room_name": room_name,
+                "room_slug": room_slug,
+                "room_label": room_label,
+                "context_source_id": context_source_id,
+                "context_surrogate_id": context_surrogate_id,
+                "sender_source_id": str(context.get("sender_source_id") or ""),
+                "sender_surrogate_id": sender_surrogate_id,
+                "sender_name": sender_name,
+                "sender_username": "",
+                "mention_metadata": [],
+                "input_text": message_text,
+                "text": message_text,
+                "quote_contexts": [],
+                "quote_context_text": "",
+                "reply_sender_name": "",
+                "reply_message_text": "",
+                "timestamp": int(node.get("time") or time.time()),
+                "onebot_message_segments": deepcopy(node.get("message") or []),
+                "raw_message": message_text,
+                "self_id": self._self_id,
+                "reply_source_id": None,
+                "reply_source_ids": [],
+                "quote_media_segments": [],
+                "current_message_line": current_message_line,
+                "group_id": group_id,
+                "group_name": group_name,
+                "thread_source_id": "",
+                "multi_quote_snapshot_fallback": True,
+            },
+            batch=batch,
+        )
 
     async def _build_mention_segments(self, raw_msg: dict, text: str, *, batch: Any = None) -> tuple[list[dict], str]:
         mentions = raw_msg.get("mentions")
@@ -517,7 +736,11 @@ class InboundTranslator:
         if str(mention_id) == str(self._rocketchat.user_id):
             mention_qq = str(self._self_id)
         else:
-            mapping = await self._get_or_create_mapping("user", str(mention_id), batch=batch)
+            mapping = await self._ensure_user_mapping(
+                str(mention_id),
+                username=str(username or ""),
+                nickname=str(name or ""),
+            )
             mention_qq = str(mapping.surrogate_id)
         return {"type": "at", "data": {"qq": mention_qq, "name": name}}
 
@@ -565,6 +788,199 @@ class InboundTranslator:
             if self._payload_has_quote_attachment(attachment):
                 return True
         return False
+
+    def _extract_top_level_quote_attachments(
+        self,
+        payload: dict[str, Any],
+    ) -> list[tuple[dict[str, Any], str]]:
+        attachments = payload.get("attachments")
+        if isinstance(attachments, dict):
+            attachments = [attachments]
+        if not isinstance(attachments, list):
+            return []
+
+        result: list[tuple[dict[str, Any], str]] = []
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            source_id = self._extract_message_id_from_url(
+                str(attachment.get("message_link") or "")
+            )
+            if source_id:
+                result.append((attachment, source_id))
+        return result
+
+    def _extract_e2ee_multi_quote_prefix(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[list[tuple[dict[str, Any], str]], str]:
+        if str(payload.get("e2e") or "").lower() != "done":
+            return [], str(payload.get("msg") or "")
+
+        text = str(payload.get("msg") or "")
+        offset = 0
+        result: list[tuple[dict[str, Any], str]] = []
+        while offset < len(text):
+            match = self._E2EE_QUOTE_PREFIX_LINE_PATTERN.match(text, offset)
+            if match is None:
+                break
+            message_link = str(match.group("url") or "")
+            source_id = self._extract_message_id_from_url(message_link)
+            if not source_id:
+                break
+            result.append(
+                (
+                    {
+                        "message_link": message_link,
+                        "_rocketcat_e2ee_quote_prefix": True,
+                    },
+                    source_id,
+                )
+            )
+            offset = match.end()
+
+        if len(result) < 2:
+            return [], text
+        return result, text[offset:].lstrip("\r\n").strip()
+
+    async def _build_multi_quote_snapshots(
+        self,
+        quote_attachments: list[tuple[dict[str, Any], str]],
+        *,
+        batch: Any = None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[bool]]:
+        fetched_messages = await asyncio.gather(
+            *[
+                self._fetch_multi_quote_source_message(source_id)
+                for _attachment, source_id in quote_attachments
+            ]
+        )
+        nodes: list[dict[str, Any]] = []
+        contexts: list[dict[str, Any]] = []
+        fallbacks: list[bool] = []
+        for (attachment, source_id), fetched_message in zip(
+            quote_attachments,
+            fetched_messages,
+            strict=True,
+        ):
+            used_attachment_snapshot = not (
+                isinstance(fetched_message, dict) and fetched_message
+            )
+            payload = (
+                fetched_message
+                if not used_attachment_snapshot
+                else attachment
+            )
+            try:
+                node, context = await self._build_multi_quote_snapshot(
+                    payload,
+                    source_id,
+                    batch=batch,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[RocketChatOneBotBridge] build native reply snapshot failed; using placeholder | "
+                    "source_message_id=%s error=%r",
+                    source_id,
+                    exc,
+                )
+                sender_name = self._extract_context_sender_name(payload)
+                node = self._build_multi_quote_placeholder(sender_name)
+                context = {
+                    "depth": 1,
+                    "source_id": source_id,
+                    "sender_source_id": "",
+                    "sender_surrogate_id": 0,
+                    "sender_name": sender_name,
+                    "text": "[引用消息内容无法解析]",
+                    "media": [],
+                }
+            nodes.append(node)
+            contexts.append(context)
+            fallbacks.append(used_attachment_snapshot)
+        return nodes, contexts, fallbacks
+
+    async def _fetch_multi_quote_source_message(self, source_id: str) -> dict[str, Any] | None:
+        try:
+            return await self._rocketchat.fetch_message_by_id(source_id)
+        except Exception as exc:
+            logger.warning(
+                "[RocketChatOneBotBridge] fetch quoted message for native reply failed; "
+                "using attachment snapshot | source_message_id=%s error=%r",
+                source_id,
+                exc,
+            )
+            return None
+
+    async def _build_multi_quote_snapshot(
+        self,
+        payload: dict[str, Any],
+        source_id: str,
+        *,
+        batch: Any = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        sender_name = self._extract_context_sender_name(payload)
+        sender_source_id = self._extract_context_sender_source_id(payload)
+        sender_surrogate_id = 0
+        if sender_source_id:
+            if sender_source_id == str(self._rocketchat.user_id or ""):
+                sender_surrogate_id = self._self_id
+            else:
+                payload_sender = payload.get("u") if isinstance(payload.get("u"), dict) else {}
+                sender_mapping = await self._ensure_user_mapping(
+                    sender_source_id,
+                    username=str(payload_sender.get("username") or ""),
+                    nickname=str(payload_sender.get("name") or sender_name or ""),
+                )
+                sender_surrogate_id = int(sender_mapping.surrogate_id)
+
+        media = await self._extract_context_media_descriptors(payload)
+        message_segments = self._build_text_segments(self._clean_quote_text(payload))
+        message_segments.extend(
+            self._rocketchat.media.build_onebot_segments_from_descriptors(media)
+        )
+        if not message_segments:
+            logger.warning(
+                "[RocketChatOneBotBridge] quoted message has no supported content; "
+                "using placeholder | source_message_id=%s",
+                source_id,
+            )
+            message_segments = [
+                {"type": "text", "data": {"text": "[引用消息内容无法解析]"}}
+            ]
+
+        node = {
+            "sender": {
+                "user_id": sender_surrogate_id,
+                "nickname": sender_name,
+                "card": sender_name,
+            },
+            "time": self._extract_timestamp(payload),
+            "message": message_segments,
+        }
+        context = {
+            "depth": 1,
+            "source_id": source_id,
+            "sender_source_id": sender_source_id,
+            "sender_surrogate_id": sender_surrogate_id,
+            "sender_name": sender_name,
+            "text": self._clean_quote_text(payload),
+            "media": media,
+        }
+        return node, context
+
+    @staticmethod
+    def _build_multi_quote_placeholder(sender_name: str) -> dict[str, Any]:
+        message = [{"type": "text", "data": {"text": "[引用消息内容无法解析]"}}]
+        return {
+            "sender": {
+                "user_id": 0,
+                "nickname": sender_name,
+                "card": sender_name,
+            },
+            "time": int(time.time()),
+            "message": message,
+        }
 
     def _extract_reply_source_id(self, raw_msg: dict) -> tuple[str | None, str]:
         text = str(raw_msg.get("msg") or "")
@@ -853,6 +1269,11 @@ class InboundTranslator:
             or "未知"
         )
 
+    @staticmethod
+    def _extract_context_sender_source_id(payload: dict[str, Any]) -> str:
+        sender = payload.get("u") if isinstance(payload.get("u"), dict) else {}
+        return str(sender.get("_id") or payload.get("author_id") or "").strip()
+
     def _clean_quote_text(self, payload: dict[str, Any]) -> str:
         text = str(payload.get("text") or payload.get("msg") or "")
         return self._QUOTE_PATTERN.sub("", text).strip()
@@ -919,6 +1340,37 @@ class InboundTranslator:
 
         lines.append("引用历史上下文：")
         lines.extend(self._format_quote_context_log_lines(quote_contexts))
+        return "\n".join(lines)
+
+    def _format_inbound_multi_quote_log(
+        self,
+        *,
+        room_context_label: str,
+        sender_name: str,
+        sender_surrogate_id: int | str,
+        current_message_line: str,
+        reply_ids: list[int],
+        quote_contexts: list[dict[str, Any]],
+    ) -> str:
+        lines = [
+            "[RocketChatOneBotBridge] 收到 Rocket.Chat 多引用消息",
+        ]
+        if room_context_label:
+            lines.append(f"来源房间：{room_context_label}")
+        lines.extend(
+            [
+                f"当前消息：{current_message_line}",
+                f"发送者映射：{sender_name}/{sender_surrogate_id}",
+                f"引用模式：{len(quote_contexts)} 条并列原生 Reply",
+                "引用内容（按 Rocket.Chat 选择顺序）：",
+            ]
+        )
+        for index, context in enumerate(quote_contexts, start=1):
+            reply_id = reply_ids[index - 1] if index <= len(reply_ids) else "未知"
+            lines.append(
+                f"  {index}. reply_id={reply_id} | "
+                f"{self._format_context_message_line(context)}"
+            )
         return "\n".join(lines)
 
     def _format_inbound_message_log(

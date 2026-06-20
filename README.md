@@ -7,15 +7,35 @@
 
 本项目的目标不是继续做一个“宿主里的桥接插件”，而是把 RocketCat 发展成一套真正独立的 `Rocket.Chat <-> OneBot v11` 桥接软件。
 
-这个 live 目录对应的是 RocketCatShell 的 Linux / Docker 迁移版：核心功能现已与 Windows `v0.1.8` rebuild 对齐，同时保留容器初始化、外部挂载目录、内置插件自动补种，以及 Docker 专属共享媒体路径翻译 / Base64 兼容策略等 docker 化包装层。
+这个 live 目录对应的是 RocketCatShell 的 Linux / Docker 迁移版：核心功能现已与 Windows `v0.1.9` 对齐，同时保留容器初始化、外部挂载目录、内置插件自动补种、Linux PTY，以及 Docker 专属共享媒体路径翻译 / Base64 兼容策略等 docker 化包装层。
 
-> 当前 README 对应版本为 `v0.1.8`。`v0.1.3` 是破坏性架构重构基线，`v0.1.4` 统一收口性能优化，`v0.1.5` 补齐了内置指令与运维增强，`v0.1.6` 推进运行诊断可观测性和入站热路径性能收口，`v0.1.7` 开始补齐面向 Docker 迁移的内置文件管理能力，而 `v0.1.8` 引入 NapCat 风格 WebUI 系统终端并优化媒体上传策略。
+> 当前 README 对应版本为 `v0.1.9`。`v0.1.3` 是破坏性架构重构基线，`v0.1.4` 统一收口性能优化，`v0.1.5` 补齐了内置指令与运维增强，`v0.1.6` 推进运行诊断可观测性和入站热路径性能收口，`v0.1.7` 开始补齐面向 Docker 迁移的内置文件管理能力，`v0.1.8` 引入 NapCat 风格 WebUI 系统终端，而 `v0.1.9` 完善多引用、用户身份映射及 Rocket.Chat 7.10–8.5 兼容，并从本版本开始发布 `linux/amd64` 与 `linux/arm64` 镜像。
 
 这意味着：
 
 - RocketCatShell 自己拥有 `config/`、`data/`、`logs/` 目录边界。
 - RocketCatShell 自己提供本地 WebUI、登录认证、Bot 管理、插件管理、项目根目录内文件管理和系统终端。
 - RocketCatShell 仍然可以作为 OneBot reverse WebSocket 客户端与 AstrBot 协同，但不再依赖 AstrBot 插件宿主才能运行。
+
+---
+
+## v0.1.9（多引用、用户身份与多架构更新）
+
+`v0.1.9` 将 Windows 版已经实地验证的多引用和用户身份重构迁移到 Linux / Docker，同时保留容器环境的媒体共享、Linux PTY 和持久化边界。
+
+- 非加密频道仅当当前消息包含两个及以上顶层 `attachments[*].message_link` 时进入多引用模式；正文中普通粘贴的多个消息链接不会被误判。
+- E2EE 频道会额外检查解密正文开头连续的空标签 Markdown 消息链接。仅在 `e2e=done` 且连续命中两条及以上引用时，才按原顺序归一化为多个顶层 OneBot `reply`，并剥离系统引用前缀。
+- 多个 `reply` 会被 AstrBot 分别解析为独立 `Reply.chain`，引用顺序、重复引用、文本、图片以及 `get_msg` 恢复行为均会保留。
+- 用户身份映射改为服务器级 `sha256-linear-v1` 确定性 11 位 ID。映射保存于 `/app/data/user_identity/*.sqlite3`，同服多个 RocketCat bot 共享映射和人工 override。
+- Bot 的 OneBot `self_id` 由登录账号不可变的 Rocket.Chat `userId` 自动生成；Bot 配置不再保存手工填写的 `onebot_self_id`，Shell 配置也不再使用 `next_onebot_self_id`。
+- WebUI 增加醒目的 User 映射入口以及映射搜索、刷新、保存、冲突高亮和删除重建操作。覆盖和删除使用 revision 校验，防止用旧页面覆盖新数据。
+- 哈希冲突会持久化到每个相关 Bot 的 `re_waring.json`，并在对应 Bot 每次加载时重新输出详细 warning。
+- Rocket.Chat 支持范围明确为 `7.10.x–8.5.x`：DDP 继续承担 resume 和订阅，业务 method 优先走 REST；8.x 固定使用 `rooms.media` + `rooms.mediaConfirm`，7.10 仅在现代端点明确不存在时回退旧上传接口。
+- E2EE 媒体、历史消息媒体和生图参考图继续使用 Docker 共享媒体目录；关闭 Base64 模式时翻译为宿主机可见路径，开启时使用 `base64://`，不会向上游暴露容器内回环 HTTP 地址。
+- 新增独立持久化挂载 `/app/data/user_identity`。升级前必须备份 `config/`、`data/bots/` 和 AstrBot 管理员配置，再运行 `tools/migrate_user_identity.py` 迁移旧 ID。
+- Docker Hub 从本版本开始同时发布 `linux/amd64` 与 `linux/arm64`，固定版本标签为 `v0.1.9`，稳定滚动标签为 `latest`。
+
+升级后，旧版实验性 forward 缓存会自然淘汰；message、room、thread 和 context 等非用户映射继续从原 runtime snapshot / journal 恢复。用户映射必须完成一次 v0.1.8 → v0.1.9 迁移，避免 AstrBot 管理员 ID 和私聊绑定突然变化。
 
 ---
 
@@ -122,8 +142,26 @@
 - `Dockerfile` 会把 `tools/` 一并打进镜像，保证容器内和宿主机目录里的工具链一致。
 - `docker/entrypoint.sh` 仍负责容器首次启动时写入 `config/shell.json` 默认值，并对外挂 `data/plugins` 中的内置插件执行缺失补种与版本变更自动刷新；`rocketcat_plugin_built_in_command` 与 `rocketcat_plugin_adapt_iamthinking` 都会随镜像自动同步到外挂插件目录。
 - `docker-compose.yml`、`.env` 和 `.env.example` 已改为 Linux 风格的默认持久化路径 `/opt/rocketcatshell/...`，不再使用旧的 Windows `D:/docker/...` 示例。
+- 用户身份注册表使用独立挂载 `/app/data/user_identity`；默认宿主目录为 `/opt/rocketcatshell/data/user_identity`，必须与 `config/`、`data/bots/` 一起备份。
+- 从 v0.1.8 升级时，应先停止 RocketCatShell 与对应 OneBot 消费端并完成备份，再用 v0.1.9 镜像执行一次性迁移；下面的 AstrBot 配置挂载与参数可按实际路径调整：
+
+```bash
+docker run --rm \
+  -v /opt/rocketcatshell/config:/app/config \
+  -v /opt/rocketcatshell/data/bots:/app/data/bots \
+  -v /opt/rocketcatshell/data/user_identity:/app/data/user_identity \
+  -v /path/to/astrbot-config.json:/migration/astrbot-config.json \
+  138763327/rocketcatshell-linux:v0.1.9 \
+  python /app/tools/migrate_user_identity.py \
+    --project-root /app \
+    --bot-id bot_xxxxxxxx \
+    --astrbot-config /migration/astrbot-config.json
+```
+
+  迁移工具会备份 Bot 旧映射文件、建立服务器级 SQLite、重建私聊绑定、清理废弃 self ID 配置字段，并写出 `identity_scope.json` 与 `user_identity_migration.json`。只有迁移清单明确命中的旧 AstrBot 管理员 ID 才会被替换。
 - WebUI 文件管理边界是容器内 `/app`，宿主机目录只有通过 compose 挂载到 `/app/config`、`/app/data/...`、`/app/logs` 等路径后才可见；这个边界只用于文件管理，不会改变 `ROCKETCAT_SHARED_MEDIA_DIR` / `ROCKETCAT_SHARED_MEDIA_HOST_DIR` 的共享媒体路径翻译语义。
 - 共享媒体导出仍保留在 Docker 版里：默认继续使用 `ROCKETCAT_SHARED_MEDIA_HOST_DIR` 路径传输，把容器内共享媒体目录翻译为宿主机可见路径；只有在路径对上游不可见，或 AstrBot 与 RocketCatShell 同为 Docker、更适合直接传 Base64 时，才建议启用 `enable_base64_media_transport`，或在首次启动前把 `.env` 里的 `ROCKETCAT_DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT=true`。Base64 是兼容兜底，不是 Docker 版默认快路径。
+- 官方镜像自 `v0.1.9` 起同时支持 `linux/amd64` 和 `linux/arm64`；Docker 会根据宿主机架构自动选择对应 manifest。
 
 ---
 
@@ -262,7 +300,11 @@ RocketCatShell 当前这一版明确不承诺合并转发消息语义。
 
 - 启用了 `e2ee_password` 后，桥接器会初始化本机密钥对并请求 / 同步房间密钥。
 - 接收入站加密消息时，会自动解密再注入 OneBot 事件流。
-- 发送到加密房间时，会自动走加密消息体和加密媒体上传确认流程。
+- 发送到加密房间时，会自动走加密消息体和加密媒体上传确认流程；媒体上传会分块读取原文件并分块写出密文临时文件。
+- Rocket.Chat 8.2+ 删除加密附件时产生的 `removed-file` 标记会在解密合并后保留。
+- Rocket.Chat 8.3+ E2EE REST 接口启用严格请求校验后，只提交对应端点允许的字段。
+- E2EE 多引用会从解密正文开头的系统引用前缀生成多个顶层 OneBot `reply`，普通正文链接不会被误判。
+- E2EE 解密媒体会写入 Docker 共享媒体目录，再按设置转换为宿主机路径或 `base64://`，与非加密频道使用同一套上游可见性策略。
 - 如果 E2EE 初始化失败，不会影响未加密房间的正常收发。
 
 ---
@@ -427,6 +469,7 @@ RocketCatShell 在第一次安装、还没有保存过任何配置时，会自�
 - `config/plugins_config/`
 - `data/`
 - `data/bots/`
+- `data/user_identity/`
 - `data/plugins/`
 - `data/plugin_data/`
 - `logs/`
@@ -442,7 +485,7 @@ RocketCatShell 在第一次安装、还没有保存过任何配置时，会自�
 - Base64 媒体传输开关：`false`
 - 本机直接运行时默认 OneBot reverse WS 地址：`ws://127.0.0.1:6199/ws/`
 - Docker Compose / `docker/entrypoint.sh` 默认 OneBot reverse WS 地址：`ws://host.docker.internal:6200/ws/`
-- `next_onebot_self_id`：`910001`
+- Bot 的 OneBot `self_id` 会在登录 Rocket.Chat 后根据不可变 `userId` 自动生成。
 
 也就是说，只要依赖安装正确，RocketCatShell 在空配置状态下可以自己创建必需目录和初始配置文件。
 
@@ -503,7 +546,6 @@ http://127.0.0.1:5751/
 - 按需填写 E2EE 密钥密码
 - OneBot reverse WS 地址
 - OneBot Access Token
-- OneBot self_id
 
 高级设置中还可以进一步设置：
 
@@ -548,7 +590,6 @@ http://127.0.0.1:5751/
 | `default_remote_media_max_size` | 默认远端媒体上传 / 下载大小上限。 |
 | `default_skip_own_messages` | 默认是否忽略机器人自己的消息。 |
 | `default_debug` | 默认是否开启调试日志。 |
-| `next_onebot_self_id` | 下一个建议的 OneBot self_id。 |
 
 ### 单个 Bot 配置
 
@@ -565,7 +606,6 @@ http://127.0.0.1:5751/
 | `e2ee_password` | E2EE 私钥密码。 |
 | `onebot_ws_url` | OneBot reverse WebSocket 地址。 |
 | `onebot_access_token` | OneBot reverse WebSocket Token。 |
-| `onebot_self_id` | OneBot 机器人 ID，必须唯一。 |
 | `reconnect_delay` | 断线重连等待秒数。 |
 | `max_reconnect_attempts` | 最大重连次数；`0` 表示不限次数。 |
 | `enable_subchannel_session_isolation` | 是否按子频道隔离上下文。 |
@@ -589,6 +629,7 @@ config/
 
 data/
 	bots/
+	user_identity/
 	plugins/
 	plugin_data/
 
@@ -599,7 +640,8 @@ logs/
 说明：
 
 - `config/` 只保存配置和插件主配置。
-- `data/` 保存本地插件本体、插件持久化数据和各 Bot 运行时数据。
+- `data/` 保存本地插件本体、插件持久化数据、用户身份注册表和各 Bot 运行时数据。
+- `data/user_identity/*.sqlite3` 保存服务器级 `sha256-linear-v1` 用户映射；同服多个 Bot 会共享该数据库。
 - `data/bots/<bot>/runtime.snapshot.bin` 保存最近一次热存储快照，覆盖 ID 映射、消息缓存、私聊房间映射和群上下文绑定。
 - `data/bots/<bot>/runtime.journal.bin` 保存快照之后的增量变更，用于启动恢复和窗口整理后的状态回放。
 - Bot 运行时仍然会按目录划分，但桥接热路径以内存态为准，不再依赖旧版逐文件在线更新模式。

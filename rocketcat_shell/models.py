@@ -18,7 +18,6 @@ DEFAULT_PERF_TRACE_ENABLED = False
 DEFAULT_SKIP_OWN_MESSAGES = True
 DEFAULT_DEBUG = False
 DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT = False
-DEFAULT_START_SELF_ID = 910001
 
 
 def _coerce_bool(value: Any, default: bool = False) -> bool:
@@ -81,7 +80,6 @@ class ShellSettings:
     default_skip_own_messages: bool = DEFAULT_SKIP_OWN_MESSAGES
     default_debug: bool = DEFAULT_DEBUG
     enable_base64_media_transport: bool = DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT
-    next_onebot_self_id: int = DEFAULT_START_SELF_ID
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any] | None) -> "ShellSettings":
@@ -126,10 +124,6 @@ class ShellSettings:
                 data.get("enable_base64_media_transport", DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT),
                 DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT,
             ),
-            next_onebot_self_id=_coerce_int(
-                data.get("next_onebot_self_id", DEFAULT_START_SELF_ID),
-                DEFAULT_START_SELF_ID,
-            ),
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -149,7 +143,6 @@ class ShellSettings:
             "default_skip_own_messages": self.default_skip_own_messages,
             "default_debug": self.default_debug,
             "enable_base64_media_transport": self.enable_base64_media_transport,
-            "next_onebot_self_id": self.next_onebot_self_id,
         }
 
 
@@ -192,7 +185,7 @@ class BotRecord:
             e2ee_password=str(data.get("e2ee_password", "") or ""),
             onebot_ws_url=str(data.get("onebot_ws_url", defaults.default_onebot_ws_url) or defaults.default_onebot_ws_url).strip(),
             onebot_access_token=str(data.get("onebot_access_token", defaults.default_onebot_access_token) or defaults.default_onebot_access_token),
-            onebot_self_id=_coerce_int(data.get("onebot_self_id", defaults.next_onebot_self_id), defaults.next_onebot_self_id),
+            onebot_self_id=0,
             reconnect_delay=_coerce_float(data.get("reconnect_delay", defaults.default_reconnect_delay), defaults.default_reconnect_delay),
             max_reconnect_attempts=_coerce_int(
                 data.get("max_reconnect_attempts", defaults.default_max_reconnect_attempts),
@@ -235,7 +228,6 @@ class BotRecord:
             "e2ee_password": self.e2ee_password,
             "onebot_ws_url": self.onebot_ws_url,
             "onebot_access_token": self.onebot_access_token,
-            "onebot_self_id": self.onebot_self_id,
             "reconnect_delay": self.reconnect_delay,
             "max_reconnect_attempts": self.max_reconnect_attempts,
             "enable_subchannel_session_isolation": self.enable_subchannel_session_isolation,
@@ -261,8 +253,6 @@ class BotRecord:
                 errors.append("enabled bot requires username")
             if not self.password:
                 errors.append("enabled bot requires password")
-            if self.onebot_self_id <= 0:
-                errors.append("enabled bot requires a positive onebot_self_id")
         if self.reconnect_delay < 0:
             errors.append("reconnect_delay must be >= 0")
         if self.max_reconnect_attempts < 0:

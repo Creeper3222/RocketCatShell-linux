@@ -6,7 +6,6 @@ from typing import Any, Mapping
 
 DEFAULT_SERVER_URL = "http://127.0.0.1:3000"
 DEFAULT_ONEBOT_WS_URL = "ws://127.0.0.1:6199/ws/"
-DEFAULT_ONEBOT_SELF_ID = 910001
 DEFAULT_RECONNECT_DELAY = 5.0
 DEFAULT_MAX_RECONNECT_ATTEMPTS = 10
 DEFAULT_ENABLE_SUBCHANNEL_SESSION_ISOLATION = True
@@ -84,7 +83,7 @@ class BridgeConfig:
             e2ee_password=str(data.get("e2ee_password", "") or ""),
             onebot_ws_url=str(data.get("onebot_ws_url", DEFAULT_ONEBOT_WS_URL) or DEFAULT_ONEBOT_WS_URL).strip(),
             onebot_access_token=str(data.get("onebot_access_token", "") or ""),
-            onebot_self_id=_coerce_int(data.get("onebot_self_id", DEFAULT_ONEBOT_SELF_ID), DEFAULT_ONEBOT_SELF_ID),
+            onebot_self_id=0,
             reconnect_delay=_coerce_float(data.get("reconnect_delay", DEFAULT_RECONNECT_DELAY), DEFAULT_RECONNECT_DELAY),
             max_reconnect_attempts=_coerce_int(
                 data.get("max_reconnect_attempts", DEFAULT_MAX_RECONNECT_ATTEMPTS),
@@ -123,7 +122,6 @@ class BridgeConfig:
             "e2ee_password": self.e2ee_password,
             "onebot_ws_url": self.onebot_ws_url,
             "onebot_access_token": self.onebot_access_token,
-            "onebot_self_id": self.onebot_self_id,
             "reconnect_delay": self.reconnect_delay,
             "max_reconnect_attempts": self.max_reconnect_attempts,
             "enable_subchannel_session_isolation": self.enable_subchannel_session_isolation,
@@ -148,8 +146,6 @@ class BridgeConfig:
                 errors.append("enabled=true 时 username 不能为空")
             if not self.password:
                 errors.append("enabled=true 时 password 不能为空")
-            if self.onebot_self_id <= 0:
-                errors.append("onebot_self_id 必须为正整数")
         if self.reconnect_delay < 0:
             errors.append("reconnect_delay 不能小于 0")
         if self.max_reconnect_attempts < 0:

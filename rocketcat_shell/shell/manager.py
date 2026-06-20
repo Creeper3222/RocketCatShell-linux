@@ -13,6 +13,7 @@ from ..__init__ import __version__
 from ..bridge.hot_storage import build_runtime_hot_stores
 from ..bridge.id_map import DurableIdMap
 from ..bridge.runtime import BridgeRuntime
+from ..bridge.user_identity import UserIdentityRegistry
 from ..diagnostics import build_runtime_diagnostic_item, collect_cached_host_diagnostics_with_meta
 from ..layout import ProjectLayout
 from ..logger import logger
@@ -46,10 +47,6 @@ class ShellManager:
         await self.plugin_manager.initialize()
         self.settings = load_or_create_shell_settings(self.layout.shell_settings_path)
         self.bots = self.registry.load(defaults=self.settings)
-
-        suggested = self.registry.next_suggested_self_id(self.bots)
-        if self.settings.next_onebot_self_id < suggested:
-            self.settings.next_onebot_self_id = suggested
 
         self._persist_shell_settings()
         self.registry.save(self.bots)
@@ -113,7 +110,7 @@ class ShellManager:
                 "enabled_bot_count": sum(1 for bot in self.bots if bot.enabled),
                 "active_runtime_count": sum(1 for runtime in self.runtimes.values() if runtime.started),
                 "plugin_count": len(self.plugin_manager.list_plugins()),
-                "suggested_onebot_self_id": self.registry.next_suggested_self_id(self.bots),
+                "user_identity_algorithm": "sha256-linear-v1",
             },
             "shell_settings": self._serialize_shell_settings(settings, mask_secrets=True),
             "bots": [self._serialize_bot(bot, mask_secrets=True) for bot in self.bots],
@@ -381,7 +378,7 @@ class ShellManager:
             "independent_webui_actual_port": actual_port,
             "access_url": f"http://{host}:{actual_port}/",
             "main_bot_onebot_self_id": None,
-            "suggested_onebot_self_id": self.registry.next_suggested_self_id(self.bots),
+            "user_identity_algorithm": "sha256-linear-v1",
             "enabled_bot_count": enabled_count,
             "bot_count": len(self.bots),
             "items": items,
@@ -531,6 +528,119 @@ class ShellManager:
         await self._reconcile_runtimes("bot updated")
         return self._serialize_bot(candidate, mask_secrets=False)
 
+    async def list_user_mappings(
+        self,
+        bot_id: str,
+        *,
+        search: str = "",
+        offset: int = 0,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        bot = self._get_bot_or_raise(bot_id)
+        registry = self._identity_registry_for_bot(bot)
+        if registry is None:
+            return {
+                "ready": False,
+                "items": [],
+                "total": 0,
+                "offset": max(0, int(offset)),
+                "limit": max(1, min(200, int(limit))),
+                "bot_id": bot.bot_id,
+                "bot_name": bot.name or bot.bot_id,
+            }
+        payload = await registry.list_mappings(
+            bot_id=bot.bot_id,
+            search=search,
+            offset=offset,
+            limit=limit,
+        )
+        payload.update(
+            {
+                "ready": True,
+                "bot_id": bot.bot_id,
+                "bot_name": bot.name or bot.bot_id,
+            }
+        )
+        return payload
+
+    async def update_user_mapping(
+        self,
+        bot_id: str,
+        user_id: str,
+        *,
+        onebot_id: int | str,
+        revision: int,
+    ) -> dict[str, Any]:
+        bot = self._get_bot_or_raise(bot_id)
+        registry = self._identity_registry_for_bot(bot)
+        if registry is None:
+            raise ValueError("该 bot 尚未建立用户映射")
+        result = await registry.override_onebot_id(
+            bot_id=bot.bot_id,
+            user_id=user_id,
+            onebot_id=onebot_id,
+            revision=revision,
+        )
+        affected_bots, restart_errors = await self._finalize_identity_mapping_change(
+            registry,
+            user_id=user_id,
+            reason=f"user identity override: {user_id}",
+        )
+        result["restarted_bot_ids"] = [
+            item.bot_id for item in affected_bots if item.enabled
+        ]
+        result["restart_errors"] = restart_errors
+        return result
+
+    async def delete_user_mapping(
+        self,
+        bot_id: str,
+        user_id: str,
+        *,
+        revision: int,
+    ) -> dict[str, Any]:
+        bot = self._get_bot_or_raise(bot_id)
+        registry = self._identity_registry_for_bot(bot)
+        if registry is None:
+            raise ValueError("该 bot 尚未建立用户映射")
+        result = await registry.delete_mapping(
+            bot_id=bot.bot_id,
+            user_id=user_id,
+            revision=revision,
+        )
+        affected_bots, restart_errors = await self._finalize_identity_mapping_change(
+            registry,
+            user_id=user_id,
+            reason=f"user identity delete: {user_id}",
+        )
+        result["restarted_bot_ids"] = [
+            item.bot_id for item in affected_bots if item.enabled
+        ]
+        result["restart_errors"] = restart_errors
+        return result
+
+    async def _finalize_identity_mapping_change(
+        self,
+        registry: UserIdentityRegistry,
+        *,
+        user_id: str,
+        reason: str,
+    ) -> tuple[list[BotRecord], list[dict[str, str]]]:
+        affected_bots = self._bots_for_identity_database(registry.database_path)
+        for affected_bot in affected_bots:
+            runtime = self.runtimes.get(affected_bot.bot_id)
+            if runtime is not None and runtime.identity_registry is not None:
+                runtime.identity_registry.invalidate_cache(user_id)
+        await self._sync_identity_warning_files(
+            affected_bots,
+            registry.database_path,
+        )
+        restart_errors = await self._restart_bots_after_identity_change(
+            affected_bots,
+            reason=reason,
+        )
+        return affected_bots, restart_errors
+
     async def delete_bot(self, bot_id: str) -> None:
         async with self._lock:
             target_index = self._find_bot_index(bot_id)
@@ -586,6 +696,107 @@ class ShellManager:
                 return index
         return -1
 
+    def _get_bot_or_raise(self, bot_id: str) -> BotRecord:
+        index = self._find_bot_index(str(bot_id))
+        if index < 0:
+            raise KeyError(bot_id)
+        return self.bots[index]
+
+    def _identity_registry_for_bot(
+        self,
+        bot: BotRecord,
+    ) -> UserIdentityRegistry | None:
+        runtime = self.runtimes.get(bot.bot_id)
+        if runtime is not None and runtime.identity_registry is not None:
+            return runtime.identity_registry
+
+        scope_path = self.layout.bots_dir / bot.bot_id / "identity_scope.json"
+        payload = read_json(scope_path, {})
+        scope_key = str(payload.get("scope_key") or "").strip()
+        database_path_text = str(payload.get("database_path") or "").strip()
+        if not scope_key or not database_path_text:
+            return None
+        database_path = Path(database_path_text)
+        expected_root = (self.layout.data_dir / "user_identity").resolve()
+        try:
+            resolved_database_path = database_path.resolve()
+        except OSError:
+            return None
+        if expected_root not in resolved_database_path.parents:
+            raise ValueError("用户映射数据库路径超出允许目录")
+        if not resolved_database_path.exists():
+            return None
+        return UserIdentityRegistry(
+            resolved_database_path,
+            scope_key=scope_key,
+            bot_id=bot.bot_id,
+            warning_path=self.layout.bots_dir / bot.bot_id / "re_waring.json",
+        )
+
+    def _bots_for_identity_database(self, database_path: Path) -> list[BotRecord]:
+        target = database_path.resolve()
+        matched: list[BotRecord] = []
+        for bot in self.bots:
+            registry = self._identity_registry_for_bot(bot)
+            if registry is not None and registry.database_path.resolve() == target:
+                matched.append(bot)
+        return matched
+
+    async def _sync_identity_warning_files(
+        self,
+        bots: list[BotRecord],
+        database_path: Path,
+    ) -> None:
+        target = database_path.resolve()
+        for bot in bots:
+            registry = self._identity_registry_for_bot(bot)
+            if registry is None or registry.database_path.resolve() != target:
+                continue
+            await registry.sync_warning_file(
+                bot_id=bot.bot_id,
+                warning_path=self.layout.bots_dir / bot.bot_id / "re_waring.json",
+            )
+
+    async def _restart_bots_after_identity_change(
+        self,
+        bots: list[BotRecord],
+        *,
+        reason: str,
+    ) -> list[dict[str, str]]:
+        errors: list[dict[str, str]] = []
+        async with self._runtime_lock:
+            for bot in bots:
+                try:
+                    runtime = self.runtimes.get(bot.bot_id)
+                    if runtime is not None:
+                        if runtime._hot_store_bundle is not None:
+                            runtime._hot_store_bundle.state_engine.purge_legacy_user_dependent_state()
+                        await runtime.restart_connections(reason)
+                        continue
+                    data_dir = self.layout.bots_dir / bot.bot_id
+                    if not data_dir.exists():
+                        continue
+                    stores = build_runtime_hot_stores(
+                        data_dir,
+                        message_window_size=self._require_settings().message_index_max_entries,
+                    )
+                    try:
+                        stores.state_engine.purge_legacy_user_dependent_state()
+                    finally:
+                        stores.close()
+                except Exception as exc:
+                    logger.exception(
+                        "[RocketCatShell] user identity override 后重启失败 | bot_id=%s",
+                        bot.bot_id,
+                    )
+                    errors.append(
+                        {
+                            "bot_id": bot.bot_id,
+                            "error": repr(exc),
+                        }
+                    )
+        return errors
+
     def _serialize_bot(self, bot: BotRecord, *, mask_secrets: bool) -> dict[str, Any]:
         payload = bot.to_mapping()
         if mask_secrets:
@@ -595,6 +806,12 @@ class ShellManager:
         payload["data_dir"] = str(self.layout.bots_dir / bot.bot_id)
         runtime = self.runtimes.get(bot.bot_id)
         payload["runtime_active"] = bool(runtime and runtime.started)
+        payload["onebot_self_id"] = (
+            int(runtime.config.onebot_self_id)
+            if runtime is not None and runtime.config.onebot_self_id > 0
+            else self._read_persisted_self_id(bot.bot_id)
+        )
+        payload["user_mapping_ready"] = bool(payload["onebot_self_id"])
         return payload
 
     def _serialize_shell_settings(self, settings: ShellSettings, *, mask_secrets: bool) -> dict[str, Any]:
@@ -623,9 +840,6 @@ class ShellManager:
             if merged.get("e2ee_password") == "***":
                 merged["e2ee_password"] = existing.e2ee_password
 
-        if self._should_fill_default_self_id(payload):
-            merged["onebot_self_id"] = self.registry.next_suggested_self_id(self.bots)
-
         bot = BotRecord.from_mapping(merged, defaults=settings)
         if not bot.bot_id:
             bot.bot_id = self._generate_bot_id()
@@ -640,15 +854,9 @@ class ShellManager:
                 continue
             if bot.bot_id == candidate.bot_id:
                 errors.append(f"bot_id {candidate.bot_id} 已存在")
-            if candidate.enabled and bot.enabled and bot.onebot_self_id == candidate.onebot_self_id:
-                errors.append(f"onebot_self_id {candidate.onebot_self_id} 已被 {bot.name or bot.bot_id} 占用")
         return errors
 
     def _persist_after_bot_change_locked(self) -> None:
-        settings = self._require_settings()
-        suggested = self.registry.next_suggested_self_id(self.bots)
-        if settings.next_onebot_self_id < suggested:
-            settings.next_onebot_self_id = suggested
         self._persist_shell_settings()
         self.registry.save(self.bots)
 
@@ -739,7 +947,7 @@ class ShellManager:
             "status_code": "pending",
             "status_label": "等待连接",
             "server_url": bot.server_url,
-            "onebot_self_id": bot.onebot_self_id,
+            "onebot_self_id": self._read_persisted_self_id(bot.bot_id),
             "server_display_name": "",
             "server_avatar_url": "",
             "is_main_bot": False,
@@ -752,6 +960,15 @@ class ShellManager:
         if not normalized_server or not normalized_username:
             return ""
         return f"{normalized_server}/avatar/{quote(normalized_username, safe='')}"
+
+    def _read_persisted_self_id(self, bot_id: str) -> int:
+        scope_path = self.layout.bots_dir / str(bot_id) / "identity_scope.json"
+        payload = read_json(scope_path, {})
+        try:
+            value = int(payload.get("onebot_self_id") or 0)
+        except (TypeError, ValueError):
+            return 0
+        return value if value > 0 else 0
 
     def _build_basic_info_avatar_proxy_url(self, bot_id: str) -> str:
         normalized_bot_id = str(bot_id or "").strip()
@@ -895,21 +1112,6 @@ class ShellManager:
             asset_label="服务器头像",
         )
 
-    def _should_fill_default_self_id(self, payload: dict[str, Any]) -> bool:
-        if "onebot_self_id" not in payload:
-            return True
-
-        value = payload.get("onebot_self_id")
-        if value is None:
-            return True
-        if isinstance(value, str) and not value.strip():
-            return True
-
-        try:
-            return int(value) <= 0
-        except (TypeError, ValueError):
-            return True
-
     def _generate_bot_id(self) -> str:
         return f"bot_{secrets.token_hex(4)}"
 
@@ -966,8 +1168,6 @@ class ShellManager:
     ) -> list[BotRecord]:
         candidate_bots: list[BotRecord] = []
         seen_bot_ids: set[str] = set()
-        enabled_self_ids: dict[int, str] = {}
-
         for index, raw_item in enumerate(raw_bots):
             if not isinstance(raw_item, dict):
                 raise ValueError(f"配置导入失败，第 {index + 1} 个 bot 配置不是对象")
@@ -976,21 +1176,12 @@ class ShellManager:
             errors = candidate.validate()
             if candidate.bot_id in seen_bot_ids:
                 errors.append(f"bot_id {candidate.bot_id} 重复")
-            if candidate.enabled:
-                occupied_by = enabled_self_ids.get(candidate.onebot_self_id)
-                if occupied_by is not None:
-                    errors.append(
-                        f"onebot_self_id {candidate.onebot_self_id} 已被 {occupied_by} 占用"
-                    )
-
             if errors:
                 raise ValueError(
                     f"配置导入失败，bot {candidate.name or candidate.bot_id or index + 1}: {'；'.join(errors)}"
                 )
 
             seen_bot_ids.add(candidate.bot_id)
-            if candidate.enabled:
-                enabled_self_ids[candidate.onebot_self_id] = candidate.name or candidate.bot_id
             candidate_bots.append(candidate)
 
         return candidate_bots

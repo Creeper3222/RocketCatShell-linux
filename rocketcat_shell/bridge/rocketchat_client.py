@@ -5,6 +5,8 @@ import hashlib
 import os
 import re
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from html import unescape
 from typing import Any, Awaitable, Callable
 from urllib.parse import quote, urlparse
@@ -16,6 +18,12 @@ from rocketcat_shell.logger import logger
 from .config import BridgeConfig
 from .json_codec import json_dumps, json_dumps_compact, json_loads
 from .media import RocketChatMediaBridge
+from .rocketchat_compat import (
+    RocketChatCapabilities,
+    RocketChatHTTPError,
+    RocketChatMethodError,
+    UnsupportedRocketChatVersionError,
+)
 from .rocketchat_e2ee import RocketChatE2EEManager
 
 
@@ -53,6 +61,7 @@ class RocketChatClient:
         self,
         config: BridgeConfig,
         enable_base64_media_transport: bool = False,
+        media_cache_dir: str | os.PathLike[str] | None = None,
         on_message: MessageCallback | None = None,
         on_reconnect_exhausted: FailureCallback | None = None,
     ):
@@ -66,6 +75,7 @@ class RocketChatClient:
         self._task: asyncio.Task | None = None
         self._pending_ddp_results: dict[str, asyncio.Future] = {}
         self._ddp_call_id = 0
+        self._method_call_id = 0
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._inbound_queues: list[asyncio.Queue[dict[str, Any]]] = []
         self._inbound_workers: set[asyncio.Task[Any]] = set()
@@ -84,12 +94,17 @@ class RocketChatClient:
         self.user_id: str | None = None
         self.bot_username: str | None = None
         self.bot_profile: dict[str, Any] = {}
+        self.server_info: dict[str, Any] = {}
+        self.cloud_workspace_id = ""
+        self.capabilities = RocketChatCapabilities.unknown()
+        self._method_transport = "rest"
+        self._method_rest_fallbacks = 0
         self.e2ee = RocketChatE2EEManager(
             client=self,
             enabled=bool(self.config.e2ee_password.strip()),
             password=self.config.e2ee_password.strip(),
         )
-        self.media = RocketChatMediaBridge(self)
+        self.media = RocketChatMediaBridge(self, cache_dir=media_cache_dir)
         self._consecutive_reconnect_failures = 0
         self._last_rest_login_at = 0.0
         self._last_websocket_activity_at = 0.0
@@ -97,7 +112,7 @@ class RocketChatClient:
         self._last_outbound_message_at = 0.0
         self._last_disconnect_reason = ""
 
-    async def start(self) -> None:
+    async def start(self, *, start_realtime: bool = True) -> None:
         if self._running:
             return
         self._running = True
@@ -112,7 +127,38 @@ class RocketChatClient:
             connector=connector,
             json_serialize=json_dumps,
         )
-        self._task = asyncio.create_task(self._run_forever())
+        try:
+            try:
+                await self.media.start()
+            except Exception as exc:
+                logger.warning(
+                    "[RocketChatOneBotBridge][E2EE] Docker 共享媒体目录初始化失败，"
+                    "将回退到当前可用媒体引用: %r",
+                    exc,
+                )
+            await self._detect_server_capabilities()
+            await self._rest_login()
+        except UnsupportedRocketChatVersionError:
+            self._running = False
+            await self.media.stop()
+            await self._http_session.close()
+            self._http_session = None
+            raise
+        except Exception:
+            self._running = False
+            await self.media.stop()
+            await self._http_session.close()
+            self._http_session = None
+            raise
+        if start_realtime:
+            await self.start_realtime()
+
+    async def start_realtime(self) -> None:
+        if not self._running:
+            raise RuntimeError("Rocket.Chat 客户端尚未初始化")
+        if self._task is not None and not self._task.done():
+            return
+        self._task = asyncio.create_task(self._run_forever(initial_login_complete=True))
 
     async def stop(self) -> None:
         self._running = False
@@ -131,6 +177,7 @@ class RocketChatClient:
         if self._http_session is not None:
             await self._http_session.close()
         self._http_session = None
+        await self.media.stop()
         self._seen_inbound_message_signatures.clear()
         self._server_branding_cache = None
         self._server_branding_cache_expires_at = 0.0
@@ -138,10 +185,13 @@ class RocketChatClient:
         self._consecutive_reconnect_failures = 0
         self.bot_profile = {}
 
-    async def _run_forever(self) -> None:
+    async def _run_forever(self, *, initial_login_complete: bool = False) -> None:
+        login_ready = bool(initial_login_complete and self.auth_token and self.user_id)
         while self._running:
             try:
-                await self._rest_login()
+                if not login_ready:
+                    await self._rest_login()
+                login_ready = False
                 await self.e2ee.initialize()
                 await self._ws_connect_and_listen()
                 if self._running:
@@ -157,6 +207,7 @@ class RocketChatClient:
                     break
                 self.auth_token = None
                 self.user_id = None
+                login_ready = False
                 self._last_disconnect_reason = repr(exc)
                 self._consecutive_reconnect_failures += 1
                 if self._should_stop_reconnect():
@@ -199,6 +250,12 @@ class RocketChatClient:
             "last_inbound_message_at": self._last_inbound_message_at or None,
             "last_outbound_message_at": self._last_outbound_message_at or None,
             "last_disconnect_reason": self._last_disconnect_reason,
+            "server_version": self.capabilities.version_text,
+            "compatibility_status": self.capabilities.compatibility_status,
+            "upload_endpoint": self.media.active_plain_upload_endpoint,
+            "method_transport": self._method_transport,
+            "method_rest_fallbacks": self._method_rest_fallbacks,
+            "local_media_base_url": self.media.local_media_base_url,
         }
 
     def _mark_websocket_activity(self) -> None:
@@ -212,11 +269,152 @@ class RocketChatClient:
     def _mark_outbound_message_activity(self) -> None:
         self._last_outbound_message_at = time.time()
 
+    @staticmethod
+    def _parse_retry_after(
+        headers: dict[str, str],
+        data: Any,
+        *,
+        default: float,
+    ) -> float:
+        retry_after = str(
+            next(
+                (
+                    value
+                    for key, value in headers.items()
+                    if str(key).lower() == "retry-after"
+                ),
+                "",
+            )
+        ).strip()
+        if retry_after:
+            try:
+                return max(0.0, min(float(retry_after), 30.0))
+            except ValueError:
+                try:
+                    retry_at = parsedate_to_datetime(retry_after)
+                    if retry_at.tzinfo is None:
+                        retry_at = retry_at.replace(tzinfo=timezone.utc)
+                    return max(
+                        0.0,
+                        min((retry_at - datetime.now(timezone.utc)).total_seconds(), 30.0),
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    pass
+
+        if isinstance(data, dict):
+            candidates = [
+                data.get("timeToReset"),
+                (data.get("details") or {}).get("timeToReset")
+                if isinstance(data.get("details"), dict)
+                else None,
+                (data.get("errorDetails") or {}).get("timeToReset")
+                if isinstance(data.get("errorDetails"), dict)
+                else None,
+            ]
+            for candidate in candidates:
+                try:
+                    value = float(candidate)
+                except (TypeError, ValueError):
+                    continue
+                if value > 10_000_000_000:
+                    value = (value / 1000.0) - time.time()
+                elif value > 10_000_000:
+                    value -= time.time()
+                elif value > 1000:
+                    value /= 1000.0
+                return max(0.0, min(value, 30.0))
+        return max(0.0, min(default, 30.0))
+
     async def _request_json(self, method: str, url: str, **kwargs) -> dict[str, Any]:
         if self._http_session is None:
             raise RuntimeError("Rocket.Chat HTTP session 尚未初始化")
-        async with self._http_session.request(method, url, **kwargs) as resp:
-            return await resp.json(content_type=None, loads=json_loads)
+
+        normalized_method = str(method or "GET").upper()
+        idempotent = normalized_method in {"GET", "HEAD", "OPTIONS"}
+        max_attempts = 3 if idempotent else 1
+
+        for attempt in range(1, max_attempts + 1):
+            async with self._http_session.request(normalized_method, url, **kwargs) as resp:
+                response_text = await resp.text()
+                data: Any = None
+                if response_text:
+                    try:
+                        data = json_loads(response_text)
+                    except Exception:
+                        data = None
+                headers = {str(key): str(value) for key, value in resp.headers.items()}
+
+                if resp.status < 400:
+                    if not isinstance(data, dict):
+                        raise RuntimeError(
+                            f"Rocket.Chat 返回了非 JSON 对象: {normalized_method} {url} "
+                            f"status={resp.status} content_type={resp.headers.get('Content-Type', '-')}"
+                        )
+                    return data
+
+                error = RocketChatHTTPError(
+                    method=normalized_method,
+                    url=url,
+                    status=resp.status,
+                    data=data,
+                    headers=headers,
+                    response_text=response_text,
+                )
+                retryable = resp.status == 429 or 500 <= resp.status <= 599
+                if not (idempotent and retryable and attempt < max_attempts):
+                    raise error
+
+                default_delay = 0.5 * (2 ** (attempt - 1))
+                delay = self._parse_retry_after(headers, data, default=default_delay)
+                logger.warning(
+                    "[RocketChatOneBotBridge] Rocket.Chat REST 请求准备重试: "
+                    "method=%s status=%s attempt=%s/%s delay=%.2fs url=%s",
+                    normalized_method,
+                    resp.status,
+                    attempt,
+                    max_attempts,
+                    delay,
+                    url,
+                )
+                await asyncio.sleep(delay)
+
+        raise RuntimeError(f"Rocket.Chat REST 请求意外结束: {normalized_method} {url}")
+
+    async def _detect_server_capabilities(self) -> None:
+        try:
+            data = await self._request_json(
+                "GET",
+                f"{self.config.server_url}/api/info",
+            )
+        except Exception as exc:
+            self.capabilities = RocketChatCapabilities.unknown()
+            logger.warning(
+                "[RocketChatOneBotBridge] 无法读取 Rocket.Chat /api/info，"
+                "将使用能力探测模式: server=%s error=%r",
+                self.config.server_url,
+                exc,
+            )
+            return
+
+        self.server_info = dict(data)
+        self.cloud_workspace_id = str(data.get("cloudWorkspaceId") or "").strip()
+        self.capabilities = RocketChatCapabilities.from_version(data.get("version"))
+        if self.capabilities.compatibility_status == "unsupported":
+            assert self.capabilities.version is not None
+            raise UnsupportedRocketChatVersionError(self.capabilities.version)
+
+        logger.info(
+            "[RocketChatOneBotBridge] Rocket.Chat 版本能力已识别: "
+            "server=%s version=%s compatibility=%s legacy_upload_fallback=%s "
+            "ddp_method_fallback=%s strict_rest=%s secure_upload=%s",
+            self.config.server_url,
+            self.capabilities.version_text,
+            self.capabilities.compatibility_status,
+            self.capabilities.allows_legacy_upload_fallback,
+            self.capabilities.allows_ddp_method_fallback,
+            self.capabilities.strict_rest_validation,
+            self.capabilities.secure_upload_validation,
+        )
 
     async def _request_text(self, method: str, url: str, **kwargs) -> str:
         if self._http_session is None:
@@ -374,6 +572,8 @@ class RocketChatClient:
         login_data = data["data"]
         self.auth_token = login_data["authToken"]
         self.user_id = login_data["userId"]
+        self._last_rest_login_at = time.time()
+        self._last_disconnect_reason = ""
         me = login_data.get("me") if isinstance(login_data.get("me"), dict) else {}
         self.bot_username = me.get("username") or self.config.username
         self.bot_profile = dict(me)
@@ -381,8 +581,6 @@ class RocketChatClient:
             self.bot_profile.setdefault("_id", self.user_id)
             self.bot_profile.setdefault("username", self.bot_username)
             self._user_cache[str(self.user_id)] = dict(self.bot_profile)
-        self._last_rest_login_at = time.time()
-        self._last_disconnect_reason = ""
         logger.info(
             f"[RocketChatOneBotBridge] Rocket.Chat 登录成功 | userId={self.user_id} | username={self.bot_username}"
         )
@@ -635,7 +833,7 @@ class RocketChatClient:
 
         activities = ["user-typing"] if is_typing else []
         try:
-            await self._ddp_call(
+            await self.call_realtime_method(
                 "stream-notify-room",
                 [f"{normalized_room_id}/user-activity", actor_name, activities, {}],
                 timeout=10.0,
@@ -961,7 +1159,10 @@ class RocketChatClient:
             if raw_message:
                 sent_messages.append(raw_message)
 
-        for segment in segments:
+        segment_index = 0
+        while segment_index < len(segments):
+            segment = segments[segment_index]
+            segment_index += 1
             segment_type = str(segment.get("type") or "text")
             data = segment.get("data", {}) or {}
 
@@ -969,22 +1170,55 @@ class RocketChatClient:
                 text_parts.append(str(data.get("text") or ""))
                 continue
 
+            had_pending_quote = bool(quote_pending)
             if text_parts:
                 await flush_text()
             elif quote_pending:
                 await flush_text(force_quote=True)
+
+            media_description = ""
+            if (
+                segment_type == "image"
+                and not had_pending_quote
+                and not pending_mentions
+                and not pending_reply_mention
+            ):
+                media_description, segment_index = self._collect_trailing_text_caption(
+                    segments,
+                    segment_index,
+                )
 
             raw_message = await self._send_media_segment(
                 room_id,
                 segment_type,
                 data,
                 tmid=current_thread_source_id,
+                description=media_description,
             )
             if raw_message:
                 sent_messages.append(raw_message)
 
         await flush_text(force_quote=bool(quote_pending))
         return sent_messages
+
+    def _collect_trailing_text_caption(
+        self,
+        segments: list[dict[str, Any]],
+        start_index: int,
+    ) -> tuple[str, int]:
+        caption_parts: list[str] = []
+        index = start_index
+        while index < len(segments):
+            segment = segments[index]
+            segment_type = str(segment.get("type") or "text")
+            if segment_type != "text":
+                return "", start_index
+            data = segment.get("data", {}) or {}
+            caption_parts.append(str(data.get("text") or ""))
+            index += 1
+
+        caption = self._normalize_outbound_text("".join(caption_parts))
+        return caption, index
 
     async def _send_media_segment(
         self,
@@ -993,6 +1227,7 @@ class RocketChatClient:
         data: dict[str, Any],
         *,
         tmid: str | None = None,
+        description: str = "",
     ) -> dict[str, Any] | None:
         file_ref = str(data.get("file") or data.get("url") or "")
         if not file_ref:
@@ -1000,12 +1235,17 @@ class RocketChatClient:
 
         if segment_type == "image":
             if file_ref.startswith(("http://", "https://")):
-                return await self.send_image_url(room_id, file_ref, tmid=tmid)
+                return await self.send_image_url(room_id, file_ref, text=description, tmid=tmid)
             local_path, cleanup = await self._resolve_uploadable_path(file_ref, ".png")
             if not local_path:
                 return None
             try:
-                return await self.send_image_file(room_id, local_path, tmid=tmid)
+                return await self.send_image_file(
+                    room_id,
+                    local_path,
+                    description=description,
+                    tmid=tmid,
+                )
             finally:
                 if cleanup:
                     cleanup()
@@ -1224,6 +1464,98 @@ class RocketChatClient:
             return data.get("result")
         finally:
             self._pending_ddp_results.pop(call_id, None)
+
+    def _parse_method_call_response(
+        self,
+        method: str,
+        call_id: str,
+        data: Any,
+    ) -> Any:
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                f"Rocket.Chat method.call 返回了无效响应: method={method} type={type(data).__name__}"
+            )
+        encoded_message = data.get("message")
+        if not isinstance(encoded_message, str) or not encoded_message:
+            raise RuntimeError(
+                f"Rocket.Chat method.call 响应缺少 message: method={method} data={data}"
+            )
+        try:
+            result_frame = json_loads(encoded_message)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Rocket.Chat method.call 响应无法解析: method={method}"
+            ) from exc
+        if not isinstance(result_frame, dict) or result_frame.get("msg") != "result":
+            raise RuntimeError(
+                f"Rocket.Chat method.call 返回了非 result 帧: method={method} frame={result_frame}"
+            )
+        if str(result_frame.get("id") or "") != call_id:
+            raise RuntimeError(
+                f"Rocket.Chat method.call 响应 ID 不匹配: method={method} "
+                f"expected={call_id} actual={result_frame.get('id')}"
+            )
+        if result_frame.get("error"):
+            raise RocketChatMethodError(method, result_frame["error"])
+        return result_frame.get("result")
+
+    async def _call_method_via_rest(
+        self,
+        method: str,
+        params: list[Any] | None = None,
+    ) -> Any:
+        self._method_call_id += 1
+        call_id = f"rest-ddp-{self._method_call_id}"
+        message = {
+            "msg": "method",
+            "method": method,
+            "id": call_id,
+            "params": params or [],
+        }
+        encoded_method = quote(method.replace("/", ":"), safe="")
+        url = f"{self.config.server_url}/api/v1/method.call/{encoded_method}"
+        try:
+            data = await self._request_json(
+                "POST",
+                url,
+                headers=self._auth_headers(),
+                json={"message": json_dumps_compact(message)},
+            )
+        except RocketChatHTTPError as exc:
+            if isinstance(exc.data, dict) and isinstance(exc.data.get("message"), str):
+                return self._parse_method_call_response(method, call_id, exc.data)
+            raise
+        return self._parse_method_call_response(method, call_id, data)
+
+    async def call_realtime_method(
+        self,
+        method: str,
+        params: list[Any] | None = None,
+        timeout: float = 10.0,
+    ) -> Any:
+        try:
+            result = await asyncio.wait_for(
+                self._call_method_via_rest(method, params),
+                timeout=timeout,
+            )
+            self._method_transport = "rest"
+            return result
+        except RocketChatHTTPError as exc:
+            if not (
+                exc.endpoint_incompatible
+                and self.capabilities.allows_ddp_method_fallback
+            ):
+                raise
+            self._method_transport = "ddp-fallback"
+            self._method_rest_fallbacks += 1
+            logger.warning(
+                "[RocketChatOneBotBridge] method.call REST 端点不可用，"
+                "回退原始 DDP method: method=%s status=%s server_version=%s",
+                method,
+                exc.status,
+                self.capabilities.version_text,
+            )
+            return await self._ddp_call(method, params, timeout=timeout)
 
     async def _ddp_connect(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         await ws.send_str(json_dumps({"msg": "connect", "version": "1", "support": ["1"]}))

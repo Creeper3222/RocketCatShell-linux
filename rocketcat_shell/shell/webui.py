@@ -30,6 +30,11 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from ..__init__ import __version__
+from ..bridge.user_identity import (
+    UserIdentityConflictError,
+    UserIdentityError,
+    UserIdentityRevisionError,
+)
 from ..logger import logger
 
 try:
@@ -329,6 +334,21 @@ class ShellWebUI:
         self._app.add_api_route(
             "/api/bots/{bot_id}",
             self._handle_delete_bot,
+            methods=["DELETE"],
+        )
+        self._app.add_api_route(
+            "/api/bots/{bot_id}/user-mappings",
+            self._handle_list_user_mappings,
+            methods=["GET"],
+        )
+        self._app.add_api_route(
+            "/api/bots/{bot_id}/user-mappings/{user_id}",
+            self._handle_update_user_mapping,
+            methods=["PUT"],
+        )
+        self._app.add_api_route(
+            "/api/bots/{bot_id}/user-mappings/{user_id}",
+            self._handle_delete_user_mapping,
             methods=["DELETE"],
         )
         self._app.add_api_route("/api/plugins", self._handle_list_plugins, methods=["GET"])
@@ -1937,6 +1957,95 @@ class ShellWebUI:
             logger.error(f"[RocketCatShell] 更新 bot 失败: {exc!r}")
             raise HTTPException(status_code=500, detail="更新 bot 失败") from exc
         return {"item": updated}
+
+    async def _handle_list_user_mappings(
+        self,
+        bot_id: str,
+        search: str = "",
+        offset: int = 0,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        try:
+            return await self.manager.list_user_mappings(
+                bot_id,
+                search=search,
+                offset=offset,
+                limit=limit,
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="找不到目标 bot")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.error("[RocketCatShell] 读取用户映射失败: bot_id=%s error=%r", bot_id, exc)
+            raise HTTPException(status_code=500, detail="读取用户映射失败") from exc
+
+    async def _handle_update_user_mapping(
+        self,
+        bot_id: str,
+        user_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            return await self.manager.update_user_mapping(
+                bot_id,
+                user_id,
+                onebot_id=payload.get("onebot_id"),
+                revision=int(payload.get("revision") or 0),
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="找不到目标 bot")
+        except UserIdentityConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": str(exc),
+                    "occupant": exc.occupant,
+                },
+            ) from exc
+        except UserIdentityRevisionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except UserIdentityError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.error(
+                "[RocketCatShell] 更新用户映射失败: bot_id=%s user_id=%s error=%r",
+                bot_id,
+                user_id,
+                exc,
+            )
+            raise HTTPException(status_code=500, detail="更新用户映射失败") from exc
+
+    async def _handle_delete_user_mapping(
+        self,
+        bot_id: str,
+        user_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            return await self.manager.delete_user_mapping(
+                bot_id,
+                user_id,
+                revision=int(payload.get("revision") or 0),
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="找不到目标 bot")
+        except UserIdentityRevisionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except UserIdentityError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.error(
+                "[RocketCatShell] 删除用户映射失败: bot_id=%s user_id=%s error=%r",
+                bot_id,
+                user_id,
+                exc,
+            )
+            raise HTTPException(status_code=500, detail="删除用户映射失败") from exc
 
     async def _handle_delete_bot(self, bot_id: str) -> dict[str, bool]:
         try:

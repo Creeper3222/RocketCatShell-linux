@@ -4,15 +4,20 @@ import base64
 import hashlib
 import mimetypes
 import os
+import re
+import secrets
 import tempfile
+from pathlib import Path
 from typing import Any, Callable, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import aiohttp
+from aiohttp import web
 
 from rocketcat_shell.logger import logger
 
 from .json_codec import json_dumps_compact, json_loads
+from .rocketchat_compat import RocketChatHTTPError
 
 
 class RocketChatMediaBridge:
@@ -20,10 +25,274 @@ class RocketChatMediaBridge:
     _PLAIN_UPLOAD_MODERN_ENDPOINT = "rooms.media"
     _ENDPOINT_COMPATIBILITY_FAILURE_STATUSES = {404, 405, 410, 501}
     _UPLOAD_MESSAGE_ECHO_TIMEOUT = 5.0
+    _LOCAL_MEDIA_HOST = "127.0.0.1"
+    _LOCAL_MEDIA_ROUTE_PREFIX = "/_rocketcat/media/"
+    _LOCAL_MEDIA_MAX_BASE64_BYTES = 20 * 1024 * 1024
 
-    def __init__(self, client: Any) -> None:
+    def __init__(self, client: Any, *, cache_dir: str | os.PathLike[str] | None = None) -> None:
         self.client = client
         self._plain_upload_endpoint_preference: str | None = None
+        self._local_media_cache_dir = self._resolve_local_media_cache_dir(cache_dir)
+        self._local_media_runner: web.AppRunner | None = None
+        self._local_media_site: web.TCPSite | None = None
+        self._local_media_base_url = ""
+        self._local_media_by_token: dict[str, tuple[str, str]] = {}
+        self._local_media_token_by_path: dict[str, str] = {}
+
+    def _resolve_local_media_cache_dir(
+        self,
+        cache_dir: str | os.PathLike[str] | None,
+    ) -> Path:
+        return Path(self._resolve_shared_media_dir()).resolve()
+
+    def _resolve_shared_media_dir(self) -> str:
+        target_dir = str(os.environ.get("ROCKETCAT_SHARED_MEDIA_DIR") or "").strip()
+        if not target_dir:
+            target_dir = "/app/data/bots/_shared_media"
+        os.makedirs(target_dir, exist_ok=True)
+        return target_dir
+
+    def _create_shared_media_temp_file(self, suffix: str):
+        return tempfile.NamedTemporaryFile(
+            suffix=suffix,
+            delete=False,
+            dir=self._resolve_shared_media_dir(),
+        )
+
+    def translate_shared_media_path_to_host(self, file_ref: str) -> str:
+        candidate = str(file_ref or "").strip()
+        if not candidate:
+            return ""
+        host_dir = str(os.environ.get("ROCKETCAT_SHARED_MEDIA_HOST_DIR") or "").strip()
+        if not host_dir:
+            return candidate
+
+        container_dir = self._resolve_shared_media_dir().replace("\\", "/").rstrip("/")
+        normalized_candidate = candidate.replace("\\", "/")
+        if normalized_candidate == container_dir:
+            relative_path = ""
+        elif normalized_candidate.startswith(container_dir + "/"):
+            relative_path = normalized_candidate[len(container_dir) + 1 :]
+        else:
+            return candidate
+
+        host_base = host_dir.rstrip("/\\")
+        if not relative_path:
+            return host_base or host_dir
+        separator = "\\" if "\\" in host_dir and "/" not in host_dir else "/"
+        suffix = relative_path.replace("/", separator)
+        return f"{host_base}{separator}{suffix}" if host_base else suffix
+
+    @property
+    def local_media_base_url(self) -> str:
+        return self._local_media_base_url
+
+    async def start(self) -> None:
+        self._local_media_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    async def stop(self) -> None:
+        self._local_media_runner = None
+        self._local_media_site = None
+        self._local_media_base_url = ""
+        self._local_media_by_token.clear()
+        self._local_media_token_by_path.clear()
+
+    async def _handle_local_media_request(self, request: web.Request) -> web.StreamResponse:
+        token = str(request.match_info.get("token") or "")
+        entry = self._local_media_by_token.get(token)
+        if entry is None:
+            raise web.HTTPNotFound()
+        file_path, content_type = entry
+        if not os.path.isfile(file_path):
+            self._local_media_by_token.pop(token, None)
+            self._local_media_token_by_path.pop(os.path.normcase(file_path), None)
+            raise web.HTTPNotFound()
+
+        response = web.FileResponse(
+            file_path,
+            headers={
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+        if content_type:
+            response.content_type = content_type
+        return response
+
+    @staticmethod
+    def _safe_media_suffix(value: str, default: str = ".bin") -> str:
+        parsed = urlparse(str(value or ""))
+        suffix = os.path.splitext(parsed.path or str(value or ""))[1].lower()
+        if not suffix or not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
+            return default
+        return suffix
+
+    @staticmethod
+    def _detect_media_suffix(raw: bytes, default: str = ".bin") -> str:
+        if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+            return ".png"
+        if raw.startswith(b"\xff\xd8\xff"):
+            return ".jpg"
+        if raw.startswith((b"GIF87a", b"GIF89a")):
+            return ".gif"
+        if raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
+            return ".webp"
+        return default
+
+    def _write_cached_media_file(self, raw: bytes, suffix: str) -> str:
+        self._local_media_cache_dir.mkdir(parents=True, exist_ok=True)
+        safe_suffix = self._safe_media_suffix(suffix)
+        digest = hashlib.sha256(raw).hexdigest()
+        target = self._local_media_cache_dir / f"e2ee_{digest}{safe_suffix}"
+        if not target.exists():
+            try:
+                with target.open("xb") as handle:
+                    handle.write(raw)
+            except FileExistsError:
+                pass
+        return str(target)
+
+    def _is_allowed_local_media_path(self, file_path: str) -> bool:
+        try:
+            resolved = Path(file_path).resolve()
+        except (OSError, RuntimeError, ValueError):
+            return False
+        allowed_roots = (
+            self._local_media_cache_dir,
+            Path(tempfile.gettempdir()).resolve(),
+        )
+        for root in allowed_roots:
+            try:
+                normalized_root = os.path.normcase(str(root))
+                normalized_resolved = os.path.normcase(str(resolved))
+                if (
+                    os.path.commonpath([normalized_root, normalized_resolved])
+                    == normalized_root
+                ):
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    def _copy_allowed_media_into_cache(self, file_path: str) -> str | None:
+        candidate = str(file_path or "").strip()
+        if not candidate or not self._is_allowed_local_media_path(candidate):
+            return None
+        try:
+            limit = self._remote_media_size_limit()
+            if limit and os.path.getsize(candidate) > limit:
+                return None
+            raw = Path(candidate).read_bytes()
+        except OSError:
+            return None
+        suffix = self._safe_media_suffix(candidate)
+        return self._write_cached_media_file(raw, suffix)
+
+    def publish_local_media_file(
+        self,
+        file_path: str,
+        *,
+        name: str = "",
+        content_type: str = "",
+    ) -> str | None:
+        cached_path = self._copy_allowed_media_into_cache(file_path)
+        if not cached_path:
+            return None
+        if self._is_base64_media_transport_enabled():
+            base64_ref = self._encode_media_file_to_base64(cached_path)
+            if base64_ref:
+                return base64_ref
+        return self.translate_shared_media_path_to_host(cached_path)
+
+    def _publish_base64_media_ref(self, file_ref: str, *, kind: str) -> str | None:
+        payload = str(file_ref or "").removeprefix("base64://")
+        if not payload:
+            return None
+        try:
+            raw = base64.b64decode(payload, validate=True)
+        except Exception:
+            return None
+        limit = min(
+            self._LOCAL_MEDIA_MAX_BASE64_BYTES,
+            max(0, self._remote_media_size_limit()),
+        )
+        if not raw or (limit and len(raw) > limit):
+            return None
+        default_suffix = ".jpg" if kind == "image" else ".bin"
+        suffix = self._detect_media_suffix(raw, default_suffix)
+        local_path = self._write_cached_media_file(raw, suffix)
+        return self.publish_local_media_file(local_path, name=f"media{suffix}")
+
+    def is_current_local_media_url(self, value: str) -> bool:
+        candidate = str(value or "").strip()
+        if not candidate or not self._local_media_base_url:
+            return False
+        if not candidate.startswith(f"{self._local_media_base_url}/"):
+            return False
+        remainder = candidate[len(self._local_media_base_url) + 1 :]
+        token = remainder.split("/", 1)[0]
+        entry = self._local_media_by_token.get(token)
+        return bool(entry and os.path.isfile(entry[0]))
+
+    @classmethod
+    def is_rocketcat_local_media_url(cls, value: str) -> bool:
+        parsed = urlparse(str(value or ""))
+        return (
+            parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+            and parsed.path.startswith(cls._LOCAL_MEDIA_ROUTE_PREFIX)
+        )
+
+    def prepare_cached_onebot_event_media(self, event: dict[str, Any]) -> bool:
+        segments = event.get("message")
+        if not isinstance(segments, list):
+            return True
+
+        all_ready = True
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            kind = str(segment.get("type") or "")
+            if kind not in {"image", "record", "video"}:
+                continue
+            data = segment.get("data")
+            if not isinstance(data, dict):
+                continue
+            file_ref = str(data.get("file") or data.get("url") or "").strip()
+            if not file_ref:
+                continue
+            if file_ref.startswith(("http://", "https://")):
+                if self.is_rocketcat_local_media_url(file_ref):
+                    all_ready = all_ready and self.is_current_local_media_url(file_ref)
+                continue
+
+            published_url: str | None = None
+            if file_ref.startswith("base64://"):
+                published_url = self._publish_base64_media_ref(file_ref, kind=kind)
+            else:
+                parsed = urlparse(file_ref)
+                local_path = unquote(parsed.path) if parsed.scheme == "file" else file_ref
+                if (
+                    os.name == "nt"
+                    and parsed.scheme == "file"
+                    and local_path.startswith("/")
+                    and len(local_path) > 3
+                    and local_path[2] == ":"
+                ):
+                    local_path = local_path[1:]
+                published_url = self.publish_local_media_file(local_path)
+            if published_url:
+                data["file"] = published_url
+                data.pop("url", None)
+            else:
+                all_ready = False
+        return all_ready
+
+    @property
+    def active_plain_upload_endpoint(self) -> str:
+        capabilities = getattr(self.client, "capabilities", None)
+        if capabilities is not None and not capabilities.allows_legacy_upload_fallback:
+            return self._PLAIN_UPLOAD_MODERN_ENDPOINT
+        return self._normalize_plain_upload_endpoint(self._plain_upload_endpoint_preference)
 
     def _remote_media_size_limit(self) -> int:
         return max(0, int(getattr(self.client.config, "remote_media_max_size", 0) or 0))
@@ -73,48 +342,6 @@ class RocketChatMediaBridge:
         )
         return False
 
-    def _resolve_shared_media_dir(self) -> str:
-        target_dir = str(os.environ.get("ROCKETCAT_SHARED_MEDIA_DIR") or "").strip()
-        if not target_dir:
-            target_dir = "/app/data/bots/_shared_media"
-        os.makedirs(target_dir, exist_ok=True)
-        return target_dir
-
-    def _create_shared_media_temp_file(self, suffix: str):
-        return tempfile.NamedTemporaryFile(
-            suffix=suffix,
-            delete=False,
-            dir=self._resolve_shared_media_dir(),
-        )
-
-    def translate_shared_media_path_to_host(self, file_ref: str) -> str:
-        candidate = str(file_ref or "").strip()
-        if not candidate:
-            return ""
-
-        host_dir = str(os.environ.get("ROCKETCAT_SHARED_MEDIA_HOST_DIR") or "").strip()
-        if not host_dir:
-            return candidate
-
-        container_dir = self._resolve_shared_media_dir().replace("\\", "/").rstrip("/")
-        normalized_candidate = candidate.replace("\\", "/")
-        if normalized_candidate == container_dir:
-            relative_path = ""
-        elif normalized_candidate.startswith(container_dir + "/"):
-            relative_path = normalized_candidate[len(container_dir) + 1 :]
-        else:
-            return candidate
-
-        host_base = host_dir.rstrip("/\\")
-        if not relative_path:
-            return host_base or host_dir
-
-        separator = "\\" if "\\" in host_dir and "/" not in host_dir else "/"
-        suffix = relative_path.replace("/", separator)
-        if not host_base:
-            return suffix
-        return f"{host_base}{separator}{suffix}"
-
     def _is_base64_media_transport_enabled(self) -> bool:
         return bool(getattr(self.client, "enable_base64_media_transport", False))
 
@@ -140,10 +367,19 @@ class RocketChatMediaBridge:
             return ""
 
         local_path = str(media.get("path") or "").strip()
-        if self._is_base64_media_transport_enabled() and local_path:
-            base64_ref = self._encode_media_file_to_base64(local_path)
-            if base64_ref:
-                return base64_ref
+        if local_path:
+            published_url = self.publish_local_media_file(
+                local_path,
+                name=str(media.get("name") or ""),
+                content_type=str(media.get("content_type") or ""),
+            )
+            if published_url:
+                media["url"] = published_url
+                return published_url
+            if self._is_base64_media_transport_enabled():
+                base64_ref = self._encode_media_file_to_base64(local_path)
+                if base64_ref:
+                    return base64_ref
 
         return self.translate_shared_media_path_to_host(file_ref)
 
@@ -506,6 +742,7 @@ class RocketChatMediaBridge:
         if self.client._http_session is None:
             return None
 
+        limit = self._remote_media_size_limit()
         try:
             async with self.client._http_session.get(
                 url,
@@ -517,7 +754,6 @@ class RocketChatMediaBridge:
                     logger.error(f"[RocketChatOneBotBridge] 下载媒体失败 {resp.status}: {url}")
                     return None
 
-                limit = self._remote_media_size_limit()
                 content_length = resp.content_length
                 if content_length is not None and content_length > limit:
                     self._log_media_size_limit_error(
@@ -542,7 +778,7 @@ class RocketChatMediaBridge:
                 return bytes(raw)
         except Exception as exc:
             logger.error(f"[RocketChatOneBotBridge] 下载媒体异常: {exc!r}")
-        return None
+            return None
 
     async def _select_media_url(
         self,
@@ -633,15 +869,7 @@ class RocketChatMediaBridge:
         return default_suffix
 
     def _write_temp_media_file(self, raw: bytes, suffix: str) -> str:
-        tmp = self._create_shared_media_temp_file(suffix)
-        try:
-            tmp.write(raw)
-            tmp.close()
-            return tmp.name
-        except Exception:
-            tmp.close()
-            os.unlink(tmp.name)
-            raise
+        return self._write_cached_media_file(raw, suffix)
 
     async def _materialize_media_reference(
         self,
@@ -692,7 +920,21 @@ class RocketChatMediaBridge:
 
         suffix = self._guess_media_suffix(file_obj, media_url, ".bin")
         local_path = self._write_temp_media_file(decrypted, suffix)
-        return {"name": str(name), "path": local_path}
+        published_url = self.publish_local_media_file(
+            local_path,
+            name=str(name),
+            content_type=str(
+                file_obj.get("type")
+                or file_obj.get("mimeType")
+                or file_obj.get("contentType")
+                or ""
+            ),
+        )
+        return {
+            "name": str(name),
+            "path": local_path,
+            "url": published_url or "",
+        }
 
     async def _extract_media_payloads(
         self,
@@ -733,20 +975,12 @@ class RocketChatMediaBridge:
         descriptors = await self.extract_media_descriptors(raw_msg)
         return self.build_onebot_segments_from_descriptors(descriptors)
 
-    def infer_upload_content_type(self, file_path: str, filename: str) -> str:
-        guessed_type, _ = mimetypes.guess_type(filename)
-        if guessed_type:
-            return guessed_type
-
-        guessed_type, _ = mimetypes.guess_type(file_path)
-        if guessed_type:
-            return guessed_type
-
+    def _detect_upload_content_type(self, file_path: str) -> str | None:
         try:
             with open(file_path, "rb") as fp:
-                header = fp.read(16)
+                header = fp.read(64)
         except Exception:
-            return "application/octet-stream"
+            return None
 
         if header.startswith(b"\x89PNG\r\n\x1a\n"):
             return "image/png"
@@ -758,8 +992,100 @@ class RocketChatMediaBridge:
             return "image/bmp"
         if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
             return "image/webp"
+        if header.startswith(b"%PDF-"):
+            return "application/pdf"
+        if header.startswith(b"PK\x03\x04"):
+            return "application/zip"
+        if header.startswith(b"\x1f\x8b"):
+            return "application/gzip"
+        if header.startswith(b"ID3") or header[:2] in {
+            b"\xff\xfb",
+            b"\xff\xf3",
+            b"\xff\xf2",
+        }:
+            return "audio/mpeg"
+        if header.startswith(b"RIFF") and header[8:12] == b"WAVE":
+            return "audio/wav"
+        if header.startswith(b"OggS"):
+            return "audio/ogg"
+        if len(header) >= 12 and header[4:8] == b"ftyp":
+            return "video/mp4"
+        if header.startswith(b"\x1aE\xdf\xa3"):
+            return "video/webm"
+        return None
 
+    def infer_upload_content_type(self, file_path: str, filename: str) -> str:
+        detected_type = self._detect_upload_content_type(file_path)
+        if detected_type:
+            return detected_type
+
+        guessed_type, _ = mimetypes.guess_type(filename)
+        if guessed_type:
+            return guessed_type
+
+        guessed_type, _ = mimetypes.guess_type(file_path)
+        if guessed_type:
+            return guessed_type
         return "application/octet-stream"
+
+    @staticmethod
+    def _sanitize_upload_filename(filename: str) -> str:
+        raw_name = str(filename or "").strip()
+        base_name = re.split(r"[\\/]", raw_name)[-1]
+        base_name = re.sub(r"[\x00-\x1f\x7f]", "_", base_name)
+        base_name = re.sub(r'[<>:"/\\|?*]', "_", base_name)
+        base_name = base_name.rstrip(" .")
+        if not base_name or base_name in {".", ".."}:
+            base_name = "attachment"
+
+        stem, suffix = os.path.splitext(base_name)
+        if stem.upper() in {
+            "CON",
+            "PRN",
+            "AUX",
+            "NUL",
+            "COM1",
+            "COM2",
+            "COM3",
+            "COM4",
+            "COM5",
+            "COM6",
+            "COM7",
+            "COM8",
+            "COM9",
+            "LPT1",
+            "LPT2",
+            "LPT3",
+            "LPT4",
+            "LPT5",
+            "LPT6",
+            "LPT7",
+            "LPT8",
+            "LPT9",
+        }:
+            stem = f"_{stem}"
+            base_name = f"{stem}{suffix}"
+
+        if len(base_name) > 240:
+            stem, suffix = os.path.splitext(base_name)
+            base_name = f"{stem[: max(1, 240 - len(suffix))]}{suffix}"
+        return base_name
+
+    def prepare_upload_metadata(self, file_path: str, filename: str) -> tuple[str, str]:
+        safe_name = self._sanitize_upload_filename(filename)
+        detected_type = self._detect_upload_content_type(file_path)
+        content_type = detected_type or self.infer_upload_content_type(file_path, safe_name)
+
+        guessed_type, _ = mimetypes.guess_type(safe_name)
+        if detected_type and guessed_type and guessed_type != detected_type:
+            suffix = self._guess_suffix_from_content_type(detected_type, "")
+            stem = os.path.splitext(safe_name)[0].rstrip(" .") or "attachment"
+            safe_name = f"{stem}{suffix}" if suffix else stem
+        elif detected_type and not os.path.splitext(safe_name)[1]:
+            suffix = self._guess_suffix_from_content_type(detected_type, "")
+            if suffix:
+                safe_name = f"{safe_name}{suffix}"
+        return safe_name, content_type
 
     def _normalize_plain_upload_endpoint(self, endpoint_name: str | None) -> str:
         if endpoint_name == self._PLAIN_UPLOAD_LEGACY_ENDPOINT:
@@ -895,25 +1221,25 @@ class RocketChatMediaBridge:
             form = aiohttp.FormData()
             content_type = self.infer_upload_content_type(file_path, resolved_name)
             form.add_field("file", fp, filename=resolved_name, content_type=content_type)
-            if description:
-                if endpoint_name == self._PLAIN_UPLOAD_LEGACY_ENDPOINT:
+            if endpoint_name == self._PLAIN_UPLOAD_LEGACY_ENDPOINT:
+                if description:
                     form.add_field("msg", description)
-                else:
-                    form.add_field("description", description)
-                    form.add_field("msg", description)
-            if tmid:
-                form.add_field("tmid", tmid)
+                if tmid:
+                    form.add_field("tmid", tmid)
             return await self.post_multipart_json_result(url, form)
 
     def _build_plain_media_confirm_payload(
         self,
         *,
+        file_name: str,
         description: str = "",
         tmid: Optional[str] = None,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {}
-        if description:
-            payload["msg"] = description
+        payload: dict[str, Any] = {
+            "msg": description,
+            "description": description,
+            "fileName": file_name,
+        }
         if tmid:
             payload["tmid"] = tmid
         return payload
@@ -942,42 +1268,41 @@ class RocketChatMediaBridge:
         room_id: str,
         upload_data: dict[str, Any],
         *,
+        resolved_name: str,
         description: str = "",
         tmid: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
         uploaded_file = upload_data.get("file") or {}
         if not isinstance(uploaded_file, dict):
-            logger.error(
-                "[RocketChatOneBotBridge] plain media upload 响应缺少 file 对象，无法继续 mediaConfirm: room_id=%s data=%s",
-                room_id,
-                upload_data,
+            raise RuntimeError(
+                f"Rocket.Chat rooms.media response missing file object: "
+                f"room_id={room_id!r} data={upload_data}"
             )
-            return None
 
         file_id = str(uploaded_file.get("_id") or "").strip()
         if not file_id:
-            logger.error(
-                "[RocketChatOneBotBridge] plain media upload 响应缺少 file._id，无法继续 mediaConfirm: room_id=%s data=%s",
-                room_id,
-                upload_data,
+            raise RuntimeError(
+                f"Rocket.Chat rooms.media response missing file._id: "
+                f"room_id={room_id!r} data={upload_data}"
             )
-            return None
 
         payload = self._build_plain_media_confirm_payload(
+            file_name=resolved_name,
             description=description,
             tmid=tmid,
         )
-        data = await self.client._post_json_message(
+        data = await self.client._request_json(
+            "POST",
             f"{self.client.config.server_url}/api/v1/rooms.mediaConfirm/{room_id}/{file_id}",
-            payload,
+            headers=self.client._auth_headers(),
+            json=payload,
         )
-        if not data:
-            logger.warning(
-                "[RocketChatOneBotBridge] plain mediaConfirm 失败，准备回退到自回显兜底: room_id=%s file_id=%s",
-                room_id,
-                file_id,
+        if not data.get("success"):
+            raise RuntimeError(
+                f"Rocket.Chat rooms.mediaConfirm failed: room_id={room_id!r} "
+                f"file_id={file_id!r} data={data}"
             )
-            return None
+        self.client._mark_outbound_message_activity()
 
         message = self._extract_uploaded_message(data)
         if message is not None:
@@ -997,6 +1322,7 @@ class RocketChatMediaBridge:
         room_id: str,
         upload_data: dict[str, Any],
         *,
+        resolved_name: str,
         description: str = "",
         tmid: Optional[str] = None,
     ) -> tuple[dict[str, Any], bool]:
@@ -1008,6 +1334,7 @@ class RocketChatMediaBridge:
         confirmed_data = await self._confirm_plain_uploaded_file(
             room_id,
             upload_data,
+            resolved_name=resolved_name,
             description=description,
             tmid=tmid,
         )
@@ -1037,13 +1364,25 @@ class RocketChatMediaBridge:
         if not result.get("ok") or not isinstance(data, dict):
             return None, result, False
 
-        finalized_data, needs_endpoint_fallback = await self._finalize_plain_upload_response(
-            endpoint_name,
-            room_id,
-            data,
-            description=description,
-            tmid=tmid,
-        )
+        try:
+            finalized_data, needs_endpoint_fallback = await self._finalize_plain_upload_response(
+                endpoint_name,
+                room_id,
+                data,
+                resolved_name=resolved_name,
+                description=description,
+                tmid=tmid,
+            )
+        except RocketChatHTTPError as exc:
+            error_result = {
+                "ok": False,
+                "status": exc.status,
+                "content_type": exc.get_header("Content-Type"),
+                "data": exc.data if isinstance(exc.data, dict) else None,
+                "text": exc.response_text,
+                "error": repr(exc),
+            }
+            return None, error_result, exc.endpoint_incompatible
         return finalized_data, result, needs_endpoint_fallback
 
     async def upload_plain_file(
@@ -1054,7 +1393,15 @@ class RocketChatMediaBridge:
         description: str = "",
         tmid: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
-        primary_endpoint = self._normalize_plain_upload_endpoint(self._plain_upload_endpoint_preference)
+        capabilities = getattr(self.client, "capabilities", None)
+        legacy_fallback_allowed = bool(
+            capabilities is None or capabilities.allows_legacy_upload_fallback
+        )
+        primary_endpoint = (
+            self._normalize_plain_upload_endpoint(self._plain_upload_endpoint_preference)
+            if legacy_fallback_allowed
+            else self._PLAIN_UPLOAD_MODERN_ENDPOINT
+        )
         primary_data, primary_result, primary_needs_fallback = await self._try_plain_upload_endpoint(
             primary_endpoint,
             room_id,
@@ -1068,6 +1415,15 @@ class RocketChatMediaBridge:
             return primary_data
 
         if not primary_needs_fallback and not self._is_plain_upload_endpoint_incompatible(primary_result):
+            return None
+        if not legacy_fallback_allowed:
+            logger.error(
+                "[RocketChatOneBotBridge] Rocket.Chat 8.x 上传链路失败，"
+                "不会回退已移除的 rooms.upload: server=%s version=%s status=%s",
+                self.client.config.server_url,
+                getattr(capabilities, "version_text", "unknown"),
+                primary_result.get("status") or "-",
+            )
             return None
 
         fallback_endpoint = self._alternate_plain_upload_endpoint(primary_endpoint)
@@ -1112,6 +1468,7 @@ class RocketChatMediaBridge:
         description: str = "",
         tmid: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
+        resolved_name, _ = self.prepare_upload_metadata(file_path, resolved_name)
         if not self._check_upload_file_size(
             room_id=room_id,
             file_path=file_path,
@@ -1561,7 +1918,6 @@ class RocketChatMediaBridge:
             tmp.close()
             os.unlink(tmp.name)
             raise
-
 
 def summarize_unsupported_media(raw_msg: dict) -> str | None:
     attachment_count = 0

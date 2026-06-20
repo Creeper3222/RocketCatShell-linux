@@ -12,7 +12,8 @@ from .config import BridgeConfig
 from .json_codec import json_dumps, json_loads
 
 
-_ONEBOT_WS_MAX_MSG_SIZE = 32 * 1024 * 1024
+_ONEBOT_WS_MIN_MSG_SIZE = 8 * 1024 * 1024
+_ONEBOT_WS_MEDIA_ENVELOPE_EXTRA = 8 * 1024 * 1024
 
 
 ActionHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -36,6 +37,11 @@ class OneBotReverseWsClient:
         self._sender_task: asyncio.Task | None = None
         self._outgoing: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._consecutive_reconnect_failures = 0
+
+    def _max_ws_msg_size(self) -> int:
+        media_limit = max(0, int(getattr(self.config, "remote_media_max_size", 0) or 0))
+        encoded_limit = ((media_limit + 2) // 3) * 4 if media_limit else 0
+        return max(_ONEBOT_WS_MIN_MSG_SIZE, encoded_limit + _ONEBOT_WS_MEDIA_ENVELOPE_EXTRA)
 
     async def start(self) -> None:
         if self._running:
@@ -99,7 +105,7 @@ class OneBotReverseWsClient:
                     headers=headers,
                     heartbeat=30.0,
                     autoping=True,
-                    max_msg_size=_ONEBOT_WS_MAX_MSG_SIZE,
+                    max_msg_size=self._max_ws_msg_size(),
                 ) as ws:
                     self._ws = ws
                     self._consecutive_reconnect_failures = 0
@@ -109,14 +115,21 @@ class OneBotReverseWsClient:
                     await self._listen_loop(ws)
                     if self._running:
                         close_code = getattr(ws, "close_code", None)
-                        close_reason = (
-                            "，疑似收到超出限制的 OneBot 大消息"
-                            if close_code == 1009
-                            else ""
-                        )
-                        logger.warning(
-                            f"[RocketChatOneBotBridge] OneBot reverse WS 已断开 (close_code={close_code}){close_reason}，{self.config.reconnect_delay:.1f}s 后重连。"
-                        )
+                        if close_code == 1009:
+                            logger.error(
+                                "[RocketChatOneBotBridge] OneBot reverse WS 收到超出传输上限的消息，"
+                                "可能是媒体上传超过 bot 远程媒体大小上限: "
+                                "bot_id=%s bot_name=%s remote_media_max_size=%s max_msg_size=%s，%.1fs 后重连。",
+                                self.config.bot_id or "-",
+                                self.config.display_name or "-",
+                                self.config.remote_media_max_size,
+                                self._max_ws_msg_size(),
+                                self.config.reconnect_delay,
+                            )
+                        else:
+                            logger.warning(
+                                f"[RocketChatOneBotBridge] OneBot reverse WS 已断开 (close_code={close_code})，{self.config.reconnect_delay:.1f}s 后重连。"
+                            )
                         await asyncio.sleep(self.config.reconnect_delay)
             except asyncio.CancelledError:
                 raise

@@ -768,10 +768,13 @@
                 <span>OneBot Access Token</span>
                 <input name="onebot_access_token" type="text" autocomplete="off" />
               </label>
-              <label class="field-block">
-                <span>OneBot self_id</span>
-                <input name="onebot_self_id" type="number" min="1" step="1" />
-              </label>
+              <div class="field-block identity-review-field">
+                <span>User 映射</span>
+                <button id="openUserMappingsButton" class="action-button primary" type="button">
+                  审查 User 映射列表
+                </button>
+                <small id="userMappingsButtonHint">首次成功登录后即可审查映射。</small>
+              </div>
             </div>
           </section>
 
@@ -823,6 +826,50 @@
         <div class="modal-footer">
           <button id="cancelButton" class="action-button subtle" type="button">取消</button>
           <button id="submitButton" class="action-button primary" type="button">保存 Bot</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="userMappingsModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="userMappingsModalTitle">
+      <div class="modal-panel user-mappings-panel">
+        <div class="modal-header">
+          <div>
+            <p class="eyebrow">User Identity Registry</p>
+            <h2 id="userMappingsModalTitle">User 映射列表</h2>
+          </div>
+          <button id="userMappingsCloseButton" class="icon-button" type="button" aria-label="关闭">×</button>
+        </div>
+        <div class="user-mappings-toolbar">
+          <input id="userMappingsSearchInput" type="search" placeholder="搜索 userId、用户名、昵称或 OneBot ID" />
+          <button id="userMappingsSearchButton" class="action-button subtle" type="button">搜索</button>
+          <button id="userMappingsRefreshButton" class="action-button primary" type="button">刷新列表</button>
+          <span id="userMappingsSummary" class="status-detail"></span>
+        </div>
+        <div id="userMappingsNotice" class="banner warning hidden"></div>
+        <div class="user-mappings-table-shell">
+          <table class="user-mappings-table">
+            <thead>
+              <tr>
+                <th>userId</th>
+                <th>用户名</th>
+                <th>昵称</th>
+                <th>OneBot ID</th>
+                <th>主槽 / 偏移</th>
+                <th>状态</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="userMappingsTableBody"></tbody>
+          </table>
+          <p id="userMappingsEmpty" class="file-table-message hidden">尚未建立任何用户映射。</p>
+        </div>
+        <div class="user-mappings-pagination">
+          <button id="userMappingsPrevButton" class="action-button subtle" type="button">上一页</button>
+          <span id="userMappingsPageLabel">1 / 1</span>
+          <button id="userMappingsNextButton" class="action-button subtle" type="button">下一页</button>
+        </div>
+        <div class="modal-footer">
+          <button id="userMappingsDoneButton" class="action-button primary" type="button">完成</button>
         </div>
       </div>
     </div>
