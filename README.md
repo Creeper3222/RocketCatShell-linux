@@ -31,7 +31,7 @@
 - WebUI 增加醒目的 User 映射入口以及映射搜索、刷新、保存、冲突高亮和删除重建操作。覆盖和删除使用 revision 校验，防止用旧页面覆盖新数据。
 - 哈希冲突会持久化到每个相关 Bot 的 `re_waring.json`，并在对应 Bot 每次加载时重新输出详细 warning。
 - Rocket.Chat 支持范围明确为 `7.10.x–8.5.x`：DDP 继续承担 resume 和订阅，业务 method 优先走 REST；8.x 固定使用 `rooms.media` + `rooms.mediaConfirm`，7.10 仅在现代端点明确不存在时回退旧上传接口。
-- E2EE 媒体、历史消息媒体和生图参考图继续使用 Docker 共享媒体目录；关闭 Base64 模式时翻译为宿主机可见路径，开启时使用 `base64://`，不会向上游暴露容器内回环 HTTP 地址。
+- E2EE 媒体、历史消息媒体和生图参考图继续使用 Docker 共享媒体目录。v0.1.9 热修复会按文件签名纠正缺失扩展名的解密图片，并优先把图片引用导出为 AstrBot 可访问的共享路径，避免生图插件拒绝 `base64://` 或 RocketCatShell 私有数据目录。
 - 新增独立持久化挂载 `/app/data/user_identity`。升级前必须备份 `config/`、`data/bots/` 和 AstrBot 管理员配置，再运行 `tools/migrate_user_identity.py` 迁移旧 ID。
 - Docker Hub 从本版本开始同时发布 `linux/amd64` 与 `linux/arm64`，固定版本标签为 `v0.1.9`，稳定滚动标签为 `latest`。
 
@@ -160,7 +160,8 @@ docker run --rm \
 
   迁移工具会备份 Bot 旧映射文件、建立服务器级 SQLite、重建私聊绑定、清理废弃 self ID 配置字段，并写出 `identity_scope.json` 与 `user_identity_migration.json`。只有迁移清单明确命中的旧 AstrBot 管理员 ID 才会被替换。
 - WebUI 文件管理边界是容器内 `/app`，宿主机目录只有通过 compose 挂载到 `/app/config`、`/app/data/...`、`/app/logs` 等路径后才可见；这个边界只用于文件管理，不会改变 `ROCKETCAT_SHARED_MEDIA_DIR` / `ROCKETCAT_SHARED_MEDIA_HOST_DIR` 的共享媒体路径翻译语义。
-- 共享媒体导出仍保留在 Docker 版里：默认继续使用 `ROCKETCAT_SHARED_MEDIA_HOST_DIR` 路径传输，把容器内共享媒体目录翻译为宿主机可见路径；只有在路径对上游不可见，或 AstrBot 与 RocketCatShell 同为 Docker、更适合直接传 Base64 时，才建议启用 `enable_base64_media_transport`，或在首次启动前把 `.env` 里的 `ROCKETCAT_DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT=true`。Base64 是兼容兜底，不是 Docker 版默认快路径。
+- 共享媒体导出使用两个独立路径：`ROCKETCAT_SHARED_MEDIA_SOURCE_DIR` 是 Docker 宿主机实际挂载源，`ROCKETCAT_SHARED_MEDIA_HOST_DIR` 是 OneBot 消息中交给 AstrBot 的可见路径。宿主机部署 AstrBot 时，两者都应指向 AstrBot 官方 `data/temp` 下的专用子目录；AstrBot 也在 Docker 时，应把同一宿主目录挂到 AstrBot 容器的 `data/temp` 内，并把后者填为 AstrBot 容器内路径。
+- `ROCKETCAT_PREFER_SHARED_MEDIA_PATH_FOR_IMAGES=true` 会让图片即使在 Base64 兼容模式开启时也优先走共享路径，保证多引用、多参考图和生图插件可读取；音频、视频等其它媒体仍可使用 Base64 兼容传输。
 - 官方镜像自 `v0.1.9` 起同时支持 `linux/amd64` 和 `linux/arm64`；Docker 会根据宿主机架构自动选择对应 manifest。
 
 ---
@@ -514,7 +515,15 @@ ws://127.0.0.1:6199/ws/
 ws://host.docker.internal:6200/ws/
 ```
 
-如果 AstrBot 也跑在 Docker，并且它不能直接访问 `ROCKETCAT_SHARED_MEDIA_HOST_DIR` 指向的共享目录，那么可以在“基础设置”页启用“启用 Base64 传输媒体”，或者在首次部署前把 `.env` 里的 `ROCKETCAT_DEFAULT_ENABLE_BASE64_MEDIA_TRANSPORT=true`，让新生成的 `shell.json` 默认启用该模式。
+生图参考图必须落在 AstrBot 允许读取的安全根目录内。宿主机部署 AstrBot 时，可使用：
+
+```text
+ROCKETCAT_SHARED_MEDIA_SOURCE_DIR=/path/to/AstrBot/data/temp/rocketcat_shared_media
+ROCKETCAT_SHARED_MEDIA_HOST_DIR=/path/to/AstrBot/data/temp/rocketcat_shared_media
+ROCKETCAT_PREFER_SHARED_MEDIA_PATH_FOR_IMAGES=true
+```
+
+如果 AstrBot 也运行在 Docker，请把 `ROCKETCAT_SHARED_MEDIA_SOURCE_DIR` 指向宿主机共享目录，同时将该目录挂载到 AstrBot 容器的 `data/temp/rocketcat_shared_media`，并把 `ROCKETCAT_SHARED_MEDIA_HOST_DIR` 设置为 AstrBot 容器内的对应绝对路径。Base64 模式可继续用于其它媒体，但当前生图插件不接受 `base64://` 参考图。
 
 ### 2. 启动 RocketCatShell
 

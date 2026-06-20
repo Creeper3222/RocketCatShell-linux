@@ -142,6 +142,7 @@ class RocketChatMediaBridge:
     def _write_cached_media_file(self, raw: bytes, suffix: str) -> str:
         self._local_media_cache_dir.mkdir(parents=True, exist_ok=True)
         safe_suffix = self._safe_media_suffix(suffix)
+        safe_suffix = self._detect_media_suffix(raw, safe_suffix)
         digest = hashlib.sha256(raw).hexdigest()
         target = self._local_media_cache_dir / f"e2ee_{digest}{safe_suffix}"
         if not target.exists():
@@ -198,11 +199,36 @@ class RocketChatMediaBridge:
         cached_path = self._copy_allowed_media_into_cache(file_path)
         if not cached_path:
             return None
-        if self._is_base64_media_transport_enabled():
+        prefer_shared_path = self._prefer_shared_path_for_image(
+            cached_path,
+            name=name,
+            content_type=content_type,
+        )
+        if self._is_base64_media_transport_enabled() and not prefer_shared_path:
             base64_ref = self._encode_media_file_to_base64(cached_path)
             if base64_ref:
                 return base64_ref
         return self.translate_shared_media_path_to_host(cached_path)
+
+    @staticmethod
+    def _prefer_shared_path_for_image(
+        file_path: str,
+        *,
+        name: str = "",
+        content_type: str = "",
+    ) -> bool:
+        configured = str(
+            os.environ.get("ROCKETCAT_PREFER_SHARED_MEDIA_PATH_FOR_IMAGES", "false")
+        ).strip().lower()
+        if configured in {"0", "false", "no", "off"}:
+            return False
+        normalized_type = str(content_type or "").split(";", 1)[0].strip().lower()
+        if normalized_type.startswith("image/"):
+            return True
+        image_suffixes = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"}
+        name_suffix = RocketChatMediaBridge._safe_media_suffix(name, "")
+        path_suffix = RocketChatMediaBridge._safe_media_suffix(file_path, "")
+        return name_suffix in image_suffixes or path_suffix in image_suffixes
 
     def _publish_base64_media_ref(self, file_ref: str, *, kind: str) -> str | None:
         payload = str(file_ref or "").removeprefix("base64://")

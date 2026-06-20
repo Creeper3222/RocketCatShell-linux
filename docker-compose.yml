@@ -17,7 +17,7 @@ services:
         source: ${ROCKETCAT_USER_IDENTITY_DIR:-/opt/rocketcatshell/data/user_identity}
         target: /app/data/user_identity
       - type: bind
-        source: ${ROCKETCAT_SHARED_MEDIA_HOST_DIR:-/opt/rocketcatshell/data/bots/_shared_media}
+        source: ${ROCKETCAT_SHARED_MEDIA_SOURCE_DIR:-/opt/astrbot/data/temp/rocketcat_shared_media}
         target: /app/data/bots/_shared_media
       - type: bind
         source: ${ROCKETCAT_PLUGINS_DIR:-/opt/rocketcatshell/data/plugins}
@@ -33,7 +33,8 @@ services:
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       ROCKETCAT_SHARED_MEDIA_DIR: /app/data/bots/_shared_media
-      ROCKETCAT_SHARED_MEDIA_HOST_DIR: ${ROCKETCAT_SHARED_MEDIA_HOST_DIR:-/opt/rocketcatshell/data/bots/_shared_media}
+      ROCKETCAT_SHARED_MEDIA_HOST_DIR: ${ROCKETCAT_SHARED_MEDIA_HOST_DIR:-/opt/astrbot/data/temp/rocketcat_shared_media}
+      ROCKETCAT_PREFER_SHARED_MEDIA_PATH_FOR_IMAGES: ${ROCKETCAT_PREFER_SHARED_MEDIA_PATH_FOR_IMAGES:-true}
       ROCKETCAT_PERF_TRACE: ${ROCKETCAT_PERF_TRACE:-false}
       ROCKETCAT_WEBUI_HOST: ${ROCKETCAT_WEBUI_HOST:-0.0.0.0}
       ROCKETCAT_WEBUI_PORT: ${ROCKETCAT_WEBUI_PORT:-5751}
