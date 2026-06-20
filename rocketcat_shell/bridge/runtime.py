@@ -38,6 +38,7 @@ class BridgeRuntime:
         raw_config: dict[str, Any] | Any,
         *,
         data_dir: Path | None = None,
+        media_temp_dir: Path | None = None,
         instance_name: str = "bridge",
         message_index_max_entries: int = DurableIdMap._DEFAULT_MESSAGE_WINDOW_SIZE,
         media_publication_service: MediaPublicationService | None = None,
@@ -51,6 +52,10 @@ class BridgeRuntime:
             data_dir = resolve_plugin_data_dir(plugin_root)
         self.data_dir = data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        if media_temp_dir is None:
+            media_temp_dir = self.data_dir.parent.parent / "temp"
+        self.media_temp_dir = media_temp_dir
+        self.media_temp_dir.mkdir(parents=True, exist_ok=True)
         self.message_index_max_entries = DurableIdMap.normalize_message_window_size(
             message_index_max_entries
         )
@@ -310,7 +315,7 @@ class BridgeRuntime:
         self.rocketchat = RocketChatClient(
             self.config,
             media_publication_service=self.media_publication_service,
-            media_cache_dir=self.data_dir / "media_cache",
+            media_temp_dir=self.media_temp_dir,
             on_message=self._handle_rocketchat_message,
             on_reconnect_exhausted=self._handle_reconnect_exhausted,
         )

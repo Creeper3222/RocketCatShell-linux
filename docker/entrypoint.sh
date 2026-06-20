@@ -9,6 +9,7 @@ EXAMPLES_DIR="/opt/rocketcat/examples"
 
 mkdir -p \
     "$CONFIG_DIR/plugins_config" \
+    "$APP_DIR/data/temp" \
     "$APP_DIR/data/bots" \
     "$APP_DIR/data/user_identity" \
     "$PLUGINS_DIR" \

@@ -62,7 +62,7 @@ class RocketChatClient:
         self,
         config: BridgeConfig,
         media_publication_service: MediaPublicationService | None = None,
-        media_cache_dir: str | os.PathLike[str] | None = None,
+        media_temp_dir: str | os.PathLike[str] | None = None,
         on_message: MessageCallback | None = None,
         on_reconnect_exhausted: FailureCallback | None = None,
     ):
@@ -106,7 +106,7 @@ class RocketChatClient:
         )
         self.media = RocketChatMediaBridge(
             self,
-            cache_dir=media_cache_dir,
+            temp_dir=media_temp_dir,
             media_publication_service=media_publication_service,
         )
         self._consecutive_reconnect_failures = 0

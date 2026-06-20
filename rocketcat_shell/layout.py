@@ -11,6 +11,7 @@ class ProjectLayout:
     config_dir: Path
     plugins_config_dir: Path
     data_dir: Path
+    temp_dir: Path
     bots_dir: Path
     plugins_dir: Path
     plugin_data_dir: Path
@@ -26,6 +27,7 @@ class ProjectLayout:
         config_dir = project_root / "config"
         plugins_config_dir = config_dir / "plugins_config"
         data_dir = project_root / "data"
+        temp_dir = data_dir / "temp"
         bots_dir = data_dir / "bots"
         plugins_dir = data_dir / "plugins"
         plugin_data_dir = data_dir / "plugin_data"
@@ -36,6 +38,7 @@ class ProjectLayout:
             config_dir=config_dir,
             plugins_config_dir=plugins_config_dir,
             data_dir=data_dir,
+            temp_dir=temp_dir,
             bots_dir=bots_dir,
             plugins_dir=plugins_dir,
             plugin_data_dir=plugin_data_dir,
@@ -49,6 +52,7 @@ class ProjectLayout:
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.plugins_config_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.bots_dir.mkdir(parents=True, exist_ok=True)
         self.plugins_dir.mkdir(parents=True, exist_ok=True)
         self.plugin_data_dir.mkdir(parents=True, exist_ok=True)

@@ -30,29 +30,28 @@ class RocketChatMediaBridge:
         self,
         client: Any,
         *,
-        cache_dir: str | os.PathLike[str] | None = None,
+        temp_dir: str | os.PathLike[str] | None = None,
         media_publication_service: MediaPublicationService | None = None,
     ) -> None:
         self.client = client
         self._plain_upload_endpoint_preference: str | None = None
-        self._local_media_cache_dir = self._resolve_local_media_cache_dir(cache_dir)
+        self._media_temp_dir = self._resolve_media_temp_dir(temp_dir)
         self._media_publication_service = media_publication_service
 
-    def _resolve_local_media_cache_dir(
+    def _resolve_media_temp_dir(
         self,
-        cache_dir: str | os.PathLike[str] | None,
+        temp_dir: str | os.PathLike[str] | None,
     ) -> Path:
-        if cache_dir is not None:
-            return Path(cache_dir).resolve()
-        bot_id = str(getattr(self.client.config, "bot_id", "") or "default").strip()
-        return (Path(tempfile.gettempdir()) / "rocketcat_shell_media" / bot_id).resolve()
+        if temp_dir is not None:
+            return Path(temp_dir).resolve()
+        return (Path(tempfile.gettempdir()) / "rocketcat_shell_media").resolve()
 
     def _create_media_temp_file(self, suffix: str):
-        self._local_media_cache_dir.mkdir(parents=True, exist_ok=True)
+        self._media_temp_dir.mkdir(parents=True, exist_ok=True)
         return tempfile.NamedTemporaryFile(
             suffix=suffix,
             delete=False,
-            dir=self._local_media_cache_dir,
+            dir=self._media_temp_dir,
         )
 
     @property
@@ -64,7 +63,7 @@ class RocketChatMediaBridge:
         )
 
     async def start(self) -> None:
-        self._local_media_cache_dir.mkdir(parents=True, exist_ok=True)
+        self._media_temp_dir.mkdir(parents=True, exist_ok=True)
 
     async def stop(self) -> None:
         if self._media_publication_service is not None:
@@ -93,11 +92,11 @@ class RocketChatMediaBridge:
         return default
 
     def _write_cached_media_file(self, raw: bytes, suffix: str) -> str:
-        self._local_media_cache_dir.mkdir(parents=True, exist_ok=True)
+        self._media_temp_dir.mkdir(parents=True, exist_ok=True)
         safe_suffix = self._safe_media_suffix(suffix)
         safe_suffix = self._detect_media_suffix(raw, safe_suffix)
         digest = hashlib.sha256(raw).hexdigest()
-        target = self._local_media_cache_dir / f"e2ee_{digest}{safe_suffix}"
+        target = self._media_temp_dir / f"e2ee_{digest}{safe_suffix}"
         if not target.exists():
             try:
                 with target.open("xb") as handle:
@@ -112,7 +111,7 @@ class RocketChatMediaBridge:
         except (OSError, RuntimeError, ValueError):
             return False
         allowed_roots = (
-            self._local_media_cache_dir,
+            self._media_temp_dir,
             Path(tempfile.gettempdir()).resolve(),
         )
         for root in allowed_roots:

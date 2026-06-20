@@ -32,6 +32,7 @@
 - 哈希冲突会持久化到每个相关 Bot 的 `re_waring.json`，并在对应 Bot 每次加载时重新输出详细 warning。
 - Rocket.Chat 支持范围明确为 `7.10.x–8.5.x`：DDP 继续承担 resume 和订阅，业务 method 优先走 REST；8.x 固定使用 `rooms.media` + `rooms.mediaConfirm`，7.10 仅在现代端点明确不存在时回退旧上传接口。
 - v0.1.9 热修复将 RocketChat → OneBot 的图片、音频和视频统一改为带高强度随机令牌的 HTTP URL；AstrBot 使用标准下载链路把媒体自动缓存到自身 `data/temp`，无需挂载 AstrBot 专属共享目录。普通频道、E2EE、多引用、多参考图和历史 `get_msg` 使用同一链路；E2EE 解密图片会按文件签名纠正 `.jpg/.png/.gif/.webp` 扩展名。
+- RocketCatShell 自身的解密媒体与下载临时文件统一保存到 `/app/data/temp`，所有 Bot 共用该目录，便于管理员查看和手动清理；旧的 `data/bots/_shared_media` 与 `data/bots/<bot>/media_cache` 不再使用。
 - 媒体接口复用 WebUI 端口 `/_rocketcat/media/{bot_id}/{token}/{filename}`，令牌失效或文件不存在时返回 404，并设置 `no-store` 与 `nosniff`。宿主机 AstrBot 会自动收到 `127.0.0.1` URL，同网络 Docker AstrBot 默认使用 `rocketcatshell` 服务名；特殊网络可用 `ROCKETCAT_UPSTREAM_MEDIA_BASE_URL` 覆盖。
 - WebUI 已移除 Base64 媒体传输开关。旧 `shell.json` 和旧导入配置中的字段会被兼容忽略并在重新保存后清理；AstrBot → RocketChat 的协议级 `base64://` 上传以及历史 Base64 缓存解码能力继续保留。
 - 新增独立持久化挂载 `/app/data/user_identity`。升级前必须备份 `config/`、`data/bots/` 和 AstrBot 管理员配置，再运行 `tools/migrate_user_identity.py` 迁移旧 ID。
@@ -63,7 +64,7 @@
 - 新增文件 API：`GET /api/files`、`POST /api/files/read`、`POST /api/files/write`、`POST /api/files/create`、`POST /api/files/upload`、`POST /api/files/delete`、`POST /api/files/move`、`POST /api/files/rename`、`GET /api/files/preview`、`GET /api/files/download` 和 `POST /api/files/download`。
 - 文件管理 API 只接受 `/app` 内相对路径，拒绝 `..`、系统绝对路径、Windows 盘符路径和符号链接解析后的越界目标；媒体令牌接口只发布 RocketCatShell 已验证并缓存的文件，不放宽文件管理边界。
 - Docker 包装层和核心源码默认只读保护，包括 `rocketcat_shell/`、`tools/`、`docker/`、两个内置插件源码目录，以及 `requirements.txt`、`Dockerfile`、`docker-compose.yml`、`.dockerignore`、`.env.example`、`launcher.sh` 等发布与启动文件。
-- 用户挂载或创建在非保护目录中的文件仍可按规则管理。例如外部挂载到 `/app/data/plugins` 的非内置插件、`/app/data/plugin_data`、`/app/data/bots` 与 `/app/data/resource` 中的普通文件可浏览、上传、移动、删除或编辑。
+- 用户挂载或创建在非保护目录中的文件仍可按规则管理。例如外部挂载到 `/app/data/plugins` 的非内置插件、`/app/data/plugin_data`、`/app/data/temp`、`/app/data/bots` 与 `/app/data/resource` 中的普通文件可浏览、上传、移动、删除或编辑。
 - 对明确的敏感持久化数据文件增加二次鉴权，包括 `config/shell.json`、`config/bots.json`、`config/plugins_config/*.json` 和 `data/bots/**/runtime_state.json`。鉴权密码复用 WebUI 登录认证 / 文件管理鉴权密码，密码只通过请求体提交；鉴权文件保存前会再次提示修改风险。
 - 文件列表图标按常见类型细分：目录、普通文件、`.txt`、`.json/.py/.md`、`.pdf`、`.doc/.docx` 使用不同图标；PDF 类型栏单独显示为 `PDF文件`。
 - `requirements.txt` 新增 `python-multipart`，用于 WebUI 上传文件接口。
@@ -145,6 +146,7 @@
 - `docker/entrypoint.sh` 仍负责容器首次启动时写入 `config/shell.json` 默认值，并对外挂 `data/plugins` 中的内置插件执行缺失补种与版本变更自动刷新；`rocketcat_plugin_built_in_command` 与 `rocketcat_plugin_adapt_iamthinking` 都会随镜像自动同步到外挂插件目录。
 - `docker-compose.yml`、`.env` 和 `.env.example` 已改为 Linux 风格的默认持久化路径 `/opt/rocketcatshell/...`，不再使用旧的 Windows `D:/docker/...` 示例。
 - 用户身份注册表使用独立挂载 `/app/data/user_identity`；默认宿主目录为 `/opt/rocketcatshell/data/user_identity`，必须与 `config/`、`data/bots/` 一起备份。
+- 全局媒体临时目录使用独立挂载 `/app/data/temp`，默认宿主目录为 `/opt/rocketcatshell/data/temp`。该目录只保存可重建缓存，可以随时在停止相关任务后手动清理。
 - 从 v0.1.8 升级时，应先停止 RocketCatShell 与对应 OneBot 消费端并完成备份，再用 v0.1.9 镜像执行一次性迁移；下面的 AstrBot 配置挂载与参数可按实际路径调整：
 
 ```bash
@@ -161,7 +163,7 @@ docker run --rm \
 ```
 
   迁移工具会备份 Bot 旧映射文件、建立服务器级 SQLite、重建私聊绑定、清理废弃 self ID 配置字段，并写出 `identity_scope.json` 与 `user_identity_migration.json`。只有迁移清单明确命中的旧 AstrBot 管理员 ID 才会被替换。
-- WebUI 文件管理边界是容器内 `/app`，宿主机目录只有通过 compose 挂载到 `/app/config`、`/app/data/...`、`/app/logs` 等路径后才可见。媒体发布接口仅通过不可预测令牌读取 RocketCatShell 自身缓存，不需要也不会映射 AstrBot 的 `data/temp`。
+- WebUI 文件管理边界是容器内 `/app`，宿主机目录只有通过 compose 挂载到 `/app/config`、`/app/data/...`、`/app/logs` 等路径后才可见。媒体发布接口仅通过不可预测令牌读取 `/app/data/temp` 中的 RocketCatShell 自身缓存，不需要也不会映射 AstrBot 的 `data/temp`。
 - 当 OneBot 地址是 `host.docker.internal`、`localhost` 或回环地址时，媒体 URL 自动使用 `http://127.0.0.1:<WebUI端口>`；当 OneBot 指向其它 Docker 服务时，默认使用 `http://rocketcatshell:<WebUI端口>`。自定义服务名可设置 `ROCKETCAT_DOCKER_SERVICE_NAME`，远程代理或特殊网络可直接设置 `ROCKETCAT_UPSTREAM_MEDIA_BASE_URL`。
 - 官方镜像自 `v0.1.9` 起同时支持 `linux/amd64` 和 `linux/arm64`；Docker 会根据宿主机架构自动选择对应 manifest。
 
@@ -306,7 +308,7 @@ RocketCatShell 当前这一版明确不承诺合并转发消息语义。
 - Rocket.Chat 8.2+ 删除加密附件时产生的 `removed-file` 标记会在解密合并后保留。
 - Rocket.Chat 8.3+ E2EE REST 接口启用严格请求校验后，只提交对应端点允许的字段。
 - E2EE 多引用会从解密正文开头的系统引用前缀生成多个顶层 OneBot `reply`，普通正文链接不会被误判。
-- E2EE 解密媒体会写入 RocketCatShell 自身缓存，按文件签名修正图片扩展名后发布为令牌 HTTP URL，与非加密频道使用同一套上游可见性策略。
+- E2EE 解密媒体会写入所有 Bot 共用的 `data/temp`，按文件签名修正图片扩展名后发布为令牌 HTTP URL，与非加密频道使用同一套上游可见性策略。
 - 如果 E2EE 初始化失败，不会影响未加密房间的正常收发。
 
 ---
@@ -468,6 +470,7 @@ RocketCatShell 在第一次安装、还没有保存过任何配置时，会自�
 - `config/`
 - `config/plugins_config/`
 - `data/`
+- `data/temp/`
 - `data/bots/`
 - `data/user_identity/`
 - `data/plugins/`
@@ -645,7 +648,8 @@ logs/
 说明：
 
 - `config/` 只保存配置和插件主配置。
-- `data/` 保存本地插件本体、插件持久化数据、用户身份注册表和各 Bot 运行时数据。
+- `data/` 保存全局媒体临时缓存、本地插件本体、插件持久化数据、用户身份注册表和各 Bot 运行时数据。
+- `data/temp/` 保存所有 Bot 共用的解密媒体与临时下载文件；目录内容是可重建缓存，可以由用户手动查看和清理。
 - `data/user_identity/*.sqlite3` 保存服务器级 `sha256-linear-v1` 用户映射；同服多个 Bot 会共享该数据库。
 - `data/bots/<bot>/runtime.snapshot.bin` 保存最近一次热存储快照，覆盖 ID 映射、消息缓存、私聊房间映射和群上下文绑定。
 - `data/bots/<bot>/runtime.journal.bin` 保存快照之后的增量变更，用于启动恢复和窗口整理后的状态回放。

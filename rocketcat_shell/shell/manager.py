@@ -851,6 +851,7 @@ class ShellManager:
                     plugin_root=self.layout.package_root,
                     raw_config=bot.to_mapping(),
                     data_dir=self.layout.bots_dir / bot.bot_id,
+                    media_temp_dir=self.layout.temp_dir,
                     instance_name=bot.name or bot.bot_id,
                     message_index_max_entries=self._require_settings().message_index_max_entries,
                     media_publication_service=self.media_publication,

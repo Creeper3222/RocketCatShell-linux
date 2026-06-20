@@ -14,6 +14,9 @@ services:
         source: ${ROCKETCAT_BOTS_DIR:-/opt/rocketcatshell/data/bots}
         target: /app/data/bots
       - type: bind
+        source: ${ROCKETCAT_TEMP_DIR:-/opt/rocketcatshell/data/temp}
+        target: /app/data/temp
+      - type: bind
         source: ${ROCKETCAT_USER_IDENTITY_DIR:-/opt/rocketcatshell/data/user_identity}
         target: /app/data/user_identity
       - type: bind

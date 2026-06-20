@@ -19,11 +19,11 @@ COPY docker/examples /opt/rocketcat/examples
 COPY docker/entrypoint.sh /usr/local/bin/rocketcat-entrypoint.sh
 
 RUN chmod +x /usr/local/bin/rocketcat-entrypoint.sh \
-    && mkdir -p /app/config/plugins_config /app/data/bots /app/data/user_identity /app/data/plugin_data /app/logs
+    && mkdir -p /app/config/plugins_config /app/data/temp /app/data/bots /app/data/user_identity /app/data/plugin_data /app/logs
 
 EXPOSE 5751
 
-VOLUME ["/app/config", "/app/data/bots", "/app/data/user_identity", "/app/data/plugins", "/app/data/plugin_data", "/app/logs"]
+VOLUME ["/app/config", "/app/data/temp", "/app/data/bots", "/app/data/user_identity", "/app/data/plugins", "/app/data/plugin_data", "/app/logs"]
 
 ENTRYPOINT ["/usr/local/bin/rocketcat-entrypoint.sh"]
 CMD []

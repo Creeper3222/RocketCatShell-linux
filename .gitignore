@@ -4,6 +4,7 @@ config/
 logs/
 tests/
 data/bots/
+data/temp/
 data/plugin_data/
 data/resource/
 data/user_identity/
