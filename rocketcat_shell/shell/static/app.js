@@ -1112,6 +1112,10 @@ function renderBasicInfo(payload) {
             <code>${escapeHtml(item.server_url || '-')}</code>
           </div>
         </div>
+        <div class="basic-meta-row wide">
+          <span>服务端版本</span>
+          <strong>${escapeHtml(`${item.server_version || 'unknown'} · ${item.compatibility_status || 'unknown'}`)}</strong>
+        </div>
         <div class="basic-meta-row wide basic-target-row">
           <div class="basic-target-summary">
             <div class="basic-room-avatar-shell" title="${escapeHtml(serverDisplayName || '未获取到服务器昵称')}">

@@ -436,6 +436,7 @@ class ShellManager:
                     data_dir=self.layout.bots_dir / bot.bot_id,
                     message_index_max_entries=settings.message_index_max_entries,
                 )
+                item["onebot_self_id"] = self._read_persisted_self_id(bot.bot_id) or None
             items.append(item)
 
         items.sort(
@@ -926,6 +927,8 @@ class ShellManager:
             "status_code": "pending",
             "status_label": "等待连接",
             "server_url": bot.server_url,
+            "server_version": "unknown",
+            "compatibility_status": "unknown",
             "onebot_self_id": self._read_persisted_self_id(bot.bot_id),
             "server_display_name": "",
             "server_avatar_url": "",

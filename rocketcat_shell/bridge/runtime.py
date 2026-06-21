@@ -151,7 +151,6 @@ class BridgeRuntime:
         return await self.id_map.rebuild_message_window(force_compact=force_compact)
 
     async def get_basic_info_summary(self) -> dict[str, Any] | None:
-        self._reload_config_snapshot()
         if not self.config.enabled:
             return None
 
@@ -162,8 +161,16 @@ class BridgeRuntime:
         user_id = ""
         server_display_name = ""
         server_avatar_url = ""
+        server_version = "unknown"
+        compatibility_status = "unknown"
 
         if self.rocketchat is not None:
+            server_version = str(
+                self.rocketchat.capabilities.version_text or "unknown"
+            )
+            compatibility_status = str(
+                self.rocketchat.capabilities.compatibility_status or "unknown"
+            )
             try:
                 user_info = await self.rocketchat.get_current_user_info()
             except Exception:
@@ -211,6 +218,8 @@ class BridgeRuntime:
             "status_code": status_code,
             "status_label": status_label,
             "server_url": self.config.server_url,
+            "server_version": server_version,
+            "compatibility_status": compatibility_status,
             "onebot_self_id": self.config.onebot_self_id,
             "server_display_name": server_display_name,
             "server_avatar_url": server_avatar_url,
@@ -219,7 +228,6 @@ class BridgeRuntime:
         }
 
     def build_diagnostic_summary(self) -> dict[str, Any]:
-        self._reload_config_snapshot()
         return build_runtime_diagnostic_item(
             instance_name=self.instance_name,
             config=self.config,

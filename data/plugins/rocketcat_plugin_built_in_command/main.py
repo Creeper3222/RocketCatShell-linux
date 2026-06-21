@@ -203,6 +203,12 @@ class Plugin(RocketCatPlugin):
         normalized_nickname = nickname or normalized_login_username or client_name or "-"
         normalized_self_id = str(runtime.bridge_config.onebot_self_id or "").strip() or "-"
         normalized_server_url = str(runtime.bridge_config.server_url or "").strip() or "-"
+        server_version = str(
+            runtime.rocketchat.capabilities.version_text or "unknown"
+        ).strip() or "unknown"
+        compatibility_status = str(
+            runtime.rocketchat.capabilities.compatibility_status or "unknown"
+        ).strip() or "unknown"
         bot_avatar_url = str(runtime.rocketchat.resolve_avatar_url(user_info, login_username) or "").strip()
 
         server_avatar_url = ""
@@ -226,6 +232,8 @@ class Plugin(RocketCatPlugin):
             "nickname": normalized_nickname,
             "self_id": normalized_self_id,
             "server_url": normalized_server_url,
+            "server_version": server_version,
+            "compatibility_status": compatibility_status,
             "status_label": self._resolve_status_label(runtime),
             "bot_avatar_url": bot_avatar_url,
             "server_avatar_url": server_avatar_url,
@@ -576,6 +584,11 @@ class Plugin(RocketCatPlugin):
         return "\n".join(
             [
                 f"Rocket.Chat 服务器：{reply_context.get('server_url') or '-'}",
+                (
+                    "服务端版本："
+                    f"{reply_context.get('server_version') or 'unknown'}"
+                    f" · {reply_context.get('compatibility_status') or 'unknown'}"
+                ),
                 "频道头像：",
             ]
         )
