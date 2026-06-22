@@ -51,7 +51,6 @@ class ShellManager:
         self.settings = load_or_create_shell_settings(self.layout.shell_settings_path)
         self.bots = self.registry.load(defaults=self.settings)
 
-        self._persist_shell_settings()
         self.registry.save(self.bots)
         if start_runtimes:
             await self._reconcile_runtimes("shell initialize")
