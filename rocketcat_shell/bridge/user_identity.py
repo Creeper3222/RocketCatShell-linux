@@ -4,8 +4,10 @@ import asyncio
 import hashlib
 import json
 import sqlite3
+import tempfile
 import threading
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -23,6 +25,7 @@ USER_ID_MAX = 99_999_999_999
 USER_ID_TABLE_SIZE = 90_000_000_000
 USER_ID_DOMAIN = b"rocketcat-user-id-v1\x00"
 IDENTITY_SCHEMA_VERSION = 1
+DEFAULT_IDENTITY_CACHE_MAX_ENTRIES = 4096
 
 
 class UserIdentityError(RuntimeError):
@@ -56,6 +59,19 @@ class UserIdentityMapping:
 
     def to_id_mapping(self) -> IdMapping:
         return IdMapping("user", self.user_id, self.onebot_id)
+
+
+@dataclass(slots=True)
+class _UserIdentitySharedState:
+    connection: sqlite3.Connection | None
+    lock: threading.RLock
+    by_user: OrderedDict[str, UserIdentityMapping]
+    by_onebot: OrderedDict[int, str]
+    bot_user_seen: OrderedDict[tuple[str, str], None]
+    cache_max_entries: int
+    initialized: bool = False
+    cache_hits: int = 0
+    cache_misses: int = 0
 
 
 def compute_primary_onebot_id(user_id: str) -> int:
@@ -115,6 +131,9 @@ def build_server_scope_name(server_url: str, cloud_workspace_id: str = "") -> st
 
 
 class UserIdentityRegistry:
+    _shared_states_lock = threading.Lock()
+    _shared_states: dict[str, _UserIdentitySharedState] = {}
+
     def __init__(
         self,
         database_path: Path,
@@ -122,16 +141,48 @@ class UserIdentityRegistry:
         scope_key: str,
         bot_id: str = "",
         warning_path: Path | None = None,
+        cache_max_entries: int = DEFAULT_IDENTITY_CACHE_MAX_ENTRIES,
     ):
-        self.database_path = Path(database_path)
+        self.database_path = Path(database_path).resolve()
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.scope_key = str(scope_key)
         self.bot_id = str(bot_id or "").strip()
         self.warning_path = Path(warning_path) if warning_path is not None else None
-        self._lock = threading.RLock()
-        self._by_user: dict[str, UserIdentityMapping] = {}
-        self._by_onebot: dict[int, str] = {}
-        self._bot_user_seen: set[tuple[str, str]] = set()
+        normalized_cache_max = max(128, int(cache_max_entries or DEFAULT_IDENTITY_CACHE_MAX_ENTRIES))
+        state_key = str(self.database_path)
+        try:
+            is_temporary_database = self.database_path.is_relative_to(
+                Path(tempfile.gettempdir()).resolve()
+            )
+        except (OSError, ValueError):
+            is_temporary_database = False
+        self._persistent_connection = not is_temporary_database
+        with self._shared_states_lock:
+            state = self._shared_states.get(state_key)
+            if state is None:
+                connection = (
+                    self._create_connection()
+                    if self._persistent_connection
+                    else None
+                )
+                state = _UserIdentitySharedState(
+                    connection=connection,
+                    lock=threading.RLock(),
+                    by_user=OrderedDict(),
+                    by_onebot=OrderedDict(),
+                    bot_user_seen=OrderedDict(),
+                    cache_max_entries=normalized_cache_max,
+                )
+                self._shared_states[state_key] = state
+            else:
+                state.cache_max_entries = normalized_cache_max
+        self._state = state
+        self._lock = state.lock
+        self._by_user = state.by_user
+        self._by_onebot = state.by_onebot
+        self._bot_user_seen = state.bot_user_seen
+        with self._lock:
+            self._evict_caches_locked()
         self._initialize()
 
     @classmethod
@@ -143,6 +194,7 @@ class UserIdentityRegistry:
         cloud_workspace_id: str = "",
         bot_id: str = "",
         warning_path: Path | None = None,
+        cache_max_entries: int = DEFAULT_IDENTITY_CACHE_MAX_ENTRIES,
     ) -> "UserIdentityRegistry":
         scope_key = build_server_scope_key(server_url, cloud_workspace_id)
         scope_name = hashlib.sha256(scope_key.encode("utf-8")).hexdigest()[:24]
@@ -152,18 +204,37 @@ class UserIdentityRegistry:
             scope_key=scope_key,
             bot_id=bot_id,
             warning_path=warning_path,
+            cache_max_entries=cache_max_entries,
         )
 
     def _connect(self) -> sqlite3.Connection:
+        connection = self._state.connection
+        if connection is not None:
+            return connection
+        return self._create_connection()
+
+    def _create_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
             self.database_path,
             timeout=10.0,
             isolation_level=None,
+            check_same_thread=False,
         )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=10000")
         return connection
+
+    def cache_summary(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "by_user_entries": len(self._by_user),
+                "by_onebot_entries": len(self._by_onebot),
+                "bot_user_seen_entries": len(self._bot_user_seen),
+                "max_entries": self._state.cache_max_entries,
+                "hits": self._state.cache_hits,
+                "misses": self._state.cache_misses,
+            }
 
     @contextmanager
     def _open_connection(self):
@@ -171,10 +242,13 @@ class UserIdentityRegistry:
         try:
             yield connection
         finally:
-            connection.close()
+            if self._state.connection is None:
+                connection.close()
 
     def _initialize(self) -> None:
         with self._lock, self._open_connection() as connection:
+            if self._state.initialized:
+                return
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=NORMAL")
             connection.executescript(
@@ -255,6 +329,7 @@ class UserIdentityRegistry:
                     ("schema_version", str(IDENTITY_SCHEMA_VERSION)),
                 ),
             )
+            self._state.initialized = True
 
     async def ensure_mapping(
         self,
@@ -267,6 +342,18 @@ class UserIdentityRegistry:
         primary_override: int | None = None,
         bot_id: str | None = None,
     ) -> UserIdentityMapping:
+        cached = self._get_matching_cached_mapping(
+            user_id,
+            username=username,
+            nickname=nickname,
+            is_bot=is_bot,
+            synthetic=synthetic,
+            bot_id=bot_id,
+        )
+        if cached is not None:
+            self._record_cache_result(hit=True)
+            return cached
+        self._record_cache_result(hit=False)
         return await asyncio.to_thread(
             self.ensure_mapping_sync,
             user_id,
@@ -309,6 +396,7 @@ class UserIdentityRegistry:
                 normalized_user_id,
             ) not in self._bot_user_seen:
                 self._touch_bot_user(normalized_bot_id, normalized_user_id)
+            self._touch_cached_mapping(cached)
             return cached
 
         now = time.time()
@@ -364,9 +452,7 @@ class UserIdentityRegistry:
                     mapping = self._row_to_mapping(row)
                     self._cache(mapping)
                     if normalized_bot_id:
-                        self._bot_user_seen.add(
-                            (normalized_bot_id, normalized_user_id)
-                        )
+                        self._remember_bot_user(normalized_bot_id, normalized_user_id)
                     return mapping
 
                 primary_onebot_id = (
@@ -468,13 +554,228 @@ class UserIdentityRegistry:
         mapping = self._row_to_mapping(row)
         self._cache(mapping)
         if normalized_bot_id:
-            self._bot_user_seen.add((normalized_bot_id, normalized_user_id))
+            self._remember_bot_user(normalized_bot_id, normalized_user_id)
         if conflict_payload is not None:
             self._record_warning(conflict_payload)
             self._log_conflict(conflict_payload, repeated=False)
         return mapping
 
+    async def ensure_mappings(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        bot_id: str | None = None,
+    ) -> list[UserIdentityMapping]:
+        if not items:
+            return []
+        cached_results: list[UserIdentityMapping] = []
+        valid_count = 0
+        all_cached = True
+        for item in items:
+            normalized_item = item or {}
+            user_id = str(normalized_item.get("user_id") or "").strip()
+            if not user_id:
+                continue
+            valid_count += 1
+            cached = self._get_matching_cached_mapping(
+                user_id,
+                username=str(normalized_item.get("username") or ""),
+                nickname=str(normalized_item.get("nickname") or ""),
+                is_bot=bool(normalized_item.get("is_bot", False)),
+                synthetic=bool(normalized_item.get("synthetic", False)),
+                bot_id=bot_id,
+            )
+            if cached is None:
+                all_cached = False
+                break
+            cached_results.append(cached)
+        if all_cached and valid_count == len(cached_results):
+            with self._lock:
+                self._state.cache_hits += len(cached_results)
+            return cached_results
+        return await asyncio.to_thread(
+            self.ensure_mappings_sync,
+            items,
+            bot_id=bot_id,
+        )
+
+    def ensure_mappings_sync(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        bot_id: str | None = None,
+    ) -> list[UserIdentityMapping]:
+        normalized_bot_id = str(bot_id if bot_id is not None else self.bot_id).strip()
+        normalized_items: list[dict[str, Any]] = []
+        for item in items:
+            user_id = str((item or {}).get("user_id") or "").strip()
+            if not user_id:
+                continue
+            normalized_items.append(
+                {
+                    "user_id": user_id,
+                    "username": str((item or {}).get("username") or "").strip(),
+                    "nickname": str((item or {}).get("nickname") or "").strip(),
+                    "is_bot": bool((item or {}).get("is_bot", False)),
+                    "synthetic": bool((item or {}).get("synthetic", False)),
+                }
+            )
+        if not normalized_items:
+            return []
+
+        results: list[UserIdentityMapping] = []
+        conflicts: list[dict[str, Any]] = []
+        now = time.time()
+        with self._lock, self._open_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                for item in normalized_items:
+                    user_id = item["user_id"]
+                    row = connection.execute(
+                        "SELECT * FROM user_mappings WHERE user_id=?",
+                        (user_id,),
+                    ).fetchone()
+                    if row is not None:
+                        username = item["username"] or str(row["username"] or "")
+                        nickname = item["nickname"] or str(row["nickname"] or "")
+                        profile_changed = (
+                            username != str(row["username"] or "")
+                            or nickname != str(row["nickname"] or "")
+                            or item["is_bot"] != bool(row["is_bot"])
+                            or item["synthetic"] != bool(row["synthetic"])
+                        )
+                        revision = int(row["revision"]) + int(profile_changed)
+                        connection.execute(
+                            """
+                            UPDATE user_mappings
+                            SET username=?, nickname=?, is_bot=?, synthetic=?,
+                                last_seen_at=?, revision=?
+                            WHERE user_id=?
+                            """,
+                            (
+                                username,
+                                nickname,
+                                int(item["is_bot"]),
+                                int(item["synthetic"]),
+                                now,
+                                revision,
+                                user_id,
+                            ),
+                        )
+                    else:
+                        primary_onebot_id = compute_primary_onebot_id(user_id)
+                        onebot_id = primary_onebot_id
+                        probe_offset = 0
+                        incumbent_row: sqlite3.Row | None = None
+                        while True:
+                            occupied = connection.execute(
+                                "SELECT * FROM user_mappings WHERE onebot_id=?",
+                                (onebot_id,),
+                            ).fetchone()
+                            if occupied is None:
+                                break
+                            if probe_offset == 0:
+                                incumbent_row = occupied
+                            probe_offset += 1
+                            if probe_offset >= USER_ID_TABLE_SIZE:
+                                raise UserIdentityError("11 位 OneBot 用户 ID 空间已耗尽")
+                            onebot_id = USER_ID_MIN + (
+                                (primary_onebot_id - USER_ID_MIN + probe_offset)
+                                % USER_ID_TABLE_SIZE
+                            )
+                        connection.execute(
+                            """
+                            INSERT INTO user_mappings(
+                                user_id, username, nickname, onebot_id,
+                                primary_onebot_id, probe_offset, manual_override,
+                                is_bot, synthetic, first_seen_at, last_seen_at, revision
+                            ) VALUES(?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 1)
+                            """,
+                            (
+                                user_id,
+                                item["username"],
+                                item["nickname"],
+                                onebot_id,
+                                primary_onebot_id,
+                                probe_offset,
+                                int(item["is_bot"]),
+                                int(item["synthetic"]),
+                                now,
+                                now,
+                            ),
+                        )
+                        if incumbent_row is not None:
+                            cursor = connection.execute(
+                                """
+                                INSERT INTO identity_conflicts(
+                                    primary_onebot_id, incumbent_user_id,
+                                    displaced_user_id, displaced_onebot_id,
+                                    probe_offset, reason, status, created_at
+                                ) VALUES(?, ?, ?, ?, ?, 'hash_collision', 'active', ?)
+                                """,
+                                (
+                                    primary_onebot_id,
+                                    str(incumbent_row["user_id"]),
+                                    user_id,
+                                    onebot_id,
+                                    probe_offset,
+                                    now,
+                                ),
+                            )
+                            conflicts.append(
+                                {
+                                    "conflict_id": int(cursor.lastrowid),
+                                    "primary_onebot_id": primary_onebot_id,
+                                    "incumbent_user_id": str(incumbent_row["user_id"]),
+                                    "incumbent_username": str(incumbent_row["username"] or ""),
+                                    "incumbent_nickname": str(incumbent_row["nickname"] or ""),
+                                    "incumbent_onebot_id": int(incumbent_row["onebot_id"]),
+                                    "displaced_user_id": user_id,
+                                    "displaced_username": item["username"],
+                                    "displaced_nickname": item["nickname"],
+                                    "displaced_onebot_id": onebot_id,
+                                    "probe_offset": probe_offset,
+                                    "reason": "hash_collision",
+                                    "status": "active",
+                                    "created_at": now,
+                                }
+                            )
+                    if normalized_bot_id:
+                        self._upsert_bot_user(
+                            connection,
+                            normalized_bot_id,
+                            user_id,
+                            now,
+                        )
+                    final_row = connection.execute(
+                        "SELECT * FROM user_mappings WHERE user_id=?",
+                        (user_id,),
+                    ).fetchone()
+                    results.append(self._row_to_mapping(final_row))
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+
+        for mapping in results:
+            self._cache(mapping)
+            if normalized_bot_id:
+                self._remember_bot_user(normalized_bot_id, mapping.user_id)
+        for conflict in conflicts:
+            self._log_conflict(conflict, repeated=False)
+        if conflicts:
+            self._record_warning(conflicts[-1])
+        return results
+
     async def get_by_user_id(self, user_id: str) -> UserIdentityMapping | None:
+        normalized = str(user_id or "").strip()
+        with self._lock:
+            cached = self._by_user.get(normalized)
+        if cached is not None:
+            self._record_cache_result(hit=True)
+            self._touch_cached_mapping(cached)
+            return cached
+        self._record_cache_result(hit=False)
         return await asyncio.to_thread(self.get_by_user_id_sync, user_id)
 
     def get_by_user_id_sync(self, user_id: str) -> UserIdentityMapping | None:
@@ -483,6 +784,7 @@ class UserIdentityRegistry:
             return None
         cached = self._by_user.get(normalized)
         if cached is not None:
+            self._touch_cached_mapping(cached)
             return cached
         with self._lock, self._open_connection() as connection:
             row = connection.execute(
@@ -496,6 +798,23 @@ class UserIdentityRegistry:
         return mapping
 
     async def get_by_onebot_id(self, onebot_id: int | str) -> UserIdentityMapping | None:
+        try:
+            normalized = validate_onebot_user_id(onebot_id)
+        except ValueError:
+            return None
+        with self._lock:
+            cached_user_id = self._by_onebot.get(normalized)
+            cached = (
+                self._by_user.get(cached_user_id)
+                if cached_user_id is not None
+                else None
+            )
+        if cached_user_id is not None:
+            if cached is not None:
+                self._record_cache_result(hit=True)
+                self._touch_cached_mapping(cached)
+                return cached
+        self._record_cache_result(hit=False)
         return await asyncio.to_thread(self.get_by_onebot_id_sync, onebot_id)
 
     def invalidate_cache(self, user_id: str | None = None) -> None:
@@ -516,7 +835,10 @@ class UserIdentityRegistry:
             return None
         cached_user_id = self._by_onebot.get(normalized)
         if cached_user_id:
-            return self._by_user.get(cached_user_id)
+            cached = self._by_user.get(cached_user_id)
+            if cached is not None:
+                self._touch_cached_mapping(cached)
+            return cached
         with self._lock, self._open_connection() as connection:
             row = connection.execute(
                 "SELECT * FROM user_mappings WHERE onebot_id=?",
@@ -801,7 +1123,7 @@ class UserIdentityRegistry:
             except Exception:
                 connection.execute("ROLLBACK")
                 raise
-        self._bot_user_seen.add((bot_id, user_id))
+        self._remember_bot_user(normalized_bot_id, normalized_user_id)
 
         self._by_onebot.pop(previous_onebot_id, None)
         mapping = self._row_to_mapping(updated)
@@ -895,9 +1217,10 @@ class UserIdentityRegistry:
                 raise
 
         self.invalidate_cache(normalized_user_id)
-        self._bot_user_seen = {
-            pair for pair in self._bot_user_seen if pair[1] != normalized_user_id
-        }
+        with self._lock:
+            for pair in tuple(self._bot_user_seen):
+                if pair[1] == normalized_user_id:
+                    self._bot_user_seen.pop(pair, None)
         try:
             self.sync_warning_file_sync(
                 bot_id=normalized_bot_id,
@@ -1024,6 +1347,7 @@ class UserIdentityRegistry:
             except Exception:
                 connection.execute("ROLLBACK")
                 raise
+        self._remember_bot_user(bot_id, user_id)
 
     @staticmethod
     def _upsert_bot_user(
@@ -1077,11 +1401,86 @@ class UserIdentityRegistry:
         )
 
     def _cache(self, mapping: UserIdentityMapping) -> None:
-        previous = self._by_user.get(mapping.user_id)
-        if previous is not None and previous.onebot_id != mapping.onebot_id:
-            self._by_onebot.pop(previous.onebot_id, None)
-        self._by_user[mapping.user_id] = mapping
-        self._by_onebot[mapping.onebot_id] = mapping.user_id
+        with self._lock:
+            previous = self._by_user.get(mapping.user_id)
+            if previous is not None and previous.onebot_id != mapping.onebot_id:
+                self._by_onebot.pop(previous.onebot_id, None)
+            self._by_user[mapping.user_id] = mapping
+            self._by_user.move_to_end(mapping.user_id)
+            self._by_onebot[mapping.onebot_id] = mapping.user_id
+            self._by_onebot.move_to_end(mapping.onebot_id)
+            self._evict_caches_locked()
+
+    def _touch_cached_mapping(self, mapping: UserIdentityMapping) -> None:
+        with self._lock:
+            if mapping.user_id in self._by_user:
+                self._by_user.move_to_end(mapping.user_id)
+            if mapping.onebot_id in self._by_onebot:
+                self._by_onebot.move_to_end(mapping.onebot_id)
+
+    def _remember_bot_user(self, bot_id: str, user_id: str) -> None:
+        pair = (str(bot_id or "").strip(), str(user_id or "").strip())
+        if not pair[0] or not pair[1]:
+            return
+        with self._lock:
+            self._bot_user_seen[pair] = None
+            self._bot_user_seen.move_to_end(pair)
+            while len(self._bot_user_seen) > self._state.cache_max_entries:
+                self._bot_user_seen.popitem(last=False)
+
+    def _get_matching_cached_mapping(
+        self,
+        user_id: str,
+        *,
+        username: str,
+        nickname: str,
+        is_bot: bool,
+        synthetic: bool,
+        bot_id: str | None,
+    ) -> UserIdentityMapping | None:
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id:
+            return None
+        normalized_bot_id = str(bot_id if bot_id is not None else self.bot_id).strip()
+        with self._lock:
+            cached = self._by_user.get(normalized_user_id)
+            if cached is None:
+                return None
+            if (
+                (username and str(username).strip() != cached.username)
+                or (nickname and str(nickname).strip() != cached.nickname)
+                or bool(is_bot) != cached.is_bot
+                or bool(synthetic) != cached.synthetic
+            ):
+                return None
+            if normalized_bot_id and (
+                normalized_bot_id,
+                normalized_user_id,
+            ) not in self._bot_user_seen:
+                return None
+            self._touch_cached_mapping(cached)
+            return cached
+
+    def _evict_caches_locked(self) -> None:
+        limit = max(128, int(self._state.cache_max_entries))
+        while len(self._by_user) > limit:
+            user_id, mapping = self._by_user.popitem(last=False)
+            if self._by_onebot.get(mapping.onebot_id) == user_id:
+                self._by_onebot.pop(mapping.onebot_id, None)
+        while len(self._by_onebot) > limit:
+            onebot_id, user_id = self._by_onebot.popitem(last=False)
+            mapping = self._by_user.get(user_id)
+            if mapping is not None and mapping.onebot_id == onebot_id:
+                self._by_user.pop(user_id, None)
+        while len(self._bot_user_seen) > limit:
+            self._bot_user_seen.popitem(last=False)
+
+    def _record_cache_result(self, *, hit: bool) -> None:
+        with self._lock:
+            if hit:
+                self._state.cache_hits += 1
+            else:
+                self._state.cache_misses += 1
 
     @staticmethod
     def _row_to_mapping(row: sqlite3.Row | None) -> UserIdentityMapping:
@@ -1139,6 +1538,16 @@ class UserIdentityIdMap(DurableIdMap):
             synthetic=synthetic,
         )
         return mapping.to_id_mapping()
+
+    async def ensure_users(
+        self,
+        items: list[dict[str, Any]],
+    ) -> dict[str, IdMapping]:
+        mappings = await self.registry.ensure_mappings(items)
+        return {
+            mapping.user_id: mapping.to_id_mapping()
+            for mapping in mappings
+        }
 
     async def get_or_create(self, namespace: str, source_id: str) -> IdMapping:
         if namespace == "user":

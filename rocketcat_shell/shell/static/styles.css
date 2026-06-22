@@ -900,7 +900,17 @@ body.sidebar-collapsed .sidebar {
 .settings-actions {
   display: flex;
   justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 12px;
+  margin-top: 18px;
+}
+
+.settings-actions-spacious {
+  padding-top: 6px;
+}
+
+.settings-helper-compact {
+  margin-top: 10px;
 }
 
 .basic-rule-value {
@@ -2425,6 +2435,21 @@ button:disabled,
   font-size: 18px;
 }
 
+details.form-section > summary {
+  cursor: pointer;
+  color: var(--text);
+  font-weight: 800;
+}
+
+details.form-section > summary h3 {
+  display: inline;
+  margin: 0;
+}
+
+details.form-section[open] > summary {
+  margin-bottom: 18px;
+}
+
 .field-grid {
   flex-wrap: wrap;
   gap: 16px;
@@ -2450,7 +2475,8 @@ button:disabled,
   font-weight: 700;
 }
 
-.field-block input {
+.field-block input,
+.field-block select {
   width: 100%;
   padding: 14px 16px;
   border-radius: 18px;
@@ -2458,7 +2484,8 @@ button:disabled,
   background: rgba(255, 255, 255, 0.92);
 }
 
-.field-block input:focus {
+.field-block input:focus,
+.field-block select:focus {
   outline: none;
   border-color: rgba(235, 79, 140, 0.45);
   box-shadow: 0 0 0 4px rgba(235, 79, 140, 0.12);

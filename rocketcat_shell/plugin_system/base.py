@@ -84,6 +84,14 @@ class RocketCatPlugin:
     ) -> bool | None:
         return None
 
+    def wants_inbound_message(
+        self,
+        event: dict[str, Any],
+        raw_msg: dict[str, Any],
+        runtime: PluginExecutionContext,
+    ) -> bool:
+        return True
+
     def get_handled_actions(self) -> frozenset[str]:
         raw_actions = self.handled_actions
         if isinstance(raw_actions, str):

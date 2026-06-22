@@ -81,6 +81,7 @@ class BridgeRuntime:
         self._restart_lock = asyncio.Lock()
         self._failure_handled = False
         self._started = False
+        self._restart_count = 0
 
     @classmethod
     def from_plugin_root(cls, raw_config: dict[str, Any] | Any) -> "BridgeRuntime":
@@ -228,7 +229,7 @@ class BridgeRuntime:
         }
 
     def build_diagnostic_summary(self) -> dict[str, Any]:
-        return build_runtime_diagnostic_item(
+        payload = build_runtime_diagnostic_item(
             instance_name=self.instance_name,
             config=self.config,
             rocketchat=self.rocketchat,
@@ -236,6 +237,26 @@ class BridgeRuntime:
             data_dir=self.data_dir,
             message_index_max_entries=self.message_index_max_entries,
         )
+        if self.onebot is not None:
+            payload.update(self.onebot.build_diagnostic_snapshot())
+        if self.rocketchat is not None:
+            client_snapshot = self.rocketchat.build_diagnostic_snapshot()
+            payload.update(
+                {
+                    "inbound_worker_count": client_snapshot.get("inbound_worker_count", 0),
+                    "inbound_queue_depth": client_snapshot.get("inbound_queue_depth", 0),
+                    "inbound_queue_capacity": client_snapshot.get("inbound_queue_capacity", 0),
+                    "user_cache_entries": client_snapshot.get("user_cache_entries", 0),
+                    "user_cache_capacity": client_snapshot.get("user_cache_capacity", 0),
+                    "room_cache_entries": client_snapshot.get("room_cache_entries", 0),
+                    "room_cache_capacity": client_snapshot.get("room_cache_capacity", 0),
+                    "media_cache": client_snapshot.get("media_cache", {}),
+                }
+            )
+        if self.identity_registry is not None:
+            payload["identity_cache"] = self.identity_registry.cache_summary()
+        payload["runtime_restart_count"] = self._restart_count
+        return payload
 
     async def _handle_rocketchat_message(self, raw_msg: dict[str, Any]) -> None:
         if self.inbound_translator is None or self.onebot is None:
@@ -286,15 +307,19 @@ class BridgeRuntime:
             plugin = binding.instance
             if not plugin.enabled:
                 continue
+            if not plugin.wants_inbound_message(
+                event,
+                raw_msg,
+                self._plugin_runtime_context,
+            ):
+                continue
             try:
-                result = await asyncio.wait_for(
-                    plugin.on_inbound_message(
+                async with asyncio.timeout(5.0):
+                    result = await plugin.on_inbound_message(
                         dict(event),
                         dict(raw_msg),
                         self._plugin_runtime_context,
-                    ),
-                    timeout=5.0,
-                )
+                    )
             except asyncio.TimeoutError:
                 logger.warning(
                     "[RocketCatShell] 插件 %s 处理入站消息超时。",
@@ -399,6 +424,7 @@ class BridgeRuntime:
             cloud_workspace_id=self.rocketchat.cloud_workspace_id,
             bot_id=self.config.bot_id,
             warning_path=warning_path,
+            cache_max_entries=self.config.identity_cache_max_entries,
         )
         bot_profile = self.rocketchat.bot_profile or {}
         self_mapping = await registry.ensure_mapping(
@@ -426,11 +452,17 @@ class BridgeRuntime:
 
         private_bindings = self._hot_store_bundle.state_engine.get_private_room_source_bindings()
         rebuilt_private_surrogates: dict[int, str] = {}
-        for user_source_id, room_source_id in private_bindings.items():
-            mapping = await registry.ensure_mapping(
-                user_source_id,
-                bot_id=self.config.bot_id,
-            )
+        private_mappings = await registry.ensure_mappings(
+            [
+                {"user_id": user_source_id}
+                for user_source_id in private_bindings
+            ],
+            bot_id=self.config.bot_id,
+        )
+        for mapping in private_mappings:
+            room_source_id = private_bindings.get(mapping.user_id)
+            if not room_source_id:
+                continue
             rebuilt_private_surrogates[mapping.onebot_id] = room_source_id
         self._hot_store_bundle.state_engine.replace_private_room_surrogate_bindings(
             rebuilt_private_surrogates
@@ -469,10 +501,10 @@ class BridgeRuntime:
     async def _stop_clients(self) -> None:
         runtime_context = self._plugin_runtime_context
         runtime_plugins = list(self._runtime_plugins)
-        if self.rocketchat is not None:
-            await self.rocketchat.stop()
         if self.onebot is not None:
             await self.onebot.stop()
+        if self.rocketchat is not None:
+            await self.rocketchat.stop()
         if self._plugin_manager is not None and runtime_context is not None and runtime_plugins:
             await self._plugin_manager.shutdown_runtime_plugins(runtime_plugins, runtime_context)
         self.rocketchat = None
@@ -536,6 +568,7 @@ class BridgeRuntime:
             await self.state_store.write({"status": "restarting", "reason": reason})
             await self._stop_clients()
             await self._start_clients()
+            self._restart_count += 1
             await self.state_store.write(
                 {
                     "status": "running",
@@ -549,6 +582,24 @@ class BridgeRuntime:
             logger.info(
                 f"[RocketChatOneBotBridge][{self.instance_name}] bridge 连接已重启，reason={reason}"
             )
+
+    async def reload_plugins(self) -> None:
+        if self._plugin_manager is None or self._plugin_runtime_context is None:
+            return
+        previous_plugins = list(self._runtime_plugins)
+        next_plugins = await self._plugin_manager.create_runtime_plugins(
+            self._plugin_runtime_context
+        )
+        self._runtime_plugins = next_plugins
+        if previous_plugins:
+            await self._plugin_manager.shutdown_runtime_plugins(
+                previous_plugins,
+                self._plugin_runtime_context,
+            )
+        logger.info(
+            "[RocketCatShell][%s] 插件 binding 已增量重载，网络 runtime 保持连接。",
+            self.instance_name,
+        )
 
     async def _handle_reconnect_exhausted(
         self,

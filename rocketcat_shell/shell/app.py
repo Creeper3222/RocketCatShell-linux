@@ -53,7 +53,12 @@ async def _run_async(args: argparse.Namespace) -> int:
 
     bootstrap_settings = load_or_create_shell_settings(layout.shell_settings_path)
     log_level = "DEBUG" if args.verbose else bootstrap_settings.log_level
-    configure_logging(layout.log_file_path, level_name=log_level)
+    configure_logging(
+        layout.log_file_path,
+        level_name=log_level,
+        max_bytes=bootstrap_settings.log_file_max_bytes,
+        backup_count=bootstrap_settings.log_file_backup_count,
+    )
 
     instance_lock = ShellInstanceLock(layout.logs_dir / "rocketcat_shell.instance.lock")
     try:

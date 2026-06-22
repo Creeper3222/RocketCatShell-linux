@@ -114,9 +114,18 @@ class BridgeLogBuffer:
     PERF_PREFIX = "[RocketCatPerf]"
     PREFIXES = ("[RocketChatOneBotBridge]", "[RocketCatShell]", PERF_PREFIX)
 
-    def __init__(self, max_entries: int = 5000):
+    def __init__(
+        self,
+        max_entries: int = 2000,
+        *,
+        max_bytes: int = 4 * 1024 * 1024,
+        max_entry_bytes: int = 32 * 1024,
+    ):
         self.max_entries = int(max_entries)
-        self._entries: deque[dict[str, Any]] = deque(maxlen=self.max_entries)
+        self.max_bytes = max(1024, int(max_bytes))
+        self.max_entry_bytes = max(256, int(max_entry_bytes))
+        self._entries: deque[dict[str, Any]] = deque()
+        self._total_bytes = 0
         self._lock = threading.Lock()
         self._next_id = 1
         self._version = 0
@@ -134,25 +143,64 @@ class BridgeLogBuffer:
         if level == "WARNING":
             level = "WARN"
 
+        encoded = message.encode("utf-8", errors="replace")
+        if len(encoded) > self.max_entry_bytes:
+            encoded = encoded[: self.max_entry_bytes]
+            message = encoded.decode("utf-8", errors="ignore") + "…[truncated]"
+        timestamp = datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S")
+        timestamp += f".{int(record.msecs):03d}"
         entry = {
             "id": self._next_id,
-            "timestamp": datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S")
-            + f".{int(record.msecs):03d}",
+            "timestamp": timestamp,
             "level": level,
             "is_perf": is_perf,
             "message": message,
-            "line": f"[{datetime.fromtimestamp(record.created).strftime('%Y-%m-%d %H:%M:%S')}.{int(record.msecs):03d}] [{level}] {message}",
         }
+        # Include a conservative allowance for the dict, strings, deque slot and
+        # allocator overhead so the configured byte limit reflects resident
+        # Python memory rather than only UTF-8 payload bytes.
+        entry_bytes = (
+            len(timestamp)
+            + len(level)
+            + len(message.encode("utf-8", errors="replace"))
+            + 640
+        )
+        entry["_bytes"] = entry_bytes
 
         with self._lock:
             self._entries.append(entry)
+            self._total_bytes += entry_bytes
+            while (
+                len(self._entries) > self.max_entries
+                or self._total_bytes > self.max_bytes
+            ):
+                removed = self._entries.popleft()
+                self._total_bytes -= int(removed.get("_bytes") or 0)
             self._next_id += 1
             self._version += 1
         self._notify_changed()
 
     def get_entries(self, *, after_id: int = 0) -> list[dict[str, Any]]:
         with self._lock:
-            return [dict(entry) for entry in self._entries if int(entry["id"]) > int(after_id)]
+            result = []
+            for entry in self._entries:
+                if int(entry["id"]) <= int(after_id):
+                    continue
+                item = {key: value for key, value in entry.items() if key != "_bytes"}
+                item["line"] = (
+                    f"[{item['timestamp']}] [{item['level']}] {item['message']}"
+                )
+                result.append(item)
+            return result
+
+    def summary(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "entry_count": len(self._entries),
+                "max_entries": self.max_entries,
+                "bytes": self._total_bytes,
+                "max_bytes": self.max_bytes,
+            }
 
     def latest_id(self) -> int:
         with self._lock:
@@ -180,6 +228,7 @@ class BridgeLogBuffer:
         with self._lock:
             cleared = len(self._entries)
             self._entries.clear()
+            self._total_bytes = 0
             self._next_id = 1
             self._version += 1
         self._notify_changed()
@@ -222,12 +271,28 @@ class ShellWebUI:
         self._server: uvicorn.Server | None = None
         self._server_task: asyncio.Task | None = None
         self._bound_socket: socket.socket | None = None
-        self._log_buffer = BridgeLogBuffer(max_entries=5000)
+        settings = getattr(self.manager, "settings", None)
+        self._log_buffer = BridgeLogBuffer(max_entries=2000)
         self._log_handler = BridgeLogHandler(self._log_buffer)
         self._file_root = Path(self.manager.layout.project_root).resolve()
         self._terminal_lock = asyncio.Lock()
+        self._terminal_create_lock = asyncio.Lock()
         self._terminal_sessions: dict[str, dict[str, Any]] = {}
         self._terminal_order: list[str] = []
+        self._terminal_max_sessions = max(
+            1,
+            int(getattr(settings, "terminal_max_sessions", 6) or 6),
+        )
+        raw_terminal_idle_timeout = getattr(
+            settings,
+            "terminal_idle_timeout_seconds",
+            0,
+        )
+        self._terminal_idle_timeout_seconds = max(
+            0,
+            int(raw_terminal_idle_timeout if raw_terminal_idle_timeout is not None else 0),
+        )
+        self._terminal_cleanup_task: asyncio.Task[Any] | None = None
         self._app = FastAPI(title="RocketCat Shell", version=__version__)
         self._static_dir = Path(__file__).resolve().parent / "static"
         self._login_file = self._static_dir / "login.html"
@@ -431,6 +496,7 @@ class ShellWebUI:
                     logger.info(
                         f"[RocketChatOneBotBridge] 独立WebUI已启动: http://{self.host}:{self.port}/"
                     )
+                    self._ensure_terminal_cleanup_task()
                     return
                 if self._server_task.done():
                     error = self._server_task.exception()
@@ -449,6 +515,7 @@ class ShellWebUI:
                     requested_port=self.requested_port,
                     actual_port=self.port,
                 )
+            self._ensure_terminal_cleanup_task()
         except Exception:
             await self._cleanup_failed_start(reset_logs=True)
             raise
@@ -474,6 +541,11 @@ class ShellWebUI:
             finally:
                 self._bound_socket = None
         await self._close_all_terminal_sessions()
+        if self._terminal_cleanup_task is not None:
+            self._terminal_cleanup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._terminal_cleanup_task
+            self._terminal_cleanup_task = None
         self._detach_log_handler()
         self._log_buffer.clear()
         if hasattr(self.manager, "clear_webui_runtime"):
@@ -518,6 +590,11 @@ class ShellWebUI:
             raise
 
     async def _cleanup_failed_start(self, *, reset_logs: bool = False) -> None:
+        if self._terminal_cleanup_task is not None:
+            self._terminal_cleanup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._terminal_cleanup_task
+            self._terminal_cleanup_task = None
         self._server = None
         self._server_task = None
         if self._bound_socket is not None:
@@ -683,6 +760,23 @@ class ShellWebUI:
         }
 
     async def _create_terminal_session(self, *, cols: int, rows: int) -> dict[str, Any]:
+        async with self._terminal_create_lock:
+            return await self._create_terminal_session_serialized(
+                cols=cols,
+                rows=rows,
+            )
+
+    async def _create_terminal_session_serialized(
+        self,
+        *,
+        cols: int,
+        rows: int,
+    ) -> dict[str, Any]:
+        async with self._terminal_lock:
+            if len(self._terminal_sessions) >= self._terminal_max_sessions:
+                raise RuntimeError(
+                    f"终端会话已达到上限 {self._terminal_max_sessions}"
+                )
         terminal_id = str(uuid.uuid4())
         now = time.time()
         loop = asyncio.get_running_loop()
@@ -721,6 +815,29 @@ class ShellWebUI:
         session["reader_thread"] = reader_thread
         reader_thread.start()
         return session
+
+    def _ensure_terminal_cleanup_task(self) -> None:
+        if self._terminal_cleanup_task is None or self._terminal_cleanup_task.done():
+            self._terminal_cleanup_task = asyncio.create_task(
+                self._terminal_cleanup_loop(),
+                name="RocketCatTerminalCleanup",
+            )
+
+    async def _terminal_cleanup_loop(self) -> None:
+        while True:
+            await asyncio.sleep(60)
+            if self._terminal_idle_timeout_seconds <= 0:
+                continue
+            cutoff = time.time() - self._terminal_idle_timeout_seconds
+            async with self._terminal_lock:
+                expired = [
+                    terminal_id
+                    for terminal_id, session in self._terminal_sessions.items()
+                    if not session.get("sockets")
+                    and float(session.get("last_access") or 0) < cutoff
+                ]
+            for terminal_id in expired:
+                await self._close_terminal_session(terminal_id)
 
     def _read_terminal_pty_output(
         self,
@@ -1107,7 +1224,18 @@ class ShellWebUI:
         return await self.manager.get_webui_state()
 
     async def _handle_diagnostics(self) -> dict[str, Any]:
-        return await self.manager.get_diagnostics_state()
+        payload = await self.manager.get_diagnostics_state()
+        async with self._terminal_lock:
+            terminal_count = len(self._terminal_sessions)
+        payload["resource_buffers"] = {
+            "logs": self._log_buffer.summary(),
+            "terminals": {
+                "active_sessions": terminal_count,
+                "max_sessions": self._terminal_max_sessions,
+                "idle_timeout_seconds": self._terminal_idle_timeout_seconds,
+            },
+        }
+        return payload
 
     async def _handle_basic_info(self) -> dict[str, Any]:
         return await self.manager.get_basic_info_state()
@@ -1187,6 +1315,7 @@ class ShellWebUI:
         return {
             "items": self._log_buffer.get_entries(after_id=effective_after_id),
             "max_entries": self._log_buffer.max_entries,
+            "buffer": self._log_buffer.summary(),
             "latest_id": latest_id,
             "reset": reset_cursor,
         }
@@ -1205,25 +1334,11 @@ class ShellWebUI:
         if not target_path.is_dir():
             raise HTTPException(status_code=400, detail="目标路径不是目录")
 
-        items: list[dict[str, Any]] = []
         try:
-            children = sorted(
-                target_path.iterdir(),
-                key=lambda item: (not item.is_dir(), item.name.lower()),
-            )
+            items = await asyncio.to_thread(self._list_file_items_sync, target_path)
         except OSError as exc:
             logger.warning("[RocketCatShell] 文件管理目录读取失败: path=%s err=%r", target_path, exc)
             raise HTTPException(status_code=500, detail="读取目录失败") from exc
-
-        for child in children:
-            try:
-                resolved_child = child.resolve()
-                if resolved_child != self._file_root and not resolved_child.is_relative_to(self._file_root):
-                    continue
-                stat_result = child.stat()
-            except OSError:
-                continue
-            items.append(self._serialize_file_item(child, stat_result=stat_result))
 
         relative_path = self._file_manager_relative_path(target_path)
         parent_path = ""
@@ -1238,6 +1353,23 @@ class ShellWebUI:
             "root_path": str(self._file_root),
             "items": items,
         }
+
+    def _list_file_items_sync(self, target_path: Path) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        children = sorted(
+            target_path.iterdir(),
+            key=lambda item: (not item.is_dir(), item.name.lower()),
+        )
+        for child in children:
+            try:
+                resolved_child = child.resolve()
+                if resolved_child != self._file_root and not resolved_child.is_relative_to(self._file_root):
+                    continue
+                stat_result = child.stat()
+            except OSError:
+                continue
+            items.append(self._serialize_file_item(child, stat_result=stat_result))
+        return items
 
     async def _handle_read_file(
         self,
@@ -1493,9 +1625,9 @@ class ShellWebUI:
                     "is_directory": target_path.is_dir(),
                 }
                 if target_path.is_dir() and not target_path.is_symlink():
-                    shutil.rmtree(target_path)
+                    await asyncio.to_thread(shutil.rmtree, target_path)
                 else:
-                    target_path.unlink()
+                    await asyncio.to_thread(target_path.unlink)
                 deleted_items.append(item_payload)
         except OSError as exc:
             logger.warning("[RocketCatShell] 文件管理删除失败: err=%r", exc)
@@ -1552,7 +1684,11 @@ class ShellWebUI:
         moved_items: list[dict[str, Any]] = []
         try:
             for source_path, destination_path in move_plan:
-                shutil.move(str(source_path), str(destination_path))
+                await asyncio.to_thread(
+                    shutil.move,
+                    str(source_path),
+                    str(destination_path),
+                )
                 stat_result = destination_path.stat()
                 moved_items.append(self._serialize_file_item(destination_path, stat_result=stat_result))
         except OSError as exc:
@@ -1637,24 +1773,15 @@ class ShellWebUI:
                 media_type="application/octet-stream",
             )
 
-        archive_buffer = io.BytesIO()
         try:
-            with zipfile.ZipFile(
-                archive_buffer,
-                mode="w",
-                compression=zipfile.ZIP_DEFLATED,
-            ) as zip_handle:
-                self._write_file_manager_zip_entry(
-                    zip_handle,
-                    target_path=target_path,
-                    archive_name=target_path.name,
-                    written_names=set(),
-                )
+            content = await asyncio.to_thread(
+                self._build_file_manager_zip,
+                [target_path],
+            )
         except OSError as exc:
             logger.warning("[RocketCatShell] 文件管理目录下载打包失败: path=%s err=%r", target_path, exc)
             raise HTTPException(status_code=500, detail="下载打包失败") from exc
 
-        content = archive_buffer.getvalue()
         return Response(
             content=content,
             media_type="application/zip",
@@ -1679,26 +1806,15 @@ class ShellWebUI:
         if not target_paths:
             raise HTTPException(status_code=400, detail="请选择要下载的项目")
 
-        archive_buffer = io.BytesIO()
         try:
-            with zipfile.ZipFile(
-                archive_buffer,
-                mode="w",
-                compression=zipfile.ZIP_DEFLATED,
-            ) as zip_handle:
-                written_names: set[str] = set()
-                for target_path in target_paths:
-                    self._write_file_manager_zip_entry(
-                        zip_handle,
-                        target_path=target_path,
-                        archive_name=target_path.name,
-                        written_names=written_names,
-                    )
+            content = await asyncio.to_thread(
+                self._build_file_manager_zip,
+                target_paths,
+            )
         except OSError as exc:
             logger.warning("[RocketCatShell] 文件管理下载打包失败: err=%r", exc)
             raise HTTPException(status_code=500, detail="下载打包失败") from exc
 
-        content = archive_buffer.getvalue()
         return Response(
             content=content,
             media_type="application/zip",
@@ -1771,18 +1887,17 @@ class ShellWebUI:
             if directory_entry not in written_names:
                 zip_handle.writestr(directory_entry, b"")
                 written_names.add(directory_entry)
-            for child in sorted(target_path.rglob("*"), key=lambda item: item.as_posix().lower()):
+            for child in sorted(target_path.iterdir(), key=lambda item: item.name.lower()):
                 try:
                     resolved_child = child.resolve()
                     if resolved_child != self._file_root and not resolved_child.is_relative_to(self._file_root):
                         continue
-                    child_relative = child.relative_to(target_path).as_posix()
                 except OSError:
                     continue
                 self._write_file_manager_zip_entry(
                     zip_handle,
                     target_path=child,
-                    archive_name=f"{safe_archive_name}/{child_relative}",
+                    archive_name=f"{safe_archive_name}/{child.name}",
                     written_names=written_names,
                 )
             return
@@ -1791,6 +1906,23 @@ class ShellWebUI:
             return
         zip_handle.write(target_path, safe_archive_name)
         written_names.add(safe_archive_name)
+
+    def _build_file_manager_zip(self, target_paths: list[Path]) -> bytes:
+        archive_buffer = io.BytesIO()
+        with zipfile.ZipFile(
+            archive_buffer,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as zip_handle:
+            written_names: set[str] = set()
+            for target_path in target_paths:
+                self._write_file_manager_zip_entry(
+                    zip_handle,
+                    target_path=target_path,
+                    archive_name=target_path.name,
+                    written_names=written_names,
+                )
+        return archive_buffer.getvalue()
 
     def _join_file_manager_relative_path(self, base_path: str, child_path: str) -> str:
         normalized_base = str(base_path or "").strip().strip("/").replace("\\", "/")

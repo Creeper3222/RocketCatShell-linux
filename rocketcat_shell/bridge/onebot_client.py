@@ -35,7 +35,25 @@ class OneBotReverseWsClient:
         self._running = False
         self._task: asyncio.Task | None = None
         self._sender_task: asyncio.Task | None = None
-        self._outgoing: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._outgoing: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
+            maxsize=max(
+                1,
+                int(
+                    getattr(
+                        config,
+                        "onebot_outgoing_queue_max_entries",
+                        512,
+                    )
+                    or 512
+                ),
+            )
+        )
+        self._pending_payload: dict[str, Any] | None = None
+        self._send_lock = asyncio.Lock()
+        self._action_semaphore = asyncio.Semaphore(8)
+        self._action_locks: dict[str, asyncio.Lock] = {}
+        self._action_lock_users: dict[str, int] = {}
+        self._action_tasks: set[asyncio.Task[Any]] = set()
         self._consecutive_reconnect_failures = 0
 
     def _max_ws_msg_size(self) -> int:
@@ -76,6 +94,13 @@ class OneBotReverseWsClient:
             except asyncio.CancelledError:
                 pass
             self._sender_task = None
+        for task in tuple(self._action_tasks):
+            task.cancel()
+        if self._action_tasks:
+            await asyncio.gather(*self._action_tasks, return_exceptions=True)
+        self._action_tasks.clear()
+        self._action_locks.clear()
+        self._action_lock_users.clear()
         if self._ws is not None and not self._ws.closed:
             await self._ws.close()
         self._ws = None
@@ -170,10 +195,13 @@ class OneBotReverseWsClient:
 
     async def _sender_loop(self) -> None:
         while self._running and self._ws is not None and not self._ws.closed:
-            payload = await self._outgoing.get()
+            if self._pending_payload is None:
+                self._pending_payload = await self._outgoing.get()
             if self._ws is None or self._ws.closed:
                 break
-            await self._ws.send_str(json_dumps(payload))
+            async with self._send_lock:
+                await self._ws.send_str(json_dumps(self._pending_payload))
+            self._pending_payload = None
 
     async def _send_lifecycle_connect(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         payload = {
@@ -183,7 +211,8 @@ class OneBotReverseWsClient:
             "meta_event_type": "lifecycle",
             "sub_type": "connect",
         }
-        await ws.send_str(json_dumps(payload))
+        async with self._send_lock:
+            await ws.send_str(json_dumps(payload))
         logger.info("[RocketChatOneBotBridge] 已上报 OneBot lifecycle.connect 元事件。")
 
     async def _listen_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
@@ -203,12 +232,86 @@ class OneBotReverseWsClient:
                 continue
             params = data.get("params") or {}
             echo = data.get("echo")
-            response = await self._action_handler(str(action), params)
-            response_payload = {
-                "status": response.get("status", "ok"),
-                "retcode": response.get("retcode", 0),
-                "data": response.get("data"),
-                "wording": response.get("wording", ""),
-                "echo": echo,
-            }
-            await ws.send_str(json_dumps(response_payload))
+            await self._action_semaphore.acquire()
+            task = asyncio.create_task(
+                self._handle_action_frame(
+                    ws,
+                    str(action),
+                    params,
+                    echo,
+                ),
+                name=f"RocketCatOneBotAction:{action}",
+            )
+            self._action_tasks.add(task)
+            task.add_done_callback(self._on_action_task_done)
+
+    def _on_action_task_done(self, task: asyncio.Task[Any]) -> None:
+        self._action_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except Exception:
+            pass
+
+    async def _handle_action_frame(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        action: str,
+        params: dict[str, Any],
+        echo: Any,
+    ) -> None:
+        target_key = self._action_target_key(action, params)
+        lock = self._action_locks.setdefault(target_key, asyncio.Lock())
+        self._action_lock_users[target_key] = self._action_lock_users.get(target_key, 0) + 1
+        try:
+            async with lock:
+                try:
+                    response = await self._action_handler(action, params)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.exception(
+                        "[RocketChatOneBotBridge] OneBot action 处理失败: action=%s",
+                        action,
+                    )
+                    response = {
+                        "status": "failed",
+                        "retcode": 1500,
+                        "data": None,
+                        "wording": repr(exc),
+                    }
+                response_payload = {
+                    "status": response.get("status", "ok"),
+                    "retcode": response.get("retcode", 0),
+                    "data": response.get("data"),
+                    "wording": response.get("wording", ""),
+                    "echo": echo,
+                }
+                if not ws.closed:
+                    async with self._send_lock:
+                        await ws.send_str(json_dumps(response_payload))
+        finally:
+            remaining = self._action_lock_users.get(target_key, 1) - 1
+            if remaining <= 0:
+                self._action_lock_users.pop(target_key, None)
+                self._action_locks.pop(target_key, None)
+            else:
+                self._action_lock_users[target_key] = remaining
+            self._action_semaphore.release()
+
+    @staticmethod
+    def _action_target_key(action: str, params: dict[str, Any]) -> str:
+        for field in ("group_id", "user_id", "message_id", "id"):
+            value = params.get(field)
+            if value is not None:
+                return f"{field}:{value}"
+        return f"action:{action}"
+
+    def build_diagnostic_snapshot(self) -> dict[str, int]:
+        return {
+            "outgoing_queue_depth": self._outgoing.qsize()
+            + int(self._pending_payload is not None),
+            "outgoing_queue_max_entries": self._outgoing.maxsize,
+            "active_action_count": len(self._action_tasks),
+        }

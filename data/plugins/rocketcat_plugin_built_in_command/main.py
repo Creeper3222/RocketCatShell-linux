@@ -12,9 +12,12 @@ from rocketcat_shell.diagnostics import (
 
 import os
 import platform
+import re
 import socket
 import time
 from datetime import datetime
+from pathlib import Path
+from typing import Any
 
 try:
     import winreg
@@ -34,6 +37,8 @@ _ROCKETCAT_COMMAND = "#rocketcat"
 _SYSTEM_COMMAND = "#system"
 _SYSTEM_CPU_SAMPLE_SECONDS = 0.2
 _SELF_ECHO_SUPPRESSION_TTL_SECONDS = 30.0
+_METADATA_FILE_NAME = "metadata.yaml"
+_METADATA_VERSION_PATTERN = re.compile(r"^(\s*version\s*:\s*)(.+?)(\s*)$")
 
 
 class Plugin(RocketCatPlugin):
@@ -43,6 +48,7 @@ class Plugin(RocketCatPlugin):
         self._suppressed_self_echo_signatures: dict[str, float] = {}
 
     async def on_load(self, runtime: PluginExecutionContext) -> None:
+        self._sync_metadata_version()
         logger.info(
             "[RocketCatShell][Plugin:%s] 已加载到运行时 %s。",
             self.context.plugin_id,
@@ -326,11 +332,84 @@ class Plugin(RocketCatPlugin):
             "process_memory": self._format_bytes_as_mb(process_memory),
         }
 
+    def _sync_metadata_version(self) -> None:
+        metadata_version = str(self.context.metadata.get("version") or "").strip()
+        if metadata_version == __version__:
+            return
+
+        metadata_path = Path(self.context.plugin_dir) / _METADATA_FILE_NAME
+        try:
+            updated = self._rewrite_metadata_version(metadata_path)
+        except OSError as exc:
+            logger.warning(
+                "[RocketCatShell][Plugin:%s] Failed to sync metadata version %s: %r",
+                self.context.plugin_id,
+                metadata_path,
+                exc,
+            )
+            self.context.metadata["version"] = __version__
+            return
+
+        self.context.metadata["version"] = __version__
+        if updated:
+            logger.info(
+                "[RocketCatShell][Plugin:%s] Metadata version synced to %s.",
+                self.context.plugin_id,
+                __version__,
+            )
+
+    def _rewrite_metadata_version(self, metadata_path: Path) -> bool:
+        if not metadata_path.exists():
+            return False
+
+        original_text = metadata_path.read_text(encoding="utf-8")
+        line_ending = "\r\n" if "\r\n" in original_text else "\n"
+        lines = original_text.splitlines()
+        updated_lines: list[str] = []
+        found_version = False
+        changed = False
+
+        for line in lines:
+            match = _METADATA_VERSION_PATTERN.match(line)
+            if match:
+                found_version = True
+                current_version = self._normalize_metadata_value(match.group(2))
+                if current_version != __version__:
+                    updated_lines.append(f"{match.group(1)}{__version__}{match.group(3)}")
+                    changed = True
+                else:
+                    updated_lines.append(line)
+                continue
+            updated_lines.append(line)
+
+        if not found_version:
+            updated_lines.append(f"version: {__version__}")
+            changed = True
+
+        if not changed:
+            return False
+
+        rewritten_text = line_ending.join(updated_lines)
+        if original_text.endswith(("\r\n", "\n")):
+            rewritten_text += line_ending
+        metadata_path.write_text(rewritten_text, encoding="utf-8")
+        return True
+
+    def _normalize_metadata_value(self, value: str) -> str:
+        normalized = str(value or "").strip()
+        if (
+            len(normalized) >= 2
+            and normalized[0] == normalized[-1]
+            and normalized[0] in {'"', "'"}
+        ):
+            normalized = normalized[1:-1]
+        return normalized.strip()
+
     def _resolve_plugin_version(self) -> str:
         metadata_version = str(self.context.metadata.get("version") or "").strip()
         if metadata_version:
             return metadata_version
-        return "-"
+        return __version__
 
     def _format_system_snapshot(self, snapshot: dict[str, str]) -> str:
         return "\n".join(
@@ -591,6 +670,26 @@ class Plugin(RocketCatPlugin):
                 ),
                 "频道头像：",
             ]
+        )
+
+    def wants_inbound_message(
+        self,
+        event: dict[str, Any],
+        raw_msg: dict[str, Any],
+        runtime: PluginExecutionContext,
+    ) -> bool:
+        message_text = str(
+            event.get("rocketchat_current_message_text")
+            or raw_msg.get("msg")
+            or ""
+        ).strip()
+        if message_text in {_ROCKETCAT_COMMAND, _SYSTEM_COMMAND}:
+            return True
+        if self._is_runtime_self_message(raw_msg, runtime):
+            return True
+        return bool(
+            self._suppressed_self_echo_message_ids
+            or self._suppressed_self_echo_signatures
         )
 
     def _normalize_suppression_text(self, message_text: str) -> str:

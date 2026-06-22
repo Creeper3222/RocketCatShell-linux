@@ -1,4 +1,4 @@
-# RocketCatShell v0.1.9 Linux / Docker runtime dependencies.
+# RocketCatShell v0.2.0 Linux / Docker runtime dependencies.
 # Linux terminal sessions use the standard-library PTY backend.
 aiohttp>=3.9,<4
 cryptography>=44.0.3
@@ -6,6 +6,6 @@ fastapi>=0.110,<1
 orjson>=3.10,<4
 psutil>=6,<7
 python-multipart>=0.0.9,<1
-PyYAML>=6,<7
 uvicorn>=0.23,<1
+# Uvicorn WebSocket backend for the WebUI terminal and realtime channels.
 websockets>=12,<16

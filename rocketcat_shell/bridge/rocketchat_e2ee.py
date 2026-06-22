@@ -687,6 +687,16 @@ class RocketChatE2EEManager:
         decryptor = Cipher(algorithms.AES(key_bytes), modes.CTR(iv)).decryptor()
         return decryptor.update(encrypted_bytes) + decryptor.finalize()
 
+    def create_uploaded_media_decryptor(
+        self,
+        *,
+        key_data: dict[str, Any],
+        iv_b64: str,
+    ) -> Any:
+        key_bytes = _b64url_decode(key_data["k"])
+        iv = _b64_decode(iv_b64)
+        return Cipher(algorithms.AES(key_bytes), modes.CTR(iv)).decryptor()
+
     async def _ensure_room_key(
         self,
         room_id: str,
@@ -1002,6 +1012,11 @@ class RocketChatE2EEManager:
         self._subscriptions_by_room = {
             sub["rid"]: sub for sub in subscriptions if isinstance(sub, dict) and sub.get("rid")
         }
+        active_room_ids = set(self._subscriptions_by_room)
+        for room_id in tuple(self._room_keys):
+            if room_id not in active_room_ids:
+                self._room_keys.pop(room_id, None)
+                self._room_locks.pop(room_id, None)
         self._subscriptions_cache_ts = now
 
     async def _rest_get(

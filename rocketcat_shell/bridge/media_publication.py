@@ -54,6 +54,9 @@ class MediaPublicationService:
             if entry.bot_id == normalized_bot_id:
                 self._remove_token(token)
 
+    def active_file_paths(self) -> set[Path]:
+        return {entry.file_path for entry in self._entries.values()}
+
     def publish(
         self,
         *,
@@ -208,8 +211,7 @@ class MediaPublicationService:
 
     def _evict_old_entries(self) -> None:
         while len(self._entries) > self._max_entries:
-            token, _ = self._entries.popitem(last=False)
-            for path_key, registered_token in tuple(self._tokens_by_path.items()):
-                if registered_token == token:
-                    self._tokens_by_path.pop(path_key, None)
-                    break
+            token, entry = self._entries.popitem(last=False)
+            path_key = (entry.bot_id, os.path.normcase(str(entry.file_path)))
+            if self._tokens_by_path.get(path_key) == token:
+                self._tokens_by_path.pop(path_key, None)

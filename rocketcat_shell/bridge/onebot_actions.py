@@ -243,6 +243,26 @@ class OneBotActionHandler:
         if not room_source_id:
             return _failed(f"未知 group_id: {group_id}", retcode=1404)
         members = await self._rocketchat.get_room_members(room_source_id)
+        mappings_by_user: dict[str, Any] = {}
+        ensure_users = getattr(self._id_map, "ensure_users", None)
+        if callable(ensure_users):
+            mappings_by_user = await ensure_users(
+                [
+                    {
+                        "user_id": str(member.get("_id") or ""),
+                        "username": str(member.get("username") or ""),
+                        "nickname": str(
+                            member.get("name")
+                            or member.get("nickname")
+                            or ""
+                        ),
+                        "is_bot": str(member.get("_id") or "")
+                        == str(self._rocketchat.user_id or ""),
+                    }
+                    for member in members
+                    if member.get("_id")
+                ]
+            )
         payload: list[dict[str, Any]] = []
         for member in members:
             member_id = member.get("_id")
@@ -254,6 +274,7 @@ class OneBotActionHandler:
                     str(member_id),
                     group_id=group_id,
                     cached=member,
+                    mapping=mappings_by_user.get(str(member_id)),
                 )
             )
         return _ok(payload)
@@ -316,9 +337,11 @@ class OneBotActionHandler:
         *,
         group_id: int | str | None = None,
         cached: dict[str, Any] | None = None,
+        mapping: Any = None,
     ) -> dict[str, Any]:
         user_info = cached or await self._rocketchat.get_user_info(user_source_id)
-        mapping = await self._ensure_user_mapping(user_source_id, user_info)
+        if mapping is None:
+            mapping = await self._ensure_user_mapping(user_source_id, user_info)
         role = self._pick_member_role(user_info)
         reported_group_id = group_id
         if reported_group_id is None:

@@ -7,15 +7,28 @@
 
 本项目的目标不是继续做一个“宿主里的桥接插件”，而是把 RocketCat 发展成一套真正独立的 `Rocket.Chat <-> OneBot v11` 桥接软件。
 
-这个 live 目录对应的是 RocketCatShell 的 Linux / Docker 迁移版：核心功能现已与 Windows `v0.1.9` 对齐，同时保留容器初始化、外部挂载目录、内置插件自动补种和 Linux PTY 等 Docker 包装层。RocketChat 媒体通过 RocketCatShell WebUI 端口上的令牌 HTTP URL 统一上报，不再要求与 AstrBot 配置共享目录。
+这个 live 目录对应的是 RocketCatShell 的 Linux / Docker 迁移版：核心功能现已与 Windows `v0.2.0` 对齐，同时保留容器初始化、外部挂载目录、内置插件自动补种和 Linux PTY 等 Docker 包装层。RocketChat 媒体通过 RocketCatShell WebUI 端口上的令牌 HTTP URL 统一上报，不再要求与 AstrBot 配置共享目录。
 
-> 当前 README 对应版本为 `v0.1.9`。`v0.1.3` 是破坏性架构重构基线，`v0.1.4` 统一收口性能优化，`v0.1.5` 补齐了内置指令与运维增强，`v0.1.6` 推进运行诊断可观测性和入站热路径性能收口，`v0.1.7` 开始补齐面向 Docker 迁移的内置文件管理能力，`v0.1.8` 引入 NapCat 风格 WebUI 系统终端，而 `v0.1.9` 完善多引用、用户身份映射及 Rocket.Chat 7.10–8.5 兼容，并从本版本开始发布 `linux/amd64` 与 `linux/arm64` 镜像。
+> 当前 README 对应版本为 `v0.2.0`。本版在保持 v0.1.9 身份、媒体、E2EE 与 Rocket.Chat 兼容行为不变的前提下，集中优化入站热路径、身份映射、媒体缓存、资源边界和 runtime 重载，并继续发布 `linux/amd64` 与 `linux/arm64` 镜像。
 
 这意味着：
 
 - RocketCatShell 自己拥有 `config/`、`data/`、`logs/` 目录边界。
 - RocketCatShell 自己提供本地 WebUI、登录认证、Bot 管理、插件管理、项目根目录内文件管理和系统终端。
 - RocketCatShell 仍然可以作为 OneBot reverse WebSocket 客户端与 AstrBot 协同，但不再依赖 AstrBot 插件宿主才能运行。
+
+---
+
+## v0.2.0（性能、效率与资源治理）
+
+- 消息窗口分配不再在每条消息上复制完整映射；只有窗口变化、手动整理或 checkpoint 时才生成完整快照。
+- 用户身份缓存命中直接在事件循环内完成；同一服务器的多个 Bot 共享 SQLite 连接、LRU 缓存与批量 `ensure_mappings`。
+- E2EE 媒体采用流式下载、AES-CTR 解密、SHA-256 计算和原子落盘；`/app/data/temp` 内已缓存文件直接发布 URL。
+- OneBot 出站队列、用户/身份/媒体缓存、文件日志、WebUI 日志和 Linux PTY 终端会话均具有明确上限。
+- Bot 配置采用增量 reconciliation；修改一个 Bot 不再重启所有 Bot，插件配置更新只重建插件 binding。
+- WebUI 新增“性能与资源（高级设置）”与队列、缓存、媒体和重载诊断数据。
+- 默认策略为 `balanced`，普通用户无需调参；旧 `shell.json` 缺少新增字段时自动采用安全默认值，并在保存或导出时补齐。
+- Docker Hub 按 `v0.2.0-amd64`、`v0.2.0-arm64`、双架构 `v0.2.0` 和与其同 digest 的 `latest` 发布。
 
 ---
 
@@ -383,7 +396,7 @@ RocketCatShell 当前已经拥有自己的本地插件系统，而不再只是�
 | 项目 | 要求 |
 |------|------|
 | Python | `>= 3.11` |
-| 运行依赖 | `aiohttp`, `cryptography`, `fastapi`, `orjson`, `psutil`, `uvicorn`, `PyYAML` |
+| 运行依赖 | `aiohttp`, `cryptography`, `fastapi`, `orjson`, `psutil`, `python-multipart`, `uvicorn`, `websockets`；其中 `websockets` 为 WebUI 系统终端和实时通道提供 Uvicorn WebSocket 后端 |
 | Rocket.Chat | 需要可用的 REST API、DDP/WebSocket 和 E2EE 接口（如使用加密功能） |
 | OneBot 上游 | 需要可用的 OneBot v11 reverse WebSocket 服务 |
 
@@ -485,7 +498,13 @@ RocketCatShell 在第一次安装、还没有保存过任何配置时，会自�
 - Docker Compose 默认宿主机访问地址：`http://127.0.0.1:5751/`（容器内 `webui_host=0.0.0.0`，再由 compose 负责端口发布）
 - WebUI 登录认证 / 文件管理鉴权密码初始值：`123456`
 - 最大消息映射窗口条数：`1000`
-- Base64 媒体传输开关：`false`
+- 性能策略：`balanced`
+- 入站 Worker：`0`（按 CPU 自动选择 2 或 4）
+- OneBot 出站队列：`512`
+- 身份缓存：`4096`
+- 媒体缓存：`1 GiB`、保留 `168` 小时
+- 日志轮转：单文件 `10 MiB`、保留 `3` 份
+- WebUI 终端：最多 `6` 个，空闲关闭为 `0`（不限制）
 - 本机直接运行时默认 OneBot reverse WS 地址：`ws://127.0.0.1:6199/ws/`
 - Docker Compose / `docker/entrypoint.sh` 默认 OneBot reverse WS 地址：`ws://host.docker.internal:6200/ws/`
 - Bot 的 OneBot `self_id` 会在登录 Rocket.Chat 后根据不可变 `userId` 自动生成。
@@ -598,6 +617,46 @@ http://127.0.0.1:5751/
 | `default_remote_media_max_size` | 默认远端媒体上传 / 下载大小上限。 |
 | `default_skip_own_messages` | 默认是否忽略机器人自己的消息。 |
 | `default_debug` | 默认是否开启调试日志。 |
+| `performance_profile` | 性能策略，v0.2.0 默认并仅提供 `balanced`。 |
+| `inbound_worker_count` | 入站 Worker 数量；`0` 按 CPU 自动选择 2 或 4。 |
+| `onebot_outgoing_queue_max_entries` | OneBot 出站队列上限，默认 `512`。 |
+| `identity_cache_max_entries` | 用户身份与 Rocket.Chat 用户缓存上限，默认 `4096`。 |
+| `media_cache_max_bytes` | `/app/data/temp` 媒体缓存总量上限，默认 `1 GiB`。 |
+| `media_cache_max_age_hours` | 媒体缓存最长保留时间，默认 `168` 小时。 |
+| `log_file_max_bytes` | 单个日志文件上限，默认 `10 MiB`。 |
+| `log_file_backup_count` | 轮转日志备份数量，默认 `3`。 |
+| `terminal_max_sessions` | WebUI Linux PTY 终端会话上限，默认 `6`。 |
+| `terminal_idle_timeout_seconds` | 无连接终端的空闲关闭时间，默认 `0`；`0` 表示不限制，仅作用于 WebUI 终端会话，不会关闭 RocketCatShell 容器或主进程。 |
+
+#### 性能与资源（高级设置）
+
+WebUI 的“性能与资源（高级设置）”统一管理消息映射、入站并发、队列、缓存、日志和终端资源边界。设置会写入 `config/shell.json`，并随配置导出；导入旧配置时缺失字段自动采用 v0.2.0 默认值。Docker 首次启动还可通过 `.env` 中同名的 `ROCKETCAT_*` 环境变量指定初值。
+
+| 设置项 | 详细行为 |
+|--------|----------|
+| 性能策略 | `performance_profile` 当前仅支持 `balanced`，作为吞吐、响应速度和容器资源占用的稳定基线。 |
+| 入站 Worker | `inbound_worker_count` 允许 `0`～`8`；`0` 表示 CPU 不超过 4 核时使用 2 个 Worker，否则使用 4 个。保存后增量重建受影响的 Bot runtime。 |
+| 最大消息映射窗口条数 | `message_index_max_entries` 默认 `1000`。窗口越大，历史 `get_msg` 和引用恢复范围越长，同时占用更多内存和快照空间；修改后立即整理现有窗口。 |
+| OneBot 出站队列上限 | `onebot_outgoing_queue_max_entries` 默认 `512`。断线期间通过有界队列施加背压，重连后保持顺序发送，避免无界积压。 |
+| 身份缓存上限 | `identity_cache_max_entries` 默认 `4096`。超出后按最近使用顺序淘汰热缓存，不会删除 SQLite 持久映射。 |
+| 媒体缓存上限和保留时间 | `media_cache_max_bytes` 默认 `1 GiB`，`media_cache_max_age_hours` 默认 7 天；清理器只删除较旧且未被发布的 `/app/data/temp` 缓存。 |
+| 日志轮转 | `log_file_max_bytes` 默认 `10 MiB`，`log_file_backup_count` 默认 `3`；新边界在下次完整启动容器后生效。 |
+| Linux PTY 终端边界 | `terminal_max_sessions` 默认 `6`；`terminal_idle_timeout_seconds` 默认 `0`，表示不限制。非零值只关闭没有 WebUI 连接的空闲终端，不会停止容器或 Bot。 |
+
+Compose 和 `.env.example` 暴露全部高级设置环境变量，但它们只用于首次生成 `shell.json`；已有持久化配置优先，不会因镜像升级被覆盖。配置导入、导出和 WebUI 保存使用相同字段与校验范围。
+
+```dotenv
+ROCKETCAT_PERFORMANCE_PROFILE=balanced
+ROCKETCAT_INBOUND_WORKER_COUNT=0
+ROCKETCAT_ONEBOT_OUTGOING_QUEUE_MAX_ENTRIES=512
+ROCKETCAT_IDENTITY_CACHE_MAX_ENTRIES=4096
+ROCKETCAT_MEDIA_CACHE_MAX_BYTES=1073741824
+ROCKETCAT_MEDIA_CACHE_MAX_AGE_HOURS=168
+ROCKETCAT_LOG_FILE_MAX_BYTES=10485760
+ROCKETCAT_LOG_FILE_BACKUP_COUNT=3
+ROCKETCAT_TERMINAL_MAX_SESSIONS=6
+ROCKETCAT_TERMINAL_IDLE_TIMEOUT_SECONDS=0
+```
 
 ### 单个 Bot 配置
 

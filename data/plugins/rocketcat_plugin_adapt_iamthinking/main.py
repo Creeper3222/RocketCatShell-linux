@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 from rocketcat_shell.logger import logger
@@ -14,6 +15,9 @@ _DEFAULT_DONE_REACTION = ":sunny:"
 _DEFAULT_ENABLE_REACTIONS = True
 _DEFAULT_ENABLE_TYPING_INDICATOR = True
 _TYPING_RENEW_INTERVAL_SECONDS = 4.0
+_REACTION_STATE_TTL_SECONDS = 3600.0
+_REACTION_STATE_MAX_ENTRIES = 2048
+_TYPING_MAX_DURATION_SECONDS = 600.0
 
 
 class _ResolvedActionEffects:
@@ -163,10 +167,16 @@ class Plugin(RocketCatPlugin):
         # `astrbot_plugin_iamthinking` only passes numeric QQ emoji ids. On Rocket.Chat we
         # normalize those numeric ids into a fixed processing/done pair instead of trying to
         # maintain a full QQ->Rocket.Chat emoji table.
+        self._prune_reaction_states()
         state = self._numeric_reaction_states.setdefault(
             source_message_id,
-            {"phase": "initial", "thinking_emoji_id": None},
+            {
+                "phase": "initial",
+                "thinking_emoji_id": None,
+                "updated_at": time.monotonic(),
+            },
         )
+        state["updated_at"] = time.monotonic()
 
         if not should_react:
             phase = str(state.get("phase") or "initial")
@@ -220,6 +230,24 @@ class Plugin(RocketCatPlugin):
             reaction=self._done_reaction(),
             typing_transition="stop",
         )
+
+    def _prune_reaction_states(self) -> None:
+        cutoff = time.monotonic() - _REACTION_STATE_TTL_SECONDS
+        expired = [
+            source_id
+            for source_id, state in self._numeric_reaction_states.items()
+            if float(state.get("updated_at") or 0.0) < cutoff
+        ]
+        for source_id in expired:
+            self._numeric_reaction_states.pop(source_id, None)
+        overflow = len(self._numeric_reaction_states) - _REACTION_STATE_MAX_ENTRIES
+        if overflow > 0:
+            oldest = sorted(
+                self._numeric_reaction_states.items(),
+                key=lambda item: float(item[1].get("updated_at") or 0.0),
+            )[:overflow]
+            for source_id, _ in oldest:
+                self._numeric_reaction_states.pop(source_id, None)
 
     async def _resolve_room_source_id(
         self,
@@ -338,10 +366,23 @@ class Plugin(RocketCatPlugin):
         runtime: PluginExecutionContext,
         room_source_id: str,
     ) -> None:
+        started_at = time.monotonic()
         try:
             while self._typing_room_members.get(room_source_id):
                 await asyncio.sleep(_TYPING_RENEW_INTERVAL_SECONDS)
                 if not self._typing_room_members.get(room_source_id):
+                    break
+                if time.monotonic() - started_at >= _TYPING_MAX_DURATION_SECONDS:
+                    self._typing_room_members.pop(room_source_id, None)
+                    await runtime.rocketchat.set_room_typing(
+                        room_source_id,
+                        is_typing=False,
+                    )
+                    logger.warning(
+                        "[RocketCatShell][Plugin:%s] typing 已达到最长持续时间并自动停止: room_id=%s",
+                        self.context.plugin_id,
+                        room_source_id,
+                    )
                     break
                 ok = await runtime.rocketchat.set_room_typing(room_source_id, is_typing=True)
                 if not ok:

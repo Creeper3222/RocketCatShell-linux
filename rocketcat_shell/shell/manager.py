@@ -37,6 +37,7 @@ class ShellManager:
         self.media_publication = MediaPublicationService()
         self.bots: list[BotRecord] = []
         self.runtimes: dict[str, BridgeRuntime] = {}
+        self._runtime_reload_counts: dict[str, int] = {}
         self._lock = asyncio.Lock()
         self._runtime_lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
@@ -146,6 +147,16 @@ class ShellManager:
             "message_index_reset_surrogate_id": DurableIdMap.message_reset_surrogate_id(
                 settings.message_index_max_entries
             ),
+            "performance_profile": settings.performance_profile,
+            "inbound_worker_count": settings.inbound_worker_count,
+            "onebot_outgoing_queue_max_entries": settings.onebot_outgoing_queue_max_entries,
+            "identity_cache_max_entries": settings.identity_cache_max_entries,
+            "media_cache_max_bytes": settings.media_cache_max_bytes,
+            "media_cache_max_age_hours": settings.media_cache_max_age_hours,
+            "log_file_max_bytes": settings.log_file_max_bytes,
+            "log_file_backup_count": settings.log_file_backup_count,
+            "terminal_max_sessions": settings.terminal_max_sessions,
+            "terminal_idle_timeout_seconds": settings.terminal_idle_timeout_seconds,
         }
 
     async def export_configuration(self) -> dict[str, Any]:
@@ -165,6 +176,16 @@ class ShellManager:
                 "webui_access_password": settings.webui_access_password,
                 "webui_port": settings.webui_port,
                 "message_index_max_entries": settings.message_index_max_entries,
+                "performance_profile": settings.performance_profile,
+                "inbound_worker_count": settings.inbound_worker_count,
+                "onebot_outgoing_queue_max_entries": settings.onebot_outgoing_queue_max_entries,
+                "identity_cache_max_entries": settings.identity_cache_max_entries,
+                "media_cache_max_bytes": settings.media_cache_max_bytes,
+                "media_cache_max_age_hours": settings.media_cache_max_age_hours,
+                "log_file_max_bytes": settings.log_file_max_bytes,
+                "log_file_backup_count": settings.log_file_backup_count,
+                "terminal_max_sessions": settings.terminal_max_sessions,
+                "terminal_idle_timeout_seconds": settings.terminal_idle_timeout_seconds,
             },
             "bots": bots,
             "plugin_configs": plugin_configs,
@@ -213,6 +234,9 @@ class ShellManager:
 
         candidate_bots = self._build_import_bots(raw_bots, defaults=settings)
         candidate_plugin_configs = self._normalize_import_plugin_configs(raw_plugin_configs)
+        candidate_settings = ShellSettings.from_mapping(
+            {**settings.to_mapping(), **raw_shell_settings}
+        )
 
         imported_plugin_count = len(candidate_plugin_configs)
         async with self._lock:
@@ -223,6 +247,19 @@ class ShellManager:
                 settings.webui_access_password = candidate_password
                 settings.webui_port = candidate_port
                 settings.message_index_max_entries = candidate_message_index_max_entries
+                for field_name in (
+                    "performance_profile",
+                    "inbound_worker_count",
+                    "onebot_outgoing_queue_max_entries",
+                    "identity_cache_max_entries",
+                    "media_cache_max_bytes",
+                    "media_cache_max_age_hours",
+                    "log_file_max_bytes",
+                    "log_file_backup_count",
+                    "terminal_max_sessions",
+                    "terminal_idle_timeout_seconds",
+                ):
+                    setattr(settings, field_name, getattr(candidate_settings, field_name))
                 self.bots = candidate_bots
                 self._persist_after_bot_change_locked()
                 self._apply_import_plugin_configs(candidate_plugin_configs)
@@ -254,6 +291,7 @@ class ShellManager:
 
         self.plugin_manager.refresh()
         await self._reconcile_runtimes("configuration imported")
+        await self._reload_runtime_plugins("configuration imported")
         message_index_summary = await self._apply_message_index_policy(
             force_compact=False,
             reason="configuration imported",
@@ -276,6 +314,7 @@ class ShellManager:
         settings = self._require_settings()
         changes: list[str] = []
         should_apply_message_index_policy = False
+        should_reconcile_runtimes = False
 
         async with self._lock:
             if "webui_access_password" in payload:
@@ -310,6 +349,46 @@ class ShellManager:
                 changes.append("message_index")
                 should_apply_message_index_policy = True
 
+            integer_settings = {
+                "inbound_worker_count": (0, 8),
+                "onebot_outgoing_queue_max_entries": (1, 100000),
+                "identity_cache_max_entries": (128, 1000000),
+                "media_cache_max_bytes": (1024 * 1024, 1024**4),
+                "media_cache_max_age_hours": (1, 24 * 3650),
+                "log_file_max_bytes": (1024 * 1024, 1024**4),
+                "log_file_backup_count": (0, 100),
+                "terminal_max_sessions": (1, 64),
+                "terminal_idle_timeout_seconds": (0, 7 * 24 * 3600),
+            }
+            for field_name, (minimum, maximum) in integer_settings.items():
+                if field_name not in payload:
+                    continue
+                try:
+                    candidate_value = int(payload.get(field_name))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{field_name} 必须是整数") from exc
+                if candidate_value < minimum or candidate_value > maximum:
+                    raise ValueError(
+                        f"{field_name} 必须在 {minimum} 到 {maximum} 之间"
+                    )
+                setattr(settings, field_name, candidate_value)
+                changes.append(field_name)
+                if field_name in {
+                    "inbound_worker_count",
+                    "onebot_outgoing_queue_max_entries",
+                    "identity_cache_max_entries",
+                    "media_cache_max_bytes",
+                    "media_cache_max_age_hours",
+                }:
+                    should_reconcile_runtimes = True
+
+            if "performance_profile" in payload:
+                profile = str(payload.get("performance_profile") or "").strip().lower()
+                if profile != "balanced":
+                    raise ValueError("当前版本仅支持 balanced 性能策略")
+                settings.performance_profile = profile
+                changes.append("performance_profile")
+
             if not changes:
                 raise ValueError("未提供可更新的设置项")
 
@@ -320,6 +399,8 @@ class ShellManager:
                 force_compact=False,
                 reason="message mapping window settings updated",
             )
+        if should_reconcile_runtimes:
+            await self._reconcile_runtimes("performance settings updated")
 
         if "password" in changes:
             logger.info("[RocketCatShell] WebUI 登录认证密码已更新。")
@@ -456,6 +537,19 @@ class ShellManager:
         )
         total_runtime_snapshot_bytes = sum(int(item.get("runtime_snapshot_bytes") or 0) for item in items)
         total_runtime_journal_bytes = sum(int(item.get("runtime_journal_bytes") or 0) for item in items)
+        total_inbound_queue_depth = sum(int(item.get("inbound_queue_depth") or 0) for item in items)
+        total_outgoing_queue_depth = sum(int(item.get("outgoing_queue_depth") or 0) for item in items)
+        total_media_cache_files = sum(
+            int((item.get("media_cache") or {}).get("file_count") or 0)
+            for item in items
+        )
+        total_media_cache_bytes = sum(
+            int((item.get("media_cache") or {}).get("total_bytes") or 0)
+            for item in items
+        )
+        total_runtime_restarts = sum(
+            int(item.get("runtime_restart_count") or 0) for item in items
+        )
 
         return {
             "version": __version__,
@@ -470,6 +564,11 @@ class ShellManager:
                 "reconnecting_bot_count": reconnecting_bot_count,
                 "total_runtime_snapshot_bytes": total_runtime_snapshot_bytes,
                 "total_runtime_journal_bytes": total_runtime_journal_bytes,
+                "total_inbound_queue_depth": total_inbound_queue_depth,
+                "total_outgoing_queue_depth": total_outgoing_queue_depth,
+                "total_media_cache_files": total_media_cache_files,
+                "total_media_cache_bytes": total_media_cache_bytes,
+                "total_runtime_restarts": total_runtime_restarts,
             },
         }
 
@@ -486,7 +585,7 @@ class ShellManager:
             self.bots.append(candidate)
             self._persist_after_bot_change_locked()
 
-        await self._reconcile_runtimes("bot created")
+        await self._reconcile_runtimes("bot created", target_bot_ids={candidate.bot_id})
         return self._serialize_bot(candidate, mask_secrets=False)
 
     async def update_bot(self, bot_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -504,7 +603,7 @@ class ShellManager:
             self.bots[target_index] = candidate
             self._persist_after_bot_change_locked()
 
-        await self._reconcile_runtimes("bot updated")
+        await self._reconcile_runtimes("bot updated", target_bot_ids={candidate.bot_id})
         return self._serialize_bot(candidate, mask_secrets=False)
 
     async def list_user_mappings(
@@ -628,7 +727,7 @@ class ShellManager:
             self.bots.pop(target_index)
             self._persist_after_bot_change_locked()
 
-        await self._reconcile_runtimes("bot deleted")
+        await self._reconcile_runtimes("bot deleted", target_bot_ids={bot_id})
 
     async def list_plugins(self) -> list[dict[str, Any]]:
         return self.plugin_manager.list_plugins()
@@ -641,17 +740,17 @@ class ShellManager:
 
     async def set_plugin_enabled(self, plugin_id: str, enabled: bool) -> dict[str, Any]:
         plugin = self.plugin_manager.set_plugin_enabled(plugin_id, enabled)
-        await self._reconcile_runtimes("plugin enabled updated")
+        await self._reload_runtime_plugins("plugin enabled updated")
         return plugin
 
     async def update_plugin_config(self, plugin_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         plugin = self.plugin_manager.update_plugin_config(plugin_id, payload)
-        await self._reconcile_runtimes("plugin config updated")
+        await self._reload_runtime_plugins("plugin config updated")
         return plugin
 
     async def reload_plugin(self, plugin_id: str) -> dict[str, Any]:
         plugin = self.plugin_manager.reload_plugin(plugin_id)
-        await self._reconcile_runtimes("plugin reloaded")
+        await self._reload_runtime_plugins("plugin reloaded")
         return plugin
 
     async def uninstall_plugin(
@@ -666,7 +765,7 @@ class ShellManager:
             delete_config=delete_config,
             delete_data=delete_data,
         )
-        await self._reconcile_runtimes("plugin uninstalled")
+        await self._reload_runtime_plugins("plugin uninstalled")
         return result
 
     def _find_bot_index(self, bot_id: str) -> int:
@@ -710,6 +809,7 @@ class ShellManager:
             scope_key=scope_key,
             bot_id=bot.bot_id,
             warning_path=self.layout.bots_dir / bot.bot_id / "re_waring.json",
+            cache_max_entries=self._require_settings().identity_cache_max_entries,
         )
 
     def _bots_for_identity_database(self, database_path: Path) -> list[BotRecord]:
@@ -735,7 +835,6 @@ class ShellManager:
                 bot_id=bot.bot_id,
                 warning_path=self.layout.bots_dir / bot.bot_id / "re_waring.json",
             )
-
     async def _restart_bots_after_identity_change(
         self,
         bots: list[BotRecord],
@@ -839,36 +938,134 @@ class ShellManager:
         self._persist_shell_settings()
         self.registry.save(self.bots)
 
-    async def _reconcile_runtimes(self, reason: str) -> None:
+    async def _reconcile_runtimes(
+        self,
+        reason: str,
+        *,
+        target_bot_ids: set[str] | None = None,
+    ) -> None:
         async with self._runtime_lock:
-            await self._stop_all_runtimes()
-
-            started = 0
-            for bot in self.bots:
-                if not bot.enabled:
+            bots_by_id = {bot.bot_id: bot for bot in self.bots}
+            target_ids = (
+                set(bots_by_id) | set(self.runtimes)
+                if target_bot_ids is None
+                else set(target_bot_ids)
+            )
+            stop_ids: list[str] = []
+            start_bots: list[BotRecord] = []
+            for bot_id in target_ids:
+                bot = bots_by_id.get(bot_id)
+                runtime = self.runtimes.get(bot_id)
+                if bot is None or not bot.enabled:
+                    if runtime is not None:
+                        stop_ids.append(bot_id)
+                    if bot is None:
+                        self._runtime_reload_counts.pop(bot_id, None)
                     continue
+                desired_config = self._runtime_config_mapping(bot)
+                if (
+                    runtime is not None
+                    and runtime.started
+                    and dict(runtime.raw_config) == desired_config
+                ):
+                    continue
+                if runtime is not None:
+                    self._runtime_reload_counts[bot_id] = (
+                        max(
+                            self._runtime_reload_counts.get(bot_id, 0),
+                            int(getattr(runtime, "_restart_count", 0) or 0),
+                        )
+                        + 1
+                    )
+                    stop_ids.append(bot_id)
+                start_bots.append(bot)
 
-                runtime = BridgeRuntime(
-                    plugin_root=self.layout.package_root,
-                    raw_config=bot.to_mapping(),
-                    data_dir=self.layout.bots_dir / bot.bot_id,
-                    media_temp_dir=self.layout.temp_dir,
-                    instance_name=bot.name or bot.bot_id,
-                    message_index_max_entries=self._require_settings().message_index_max_entries,
-                    media_publication_service=self.media_publication,
-                    disable_callback=lambda bot_id=bot.bot_id: self._disable_bot_after_failure(bot_id),
-                    plugin_manager=self.plugin_manager,
-                )
-                await runtime.start()
-                if runtime.started:
-                    self.runtimes[bot.bot_id] = runtime
-                    started += 1
+            for bot_id in stop_ids:
+                runtime = self.runtimes.pop(bot_id, None)
+                if runtime is not None:
+                    await runtime.stop()
+
+            semaphore = asyncio.Semaphore(2)
+
+            async def start_one(bot: BotRecord) -> tuple[str, BridgeRuntime | None]:
+                async with semaphore:
+                    runtime = self._build_runtime(bot)
+                    try:
+                        await runtime.start()
+                    except Exception:
+                        logger.exception(
+                            "[RocketCatShell] runtime 启动失败 | bot_id=%s | reason=%s",
+                            bot.bot_id,
+                            reason,
+                        )
+                        return bot.bot_id, None
+                    return bot.bot_id, runtime if runtime.started else None
+
+            results = (
+                await asyncio.gather(*(start_one(bot) for bot in start_bots))
+                if start_bots
+                else []
+            )
+            for bot_id, runtime in results:
+                if runtime is not None:
+                    self.runtimes[bot_id] = runtime
 
             logger.info(
-                "[RocketCatShell] runtime reconcile complete | reason=%s | started=%s | enabled=%s",
+                "[RocketCatShell] runtime incremental reconcile complete | reason=%s | stopped=%s | started=%s | unchanged=%s | enabled=%s",
                 reason,
-                started,
+                len(stop_ids),
+                sum(1 for _, runtime in results if runtime is not None),
+                max(0, len(target_ids) - len(stop_ids) - len(start_bots)),
                 sum(1 for bot in self.bots if bot.enabled),
+            )
+
+    def _runtime_config_mapping(self, bot: BotRecord) -> dict[str, Any]:
+        settings = self._require_settings()
+        payload = bot.to_mapping()
+        payload.update(
+            {
+                "inbound_worker_count": settings.inbound_worker_count,
+                "onebot_outgoing_queue_max_entries": settings.onebot_outgoing_queue_max_entries,
+                "identity_cache_max_entries": settings.identity_cache_max_entries,
+                "media_cache_max_bytes": settings.media_cache_max_bytes,
+                "media_cache_max_age_hours": settings.media_cache_max_age_hours,
+            }
+        )
+        return payload
+
+    def _build_runtime(self, bot: BotRecord) -> BridgeRuntime:
+        runtime = BridgeRuntime(
+            plugin_root=self.layout.package_root,
+            raw_config=self._runtime_config_mapping(bot),
+            data_dir=self.layout.bots_dir / bot.bot_id,
+            media_temp_dir=self.layout.temp_dir,
+            instance_name=bot.name or bot.bot_id,
+            message_index_max_entries=self._require_settings().message_index_max_entries,
+            media_publication_service=self.media_publication,
+            disable_callback=lambda bot_id=bot.bot_id: self._disable_bot_after_failure(bot_id),
+            plugin_manager=self.plugin_manager,
+        )
+        runtime._restart_count = self._runtime_reload_counts.get(bot.bot_id, 0)
+        return runtime
+
+    async def _reload_runtime_plugins(self, reason: str) -> None:
+        async with self._runtime_lock:
+            results = await asyncio.gather(
+                *(runtime.reload_plugins() for runtime in self.runtimes.values()),
+                return_exceptions=True,
+            )
+        failures = sum(1 for result in results if isinstance(result, Exception))
+        if failures:
+            logger.error(
+                "[RocketCatShell] 插件增量重载完成但存在失败 | reason=%s | failures=%s",
+                reason,
+                failures,
+            )
+        else:
+            logger.info(
+                "[RocketCatShell] 插件增量重载完成 | reason=%s | runtimes=%s",
+                reason,
+                len(results),
             )
 
     async def _stop_all_runtimes(self) -> None:
@@ -898,6 +1095,10 @@ class ShellManager:
 
         runtime = self.runtimes.pop(bot_id, None)
         if runtime is not None:
+            self._runtime_reload_counts[bot_id] = max(
+                self._runtime_reload_counts.get(bot_id, 0),
+                int(getattr(runtime, "_restart_count", 0) or 0),
+            )
             await runtime.stop()
 
     async def _build_basic_info_item(

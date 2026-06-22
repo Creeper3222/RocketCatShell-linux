@@ -928,20 +928,23 @@ class RuntimeStateEngine:
             removed_count += 1
 
         changed = removed_count > 0
-        active_mappings = {
-            str(source_id): int(surrogate_id)
-            for source_id, surrogate_id in self._forward["message"].items()
-        }
-
         if not changed and not return_snapshot_when_unchanged:
             return None
 
+        active_mappings = (
+            {
+                str(source_id): int(surrogate_id)
+                for source_id, surrogate_id in self._forward["message"].items()
+            }
+            if return_snapshot_when_unchanged or force_compact
+            else {}
+        )
         return MessageWindowSnapshot(
             active_mappings=active_mappings,
             changed=changed,
             removed_count=removed_count,
             compacted=False,
-            active_count=len(active_mappings),
+            active_count=len(self._forward["message"]),
             max_entries=self._message_window_size,
         )
 

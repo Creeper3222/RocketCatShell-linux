@@ -49,41 +49,19 @@ class InboundTranslator:
         if not room_id or not sender_source_id or not source_message_id:
             return None
 
-        quote_contexts_task: asyncio.Task[list[dict[str, Any]]] | None = None
-        reply_source_id: str | None = None
-        multi_reply_source_ids: list[str] = []
+        with perf_stage(perf_trace, "parse_plan"):
+            (
+                quote_contexts_task,
+                multi_quote_fetch_task,
+                reply_source_id,
+                multi_reply_source_ids,
+                cleaned_text,
+                top_level_quotes,
+                is_multi_quote,
+            ) = self._build_translation_plan(raw_msg)
         multi_reply_ids: list[int] = []
         multi_quote_nodes: list[dict[str, Any]] = []
         multi_quote_fallbacks: list[bool] = []
-        cleaned_text = str(raw_msg.get("msg") or "")
-        top_level_quotes = self._extract_top_level_quote_attachments(raw_msg)
-        e2ee_prefix_quotes, e2ee_cleaned_text = self._extract_e2ee_multi_quote_prefix(
-            raw_msg
-        )
-        uses_e2ee_prefix_quotes = (
-            len(top_level_quotes) < 2 and len(e2ee_prefix_quotes) >= 2
-        )
-        if uses_e2ee_prefix_quotes:
-            top_level_quotes = e2ee_prefix_quotes
-        is_multi_quote = len(top_level_quotes) >= 2
-        if is_multi_quote:
-            multi_reply_source_ids = [source_id for _attachment, source_id in top_level_quotes]
-        may_have_quote_contexts = self._may_have_quote_contexts(raw_msg)
-        if is_multi_quote:
-            cleaned_text = (
-                e2ee_cleaned_text
-                if uses_e2ee_prefix_quotes
-                else self._QUOTE_PATTERN.sub("", cleaned_text).strip()
-            )
-        elif may_have_quote_contexts:
-            reply_source_id, cleaned_text = self._extract_reply_source_id(raw_msg)
-            quote_contexts_task = asyncio.create_task(
-                self._build_quote_contexts(
-                    raw_msg,
-                    max_depth=self._MAX_QUOTE_DEPTH,
-                    reply_source_id=reply_source_id,
-                )
-            )
         runtime_batch = self._begin_runtime_batch()
         try:
             with perf_stage(perf_trace, "room_lookup"):
@@ -142,7 +120,11 @@ class InboundTranslator:
 
             current_input_text = cleaned_text.strip()
             with perf_stage(perf_trace, "mention_segments"):
-                message_segments, cleaned_text = await self._build_mention_segments(
+                (
+                    message_segments,
+                    cleaned_text,
+                    mention_metadata,
+                ) = await self._build_mentions(
                     raw_msg,
                     cleaned_text,
                     batch=runtime_batch,
@@ -156,12 +138,15 @@ class InboundTranslator:
                         multi_quote_fallbacks,
                     ) = await self._build_multi_quote_snapshots(
                         top_level_quotes,
+                        fetched_by_source=(
+                            await multi_quote_fetch_task
+                            if multi_quote_fetch_task is not None
+                            else None
+                        ),
                         batch=runtime_batch,
                     )
                 elif quote_contexts_task is not None:
                     quote_contexts = await quote_contexts_task
-            with perf_stage(perf_trace, "mention_metadata"):
-                mention_metadata = await self._extract_mention_metadata(raw_msg, batch=runtime_batch)
             mention_display_names = [
                 str(item.get("name") or "")
                 for item in mention_metadata
@@ -223,160 +208,395 @@ class InboundTranslator:
                 current_message_text=current_input_text,
                 fallback=message_text,
             )
-            event = {
-                "time": timestamp,
-                "self_id": self._self_id,
-                "post_type": "message",
-                "message_type": "private" if room_type == "d" else "group",
-                "sub_type": "friend" if room_type == "d" else "normal",
-                "message_id": message_mapping.surrogate_id,
-                "user_id": sender_mapping.surrogate_id,
-                "message": segments,
-                "raw_message": combined_raw_message,
-                "font": 0,
-                "sender": {
-                    "user_id": sender_mapping.surrogate_id,
-                    "nickname": sender_name,
-                    "card": sender_name,
-                },
-                "message_format": "array",
-                "rocketchat_sender_name": sender_name,
-                "rocketchat_sender_username": str(sender.get("username") or ""),
-                "rocketchat_sender_source_id": sender_source_id,
-                "rocketchat_sender_surrogate_id": sender_mapping.surrogate_id,
-                "rocketchat_mentions": mention_metadata,
-                "rocketchat_quote_contexts": quote_contexts,
-                "rocketchat_quote_context_text": quote_context_block,
-                "rocketchat_current_message_input_text": current_input_text,
-                "rocketchat_quote_media_segments": quote_media_segments,
-                "rocketchat_current_message_text": message_text,
-                "rocketchat_current_message_line": current_message_line,
-                "rocketchat_reply_source_id": reply_source_id,
-                "rocketchat_reply_source_ids": list(multi_reply_source_ids),
-                "rocketchat_reply_sender_name": str(direct_reply_context.get("sender_name") or ""),
-                "rocketchat_reply_message_text": str(direct_reply_context.get("text") or ""),
-                "rocketchat_room_source_id": room_id,
-                "rocketchat_room_name": room_name,
-                "rocketchat_room_slug": room_slug,
-                "rocketchat_room_label": room_context_label,
-                "rocketchat_room_surrogate_id": room_mapping.surrogate_id,
-                "rocketchat_context_source_id": context_source_id,
-                "rocketchat_context_group_id": context_surrogate_id,
-                "rocketchat_thread_source_id": thread_source_id,
-            }
+            with perf_stage(perf_trace, "event_build"):
+                event = self._build_inbound_event(
+                    timestamp=timestamp,
+                    room_type=room_type,
+                    message_surrogate_id=message_mapping.surrogate_id,
+                    sender_surrogate_id=sender_mapping.surrogate_id,
+                    sender_name=sender_name,
+                    sender_username=str(sender.get("username") or ""),
+                    sender_source_id=sender_source_id,
+                    segments=segments,
+                    raw_message=combined_raw_message,
+                    mention_metadata=mention_metadata,
+                    quote_contexts=quote_contexts,
+                    quote_context_block=quote_context_block,
+                    current_input_text=current_input_text,
+                    quote_media_segments=quote_media_segments,
+                    message_text=message_text,
+                    current_message_line=current_message_line,
+                    reply_source_id=reply_source_id,
+                    multi_reply_source_ids=multi_reply_source_ids,
+                    direct_reply_context=direct_reply_context,
+                    room_id=room_id,
+                    room_name=room_name,
+                    room_slug=room_slug,
+                    room_context_label=room_context_label,
+                    room_surrogate_id=room_mapping.surrogate_id,
+                    context_source_id=context_source_id,
+                    context_surrogate_id=context_surrogate_id,
+                    thread_source_id=thread_source_id,
+                )
 
-            if room_type != "d":
-                event["group_id"] = context_surrogate_id if context_surrogate_id is not None else room_mapping.surrogate_id
-                event["group_name"] = room_name
-
-            if is_multi_quote:
-                logger.info(
-                    self._format_inbound_multi_quote_log(
-                        room_context_label=room_context_label,
-                        sender_name=sender_name,
-                        sender_surrogate_id=sender_mapping.surrogate_id,
-                        current_message_line=current_message_line,
-                        reply_ids=multi_reply_ids,
-                        quote_contexts=quote_contexts,
-                    )
-                )
-            elif quote_contexts:
-                logger.info(
-                    self._format_inbound_quote_log(
-                        room_context_label=room_context_label,
-                        sender_name=sender_name,
-                        sender_surrogate_id=sender_mapping.surrogate_id,
-                        current_message_line=current_message_line,
-                        quote_contexts=quote_contexts,
-                    )
-                )
-            else:
-                logger.info(
-                    self._format_inbound_message_log(
-                        room_context_label=room_context_label,
-                        sender_name=sender_name,
-                        sender_surrogate_id=sender_mapping.surrogate_id,
-                        current_message_line=current_message_line,
-                    )
-                )
+            self._log_translated_event(
+                is_multi_quote=is_multi_quote,
+                room_context_label=room_context_label,
+                sender_name=sender_name,
+                sender_surrogate_id=sender_mapping.surrogate_id,
+                current_message_line=current_message_line,
+                reply_ids=multi_reply_ids,
+                quote_contexts=quote_contexts,
+            )
 
             with perf_stage(perf_trace, "message_store"):
-                if is_multi_quote:
-                    for (
-                        (_attachment, quoted_source_id),
-                        quoted_surrogate_id,
-                        node,
-                        context,
-                        used_attachment_snapshot,
-                    ) in zip(
+                await self._persist_translated_event(
+                    event=event,
+                    batch=runtime_batch,
+                    is_multi_quote=is_multi_quote,
+                    fallback_inputs=(
                         top_level_quotes,
                         multi_reply_ids,
                         multi_quote_nodes,
                         quote_contexts,
                         multi_quote_fallbacks,
-                        strict=True,
-                    ):
-                        if not used_attachment_snapshot:
-                            continue
-                        await self._put_multi_quote_fallback_entry(
-                            source_id=quoted_source_id,
-                            surrogate_id=quoted_surrogate_id,
-                            node=node,
-                            context=context,
-                            room_source_id=room_id,
-                            room_surrogate_id=room_mapping.surrogate_id,
-                            room_type=room_type,
-                            room_name=room_name,
-                            room_slug=room_slug,
-                            room_label=room_context_label,
-                            context_source_id=context_source_id,
-                            context_surrogate_id=context_surrogate_id,
-                            group_id=event.get("group_id"),
-                            group_name=event.get("group_name"),
-                            batch=runtime_batch,
-                        )
-                await self._put_message_entry(
-                    {
-                        "source_id": source_message_id,
-                        "surrogate_id": message_mapping.surrogate_id,
-                        "room_source_id": room_id,
-                        "room_surrogate_id": room_mapping.surrogate_id,
-                        "room_type": room_type,
-                        "room_name": room_name,
-                        "room_slug": room_slug,
+                    ),
+                    room={
+                        "source_id": room_id,
+                        "surrogate_id": room_mapping.surrogate_id,
+                        "type": room_type,
+                        "name": room_name,
+                        "slug": room_slug,
+                        "label": room_context_label,
                         "context_source_id": context_source_id,
                         "context_surrogate_id": context_surrogate_id,
-                        "sender_source_id": sender_source_id,
-                        "sender_surrogate_id": sender_mapping.surrogate_id,
-                        "sender_name": sender_name,
-                        "sender_username": str(sender.get("username") or ""),
-                        "mention_metadata": mention_metadata,
+                    },
+                    message={
+                        "source_id": source_message_id,
+                        "surrogate_id": message_mapping.surrogate_id,
                         "input_text": current_input_text,
                         "text": message_text,
-                        "quote_contexts": quote_contexts,
-                        "quote_context_text": quote_context_block,
-                        "reply_sender_name": str(direct_reply_context.get("sender_name") or ""),
-                        "reply_message_text": str(direct_reply_context.get("text") or ""),
-                        "timestamp": timestamp,
-                        "onebot_message_segments": segments,
+                        "segments": segments,
                         "raw_message": combined_raw_message,
-                        "self_id": self._self_id,
-                        "reply_source_id": reply_source_id,
-                        "reply_source_ids": list(multi_reply_source_ids),
-                        "quote_media_segments": quote_media_segments,
-                        "current_message_line": current_message_line,
-                        "room_label": room_context_label,
-                        "group_id": event.get("group_id"),
-                        "group_name": event.get("group_name"),
+                        "current_line": current_message_line,
                         "thread_source_id": thread_source_id,
                     },
-                    batch=runtime_batch,
+                    sender={
+                        "source_id": sender_source_id,
+                        "surrogate_id": sender_mapping.surrogate_id,
+                        "name": sender_name,
+                        "username": str(sender.get("username") or ""),
+                    },
+                    reply={
+                        "source_id": reply_source_id,
+                        "source_ids": list(multi_reply_source_ids),
+                        "contexts": quote_contexts,
+                        "context_text": quote_context_block,
+                        "media_segments": quote_media_segments,
+                        "sender_name": str(
+                            direct_reply_context.get("sender_name") or ""
+                        ),
+                        "message_text": str(
+                            direct_reply_context.get("text") or ""
+                        ),
+                    },
+                    mention_metadata=mention_metadata,
+                    timestamp=timestamp,
                 )
             return event
         finally:
             await self._cancel_pending_task(quote_contexts_task)
+            await self._cancel_pending_task(multi_quote_fetch_task)
             with perf_stage(perf_trace, "batch_commit"):
                 self._commit_runtime_batch(runtime_batch)
+
+    def _build_translation_plan(
+        self,
+        raw_msg: dict[str, Any],
+    ) -> tuple[
+        asyncio.Task[list[dict[str, Any]]] | None,
+        asyncio.Task[dict[str, dict[str, Any] | None]] | None,
+        str | None,
+        list[str],
+        str,
+        list[tuple[dict[str, Any], str]],
+        bool,
+    ]:
+        quote_contexts_task: asyncio.Task[list[dict[str, Any]]] | None = None
+        multi_quote_fetch_task: asyncio.Task[
+            dict[str, dict[str, Any] | None]
+        ] | None = None
+        reply_source_id: str | None = None
+        multi_reply_source_ids: list[str] = []
+        cleaned_text = str(raw_msg.get("msg") or "")
+        top_level_quotes = self._extract_top_level_quote_attachments(raw_msg)
+        e2ee_prefix_quotes, e2ee_cleaned_text = self._extract_e2ee_multi_quote_prefix(
+            raw_msg
+        )
+        uses_e2ee_prefix_quotes = (
+            len(top_level_quotes) < 2 and len(e2ee_prefix_quotes) >= 2
+        )
+        if uses_e2ee_prefix_quotes:
+            top_level_quotes = e2ee_prefix_quotes
+        is_multi_quote = len(top_level_quotes) >= 2
+        if is_multi_quote:
+            multi_reply_source_ids = [
+                source_id for _attachment, source_id in top_level_quotes
+            ]
+            multi_quote_fetch_task = asyncio.create_task(
+                self._fetch_multi_quote_source_messages(multi_reply_source_ids)
+            )
+            cleaned_text = (
+                e2ee_cleaned_text
+                if uses_e2ee_prefix_quotes
+                else self._QUOTE_PATTERN.sub("", cleaned_text).strip()
+            )
+        elif self._may_have_quote_contexts(raw_msg):
+            reply_source_id, cleaned_text = self._extract_reply_source_id(raw_msg)
+            quote_contexts_task = asyncio.create_task(
+                self._build_quote_contexts(
+                    raw_msg,
+                    max_depth=self._MAX_QUOTE_DEPTH,
+                    reply_source_id=reply_source_id,
+                )
+            )
+        return (
+            quote_contexts_task,
+            multi_quote_fetch_task,
+            reply_source_id,
+            multi_reply_source_ids,
+            cleaned_text,
+            top_level_quotes,
+            is_multi_quote,
+        )
+
+    async def _persist_translated_event(
+        self,
+        *,
+        event: dict[str, Any],
+        batch: Any,
+        is_multi_quote: bool,
+        fallback_inputs: tuple[
+            list[tuple[dict[str, Any], str]],
+            list[int],
+            list[dict[str, Any]],
+            list[dict[str, Any]],
+            list[bool],
+        ],
+        room: dict[str, Any],
+        message: dict[str, Any],
+        sender: dict[str, Any],
+        reply: dict[str, Any],
+        mention_metadata: list[dict[str, Any]],
+        timestamp: int,
+    ) -> None:
+        if is_multi_quote:
+            (
+                top_level_quotes,
+                multi_reply_ids,
+                multi_quote_nodes,
+                quote_contexts,
+                multi_quote_fallbacks,
+            ) = fallback_inputs
+            for (
+                (_attachment, quoted_source_id),
+                quoted_surrogate_id,
+                node,
+                context,
+                used_attachment_snapshot,
+            ) in zip(
+                top_level_quotes,
+                multi_reply_ids,
+                multi_quote_nodes,
+                quote_contexts,
+                multi_quote_fallbacks,
+                strict=True,
+            ):
+                if not used_attachment_snapshot:
+                    continue
+                await self._put_multi_quote_fallback_entry(
+                    source_id=quoted_source_id,
+                    surrogate_id=quoted_surrogate_id,
+                    node=node,
+                    context=context,
+                    room_source_id=room["source_id"],
+                    room_surrogate_id=room["surrogate_id"],
+                    room_type=room["type"],
+                    room_name=room["name"],
+                    room_slug=room["slug"],
+                    room_label=room["label"],
+                    context_source_id=room["context_source_id"],
+                    context_surrogate_id=room["context_surrogate_id"],
+                    group_id=event.get("group_id"),
+                    group_name=event.get("group_name"),
+                    batch=batch,
+                )
+
+        await self._put_message_entry(
+            {
+                "source_id": message["source_id"],
+                "surrogate_id": message["surrogate_id"],
+                "room_source_id": room["source_id"],
+                "room_surrogate_id": room["surrogate_id"],
+                "room_type": room["type"],
+                "room_name": room["name"],
+                "room_slug": room["slug"],
+                "context_source_id": room["context_source_id"],
+                "context_surrogate_id": room["context_surrogate_id"],
+                "sender_source_id": sender["source_id"],
+                "sender_surrogate_id": sender["surrogate_id"],
+                "sender_name": sender["name"],
+                "sender_username": sender["username"],
+                "mention_metadata": mention_metadata,
+                "input_text": message["input_text"],
+                "text": message["text"],
+                "quote_contexts": reply["contexts"],
+                "quote_context_text": reply["context_text"],
+                "reply_sender_name": reply["sender_name"],
+                "reply_message_text": reply["message_text"],
+                "timestamp": timestamp,
+                "onebot_message_segments": message["segments"],
+                "raw_message": message["raw_message"],
+                "self_id": self._self_id,
+                "reply_source_id": reply["source_id"],
+                "reply_source_ids": reply["source_ids"],
+                "quote_media_segments": reply["media_segments"],
+                "current_message_line": message["current_line"],
+                "room_label": room["label"],
+                "group_id": event.get("group_id"),
+                "group_name": event.get("group_name"),
+                "thread_source_id": message["thread_source_id"],
+            },
+            batch=batch,
+        )
+
+    def _build_inbound_event(
+        self,
+        *,
+        timestamp: int,
+        room_type: str,
+        message_surrogate_id: int,
+        sender_surrogate_id: int,
+        sender_name: str,
+        sender_username: str,
+        sender_source_id: str,
+        segments: list[dict[str, Any]],
+        raw_message: str,
+        mention_metadata: list[dict[str, Any]],
+        quote_contexts: list[dict[str, Any]],
+        quote_context_block: str,
+        current_input_text: str,
+        quote_media_segments: list[dict[str, Any]],
+        message_text: str,
+        current_message_line: str,
+        reply_source_id: str | None,
+        multi_reply_source_ids: list[str],
+        direct_reply_context: dict[str, Any],
+        room_id: str,
+        room_name: str,
+        room_slug: str,
+        room_context_label: str,
+        room_surrogate_id: int,
+        context_source_id: str,
+        context_surrogate_id: int | None,
+        thread_source_id: str,
+    ) -> dict[str, Any]:
+        event: dict[str, Any] = {
+            "time": timestamp,
+            "self_id": self._self_id,
+            "post_type": "message",
+            "message_type": "private" if room_type == "d" else "group",
+            "sub_type": "friend" if room_type == "d" else "normal",
+            "message_id": message_surrogate_id,
+            "user_id": sender_surrogate_id,
+            "message": segments,
+            "raw_message": raw_message,
+            "font": 0,
+            "sender": {
+                "user_id": sender_surrogate_id,
+                "nickname": sender_name,
+                "card": sender_name,
+            },
+            "message_format": "array",
+            "rocketchat_sender_name": sender_name,
+            "rocketchat_sender_username": sender_username,
+            "rocketchat_sender_source_id": sender_source_id,
+            "rocketchat_sender_surrogate_id": sender_surrogate_id,
+            "rocketchat_mentions": mention_metadata,
+            "rocketchat_quote_contexts": quote_contexts,
+            "rocketchat_quote_context_text": quote_context_block,
+            "rocketchat_current_message_input_text": current_input_text,
+            "rocketchat_quote_media_segments": quote_media_segments,
+            "rocketchat_current_message_text": message_text,
+            "rocketchat_current_message_line": current_message_line,
+            "rocketchat_reply_source_id": reply_source_id,
+            "rocketchat_reply_source_ids": list(multi_reply_source_ids),
+            "rocketchat_reply_sender_name": str(
+                direct_reply_context.get("sender_name") or ""
+            ),
+            "rocketchat_reply_message_text": str(
+                direct_reply_context.get("text") or ""
+            ),
+            "rocketchat_room_source_id": room_id,
+            "rocketchat_room_name": room_name,
+            "rocketchat_room_slug": room_slug,
+            "rocketchat_room_label": room_context_label,
+            "rocketchat_room_surrogate_id": room_surrogate_id,
+            "rocketchat_context_source_id": context_source_id,
+            "rocketchat_context_group_id": context_surrogate_id,
+            "rocketchat_thread_source_id": thread_source_id,
+        }
+        if room_type != "d":
+            event["group_id"] = (
+                context_surrogate_id
+                if context_surrogate_id is not None
+                else room_surrogate_id
+            )
+            event["group_name"] = room_name
+        return event
+
+    def _log_translated_event(
+        self,
+        *,
+        is_multi_quote: bool,
+        room_context_label: str,
+        sender_name: str,
+        sender_surrogate_id: int,
+        current_message_line: str,
+        reply_ids: list[int],
+        quote_contexts: list[dict[str, Any]],
+    ) -> None:
+        log_line = self._truncate_log_text(current_message_line)
+        if is_multi_quote:
+            logger.info(
+                self._format_inbound_multi_quote_log(
+                    room_context_label=room_context_label,
+                    sender_name=sender_name,
+                    sender_surrogate_id=sender_surrogate_id,
+                    current_message_line=log_line,
+                    reply_ids=reply_ids,
+                    quote_contexts=quote_contexts,
+                )
+            )
+        elif quote_contexts:
+            logger.info(
+                self._format_inbound_quote_log(
+                    room_context_label=room_context_label,
+                    sender_name=sender_name,
+                    sender_surrogate_id=sender_surrogate_id,
+                    current_message_line=log_line,
+                    quote_contexts=quote_contexts,
+                )
+            )
+        else:
+            logger.info(
+                self._format_inbound_message_log(
+                    room_context_label=room_context_label,
+                    sender_name=sender_name,
+                    sender_surrogate_id=sender_surrogate_id,
+                    current_message_line=log_line,
+                )
+            )
 
     async def hydrate(self, surrogate_message_id: int | str) -> dict | None:
         cached = await self._messages.get_by_surrogate(surrogate_message_id)
@@ -678,14 +898,29 @@ class InboundTranslator:
         )
 
     async def _build_mention_segments(self, raw_msg: dict, text: str, *, batch: Any = None) -> tuple[list[dict], str]:
+        segments, cleaned_text, _metadata = await self._build_mentions(
+            raw_msg,
+            text,
+            batch=batch,
+        )
+        return segments, cleaned_text
+
+    async def _build_mentions(
+        self,
+        raw_msg: dict[str, Any],
+        text: str,
+        *,
+        batch: Any = None,
+    ) -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]]:
         mentions = raw_msg.get("mentions")
         if not isinstance(mentions, list) or not mentions:
             stripped = text.strip()
-            return self._build_text_segments(stripped), stripped
+            return self._build_text_segments(stripped), stripped, []
 
         segments: list[dict] = []
         text_parts: list[str] = []
         unmatched_segments: list[dict] = []
+        metadata: list[dict[str, Any]] = []
         cursor = 0
 
         for mention in mentions:
@@ -698,6 +933,19 @@ class InboundTranslator:
             mention_segment = await self._build_mention_segment(mention, batch=batch)
             if mention_segment is None:
                 continue
+            mention_data = mention_segment.get("data") or {}
+            metadata.append(
+                {
+                    "source_id": str(mention_id),
+                    "username": str(mention.get("username") or ""),
+                    "name": str(
+                        mention.get("name")
+                        or mention_data.get("name")
+                        or mention_id
+                    ),
+                    "qq": str(mention_data.get("qq") or ""),
+                }
+            )
 
             username = mention.get("username")
             token = f"@{username}" if username else ""
@@ -724,7 +972,7 @@ class InboundTranslator:
             self._append_text_segment(segments, chunk)
 
         segments.extend(unmatched_segments)
-        return segments, "".join(text_parts).strip()
+        return segments, "".join(text_parts).strip(), metadata
 
     async def _build_mention_segment(self, mention: dict[str, Any], *, batch: Any = None) -> dict[str, Any] | None:
         mention_id = mention.get("_id")
@@ -847,34 +1095,74 @@ class InboundTranslator:
         self,
         quote_attachments: list[tuple[dict[str, Any], str]],
         *,
+        fetched_by_source: dict[str, dict[str, Any] | None] | None = None,
         batch: Any = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[bool]]:
-        fetched_messages = await asyncio.gather(
-            *[
-                self._fetch_multi_quote_source_message(source_id)
-                for _attachment, source_id in quote_attachments
-            ]
-        )
+        if fetched_by_source is None:
+            fetched_by_source = await self._fetch_multi_quote_source_messages(
+                [source_id for _attachment, source_id in quote_attachments]
+            )
+        fetched_messages = [
+            fetched_by_source.get(source_id)
+            for _attachment, source_id in quote_attachments
+        ]
+        snapshot_payloads = [
+            fetched_message
+            if isinstance(fetched_message, dict) and fetched_message
+            else attachment
+            for (attachment, _source_id), fetched_message in zip(
+                quote_attachments,
+                fetched_messages,
+                strict=True,
+            )
+        ]
+        sender_mappings: dict[str, Any] = {}
+        ensure_users = getattr(self._id_map, "ensure_users", None)
+        if callable(ensure_users):
+            user_items: list[dict[str, Any]] = []
+            seen_user_ids: set[str] = set()
+            for payload in snapshot_payloads:
+                sender_source_id = self._extract_context_sender_source_id(payload)
+                if (
+                    not sender_source_id
+                    or sender_source_id == str(self._rocketchat.user_id or "")
+                    or sender_source_id in seen_user_ids
+                ):
+                    continue
+                seen_user_ids.add(sender_source_id)
+                payload_sender = payload.get("u") if isinstance(payload.get("u"), dict) else {}
+                user_items.append(
+                    {
+                        "user_id": sender_source_id,
+                        "username": str(payload_sender.get("username") or ""),
+                        "nickname": str(
+                            payload_sender.get("name")
+                            or self._extract_context_sender_name(payload)
+                            or ""
+                        ),
+                    }
+                )
+            if user_items:
+                sender_mappings = await ensure_users(user_items)
         nodes: list[dict[str, Any]] = []
         contexts: list[dict[str, Any]] = []
         fallbacks: list[bool] = []
-        for (attachment, source_id), fetched_message in zip(
+        for (attachment, source_id), fetched_message, payload in zip(
             quote_attachments,
             fetched_messages,
+            snapshot_payloads,
             strict=True,
         ):
             used_attachment_snapshot = not (
                 isinstance(fetched_message, dict) and fetched_message
             )
-            payload = (
-                fetched_message
-                if not used_attachment_snapshot
-                else attachment
-            )
             try:
                 node, context = await self._build_multi_quote_snapshot(
                     payload,
                     source_id,
+                    sender_mapping=sender_mappings.get(
+                        self._extract_context_sender_source_id(payload)
+                    ),
                     batch=batch,
                 )
             except Exception as exc:
@@ -900,6 +1188,19 @@ class InboundTranslator:
             fallbacks.append(used_attachment_snapshot)
         return nodes, contexts, fallbacks
 
+    async def _fetch_multi_quote_source_messages(
+        self,
+        source_ids: list[str],
+    ) -> dict[str, dict[str, Any] | None]:
+        unique_source_ids = list(dict.fromkeys(str(item) for item in source_ids if str(item)))
+        fetched = await asyncio.gather(
+            *[
+                self._fetch_multi_quote_source_message(source_id)
+                for source_id in unique_source_ids
+            ]
+        )
+        return dict(zip(unique_source_ids, fetched, strict=True))
+
     async def _fetch_multi_quote_source_message(self, source_id: str) -> dict[str, Any] | None:
         try:
             return await self._rocketchat.fetch_message_by_id(source_id)
@@ -917,6 +1218,7 @@ class InboundTranslator:
         payload: dict[str, Any],
         source_id: str,
         *,
+        sender_mapping: Any = None,
         batch: Any = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         sender_name = self._extract_context_sender_name(payload)
@@ -925,6 +1227,8 @@ class InboundTranslator:
         if sender_source_id:
             if sender_source_id == str(self._rocketchat.user_id or ""):
                 sender_surrogate_id = self._self_id
+            elif sender_mapping is not None:
+                sender_surrogate_id = int(sender_mapping.surrogate_id)
             else:
                 payload_sender = payload.get("u") if isinstance(payload.get("u"), dict) else {}
                 sender_mapping = await self._ensure_user_mapping(
@@ -1369,7 +1673,7 @@ class InboundTranslator:
             reply_id = reply_ids[index - 1] if index <= len(reply_ids) else "未知"
             lines.append(
                 f"  {index}. reply_id={reply_id} | "
-                f"{self._format_context_message_line(context)}"
+                f"{self._truncate_log_text(self._format_context_message_line(context))}"
             )
         return "\n".join(lines)
 
@@ -1407,8 +1711,21 @@ class InboundTranslator:
         lines: list[str] = []
         for index, context in enumerate(quote_contexts, start=1):
             depth = int(context.get("depth") or index)
-            lines.append(f"  {index}. 第{depth}层：{self._format_context_message_line(context)}")
+            lines.append(
+                f"  {index}. 第{depth}层："
+                f"{self._truncate_log_text(self._format_context_message_line(context))}"
+            )
         return lines
+
+    def _truncate_log_text(self, value: str, limit: int = 512) -> str:
+        text = str(value or "")
+        if (
+            bool(getattr(self._rocketchat.config, "debug", False))
+            or bool(getattr(self._rocketchat.config, "perf_trace_enabled", False))
+            or len(text) <= limit
+        ):
+            return text
+        return f"{text[:limit]}…[truncated {len(text) - limit} chars]"
 
     def _format_quote_context_lines(self, quote_contexts: list[dict[str, Any]]) -> str:
         lines: list[str] = []

@@ -61,7 +61,7 @@ const state = {
   logs: {
     items: [],
     lastId: 0,
-    maxEntries: 5000,
+    maxEntries: 2000,
     pollTimer: null,
     abortController: null,
     polling: false,
@@ -232,10 +232,20 @@ const elements = {
   settingsWebuiPasswordInput: document.getElementById('settingsWebuiPasswordInput'),
   settingsWebuiPortInput: document.getElementById('settingsWebuiPortInput'),
   settingsMessageIndexMaxEntriesInput: document.getElementById('settingsMessageIndexMaxEntriesInput'),
+  settingsPerformanceProfileInput: document.getElementById('settingsPerformanceProfileInput'),
+  settingsInboundWorkerCountInput: document.getElementById('settingsInboundWorkerCountInput'),
+  settingsOnebotQueueMaxInput: document.getElementById('settingsOnebotQueueMaxInput'),
+  settingsIdentityCacheMaxInput: document.getElementById('settingsIdentityCacheMaxInput'),
+  settingsMediaCacheMaxBytesInput: document.getElementById('settingsMediaCacheMaxBytesInput'),
+  settingsMediaCacheMaxAgeInput: document.getElementById('settingsMediaCacheMaxAgeInput'),
+  settingsLogFileMaxBytesInput: document.getElementById('settingsLogFileMaxBytesInput'),
+  settingsLogFileBackupCountInput: document.getElementById('settingsLogFileBackupCountInput'),
+  settingsTerminalMaxSessionsInput: document.getElementById('settingsTerminalMaxSessionsInput'),
+  settingsTerminalIdleTimeoutInput: document.getElementById('settingsTerminalIdleTimeoutInput'),
   settingsPasswordSaveButton: document.getElementById('settingsPasswordSaveButton'),
   settingsPortSaveButton: document.getElementById('settingsPortSaveButton'),
-  settingsMessageIndexSaveButton: document.getElementById('settingsMessageIndexSaveButton'),
   settingsMessageIndexRebuildButton: document.getElementById('settingsMessageIndexRebuildButton'),
+  settingsPerformanceSaveButton: document.getElementById('settingsPerformanceSaveButton'),
   settingsExportConfigButton: document.getElementById('settingsExportConfigButton'),
   settingsImportConfigButton: document.getElementById('settingsImportConfigButton'),
   settingsImportFileInput: document.getElementById('settingsImportFileInput'),
@@ -926,6 +936,7 @@ function renderDiagnostics(payload) {
   const diagnostics = payload || {};
   const host = diagnostics.host || null;
   const hostCache = diagnostics.host_cache || null;
+  const resourceBuffers = diagnostics.resource_buffers || {};
   const summary = diagnostics.summary || {};
   const items = Array.isArray(diagnostics.items) ? diagnostics.items : [];
   state.diagnostics.data = diagnostics;
@@ -937,9 +948,12 @@ function renderDiagnostics(payload) {
   elements.diagnosticsHostNote.textContent = host
     ? `${host.system_label || '-'} · Python ${host.python_version || '-'} · 主机 ${host.hostname || '-'}`
     : (diagnostics.host_error || '当前无法获取主机诊断快照。');
-  elements.diagnosticsCacheNote.textContent = host
+  const logBuffer = resourceBuffers.logs || {};
+  const terminalBuffer = resourceBuffers.terminals || {};
+  const resourceSuffix = ` · 日志 ${formatDiagnosticBytes(logBuffer.bytes)} / ${formatDiagnosticBytes(logBuffer.max_bytes)} · 终端 ${terminalBuffer.active_sessions ?? 0}/${terminalBuffer.max_sessions ?? 0}`;
+  elements.diagnosticsCacheNote.textContent = (host
     ? `采样状态: ${getDiagnosticsCacheStatusLabel(hostCache)} · 快照年龄 ${formatDiagnosticDuration(hostCache?.snapshot_age_seconds)} · TTL ${formatDiagnosticDuration(hostCache?.cache_ttl_seconds)}`
-    : `采样状态: ${getDiagnosticsCacheStatusLabel(hostCache)} · TTL ${formatDiagnosticDuration(hostCache?.cache_ttl_seconds)}`;
+    : `采样状态: ${getDiagnosticsCacheStatusLabel(hostCache)} · TTL ${formatDiagnosticDuration(hostCache?.cache_ttl_seconds)}`) + resourceSuffix;
 
   const cpuPercent = clampDiagnosticPercent(host?.cpu_usage_percent);
   const cpuProcessPercent = Math.min(cpuPercent, clampDiagnosticPercent(host?.process_cpu_usage_percent));
@@ -1027,6 +1041,30 @@ function renderDiagnostics(payload) {
         <div class="diagnostics-row">
           <span>重连失败</span>
           <strong>${escapeHtml(String(item.reconnect_failures ?? 0))}</strong>
+        </div>
+        <div class="diagnostics-row">
+          <span>入站队列</span>
+          <strong>${escapeHtml(`${item.inbound_queue_depth ?? 0} / ${item.inbound_queue_capacity ?? 0} · ${item.inbound_worker_count ?? 0} workers`)}</strong>
+        </div>
+        <div class="diagnostics-row">
+          <span>OneBot 出站队列</span>
+          <strong>${escapeHtml(`${item.outgoing_queue_depth ?? 0} / ${item.outgoing_queue_max_entries ?? 0}`)}</strong>
+        </div>
+        <div class="diagnostics-row">
+          <span>用户 / 房间缓存</span>
+          <strong>${escapeHtml(`${item.user_cache_entries ?? 0}/${item.user_cache_capacity ?? 0} · ${item.room_cache_entries ?? 0}/${item.room_cache_capacity ?? 0}`)}</strong>
+        </div>
+        <div class="diagnostics-row">
+          <span>身份缓存</span>
+          <strong>${escapeHtml(`${item.identity_cache?.by_user_entries ?? 0}/${item.identity_cache?.max_entries ?? 0} · hit ${item.identity_cache?.hits ?? 0} / miss ${item.identity_cache?.misses ?? 0}`)}</strong>
+        </div>
+        <div class="diagnostics-row">
+          <span>媒体缓存</span>
+          <strong>${escapeHtml(`${item.media_cache?.file_count ?? 0} 个 · ${formatDiagnosticBytes(item.media_cache?.total_bytes)}`)}</strong>
+        </div>
+        <div class="diagnostics-row">
+          <span>Runtime 重载</span>
+          <strong>${escapeHtml(String(item.runtime_restart_count ?? 0))}</strong>
         </div>
         <div class="diagnostics-row">
           <span>最近 WebSocket</span>
@@ -1166,6 +1204,90 @@ function renderSettings(payload) {
   if (elements.settingsMessageIndexMaxEntriesInput) {
     elements.settingsMessageIndexMaxEntriesInput.value = String(settings.message_index_max_entries || 1000);
   }
+  const performanceFields = [
+    ['settingsPerformanceProfileInput', settings.performance_profile || 'balanced'],
+    ['settingsInboundWorkerCountInput', settings.inbound_worker_count ?? 0],
+    ['settingsOnebotQueueMaxInput', settings.onebot_outgoing_queue_max_entries ?? 512],
+    ['settingsIdentityCacheMaxInput', settings.identity_cache_max_entries ?? 4096],
+    ['settingsMediaCacheMaxBytesInput', settings.media_cache_max_bytes ?? 1073741824],
+    ['settingsMediaCacheMaxAgeInput', settings.media_cache_max_age_hours ?? 168],
+    ['settingsLogFileMaxBytesInput', settings.log_file_max_bytes ?? 10485760],
+    ['settingsLogFileBackupCountInput', settings.log_file_backup_count ?? 3],
+    ['settingsTerminalMaxSessionsInput', settings.terminal_max_sessions ?? 6],
+    ['settingsTerminalIdleTimeoutInput', settings.terminal_idle_timeout_seconds ?? 0],
+  ];
+  for (const [fieldName, value] of performanceFields) {
+    if (elements[fieldName]) {
+      elements[fieldName].value = String(value);
+    }
+  }
+}
+
+function relocateMessageIndexSettingsSection() {
+  const messageIndexInput = elements.settingsMessageIndexMaxEntriesInput;
+  const messageIndexHint = elements.settingsMessageIndexHint;
+  const rebuildButton = elements.settingsMessageIndexRebuildButton;
+  const performanceSaveButton = elements.settingsPerformanceSaveButton;
+  if (!messageIndexInput || !messageIndexHint || !rebuildButton || !performanceSaveButton) {
+    return;
+  }
+
+  const legacySection = messageIndexInput.closest('.form-section');
+  const advancedSection = performanceSaveButton.closest('.form-section');
+  if (!legacySection || !advancedSection || legacySection === advancedSection) {
+    return;
+  }
+
+  if (legacySection.parentElement === advancedSection) {
+    return;
+  }
+
+  const advancedActions = performanceSaveButton.parentElement;
+  const messageIndexField = messageIndexInput.closest('.field-block');
+  const legacySaveButton = document.getElementById('settingsMessageIndexSaveButton');
+  const terminalIdleLabel = elements.settingsTerminalIdleTimeoutInput
+    ?.closest('.field-block')
+    ?.querySelector('span');
+  if (!advancedActions || !messageIndexField) {
+    return;
+  }
+
+  if (messageIndexField.parentElement !== advancedSection) {
+    advancedSection.insertBefore(messageIndexField, messageIndexHint);
+  }
+
+  if (messageIndexHint.parentElement !== advancedSection) {
+    advancedSection.insertBefore(messageIndexHint, advancedActions);
+  }
+
+  advancedSection.insertBefore(messageIndexField, messageIndexHint);
+
+  let terminalIdleHint = advancedSection.querySelector('#settingsTerminalIdleHint');
+  if (!terminalIdleHint) {
+    terminalIdleHint = document.createElement('p');
+    terminalIdleHint.id = 'settingsTerminalIdleHint';
+    terminalIdleHint.className = 'settings-helper settings-helper-compact';
+  }
+  terminalIdleHint.textContent = '“终端空闲关闭”只作用于 WebUI 的系统终端会话，不会关闭 RocketCatShell 进程；仅在终端没有任何连接时才会自动回收。设置为 0 等于不限制时间。';
+  advancedSection.insertBefore(terminalIdleHint, advancedActions);
+
+  if (rebuildButton.parentElement !== advancedActions) {
+    advancedActions.classList.add('settings-actions-spacious');
+    advancedActions.insertBefore(rebuildButton, performanceSaveButton);
+  }
+
+  if (terminalIdleLabel) {
+    terminalIdleLabel.textContent = '终端空闲关闭（秒，0=不限制）';
+  }
+  elements.settingsTerminalIdleTimeoutInput?.setAttribute('min', '0');
+  elements.settingsTerminalIdleTimeoutInput?.setAttribute('step', '60');
+  elements.settingsTerminalIdleTimeoutInput?.setAttribute(
+    'placeholder',
+    '0 等于不限制时间，仅影响 WebUI 终端会话',
+  );
+
+  legacySaveButton?.remove();
+  legacySection.remove();
 }
 
 function isLogConsoleNearBottom() {
@@ -3533,24 +3655,34 @@ async function savePortSettings() {
   showToast('WebUI 访问端口已写入配置；重启后会优先尝试新端口', 'success');
 }
 
-async function saveMessageIndexSettings() {
-  const rawValue = String(elements.settingsMessageIndexMaxEntriesInput?.value || '').trim();
-  if (!rawValue) {
-    throw new Error('请输入最大消息映射窗口条数');
-  }
-
-  const maxEntries = Number(rawValue);
-  if (!Number.isInteger(maxEntries) || maxEntries <= 0) {
-    throw new Error('最大消息映射窗口条数必须是正整数');
-  }
-
-  const payload = await requestJson('/api/settings', {
+async function savePerformanceSettings() {
+  const readInteger = (element, label) => {
+    const value = Number(String(element?.value || '').trim());
+    if (!Number.isInteger(value)) {
+      throw new Error(`${label} 必须是整数`);
+    }
+    return value;
+  };
+  const payload = {
+    performance_profile: String(elements.settingsPerformanceProfileInput?.value || 'balanced'),
+    message_index_max_entries: readInteger(elements.settingsMessageIndexMaxEntriesInput, 'message mapping window size'),
+    inbound_worker_count: readInteger(elements.settingsInboundWorkerCountInput, '入站 Worker 数量'),
+    onebot_outgoing_queue_max_entries: readInteger(elements.settingsOnebotQueueMaxInput, 'OneBot 队列上限'),
+    identity_cache_max_entries: readInteger(elements.settingsIdentityCacheMaxInput, '身份缓存上限'),
+    media_cache_max_bytes: readInteger(elements.settingsMediaCacheMaxBytesInput, '媒体缓存上限'),
+    media_cache_max_age_hours: readInteger(elements.settingsMediaCacheMaxAgeInput, '媒体缓存保留时间'),
+    log_file_max_bytes: readInteger(elements.settingsLogFileMaxBytesInput, '日志文件上限'),
+    log_file_backup_count: readInteger(elements.settingsLogFileBackupCountInput, '日志备份数量'),
+    terminal_max_sessions: readInteger(elements.settingsTerminalMaxSessionsInput, '终端会话上限'),
+    terminal_idle_timeout_seconds: readInteger(elements.settingsTerminalIdleTimeoutInput, '终端空闲关闭时间'),
+  };
+  const settings = await requestJson('/api/settings', {
     method: 'PUT',
-    body: JSON.stringify({ message_index_max_entries: maxEntries }),
+    body: JSON.stringify(payload),
   });
   state.settings.loaded = true;
-  renderSettings(payload);
-  showToast('消息映射窗口条数上限已保存，现有映射窗口已按新规则整理', 'success');
+  renderSettings(settings);
+  showToast('性能与资源设置已保存', 'success');
 }
 
 function summarizeMessageIndexResult(result) {
@@ -4151,18 +4283,18 @@ elements.settingsPortSaveButton?.addEventListener('click', async () => {
     showToast(error.message || '设置保存失败', 'error');
   }
 });
-elements.settingsMessageIndexSaveButton?.addEventListener('click', async () => {
-  try {
-    await saveMessageIndexSettings();
-  } catch (error) {
-    showToast(error.message || '设置保存失败', 'error');
-  }
-});
 elements.settingsMessageIndexRebuildButton?.addEventListener('click', async () => {
   try {
     await rebuildMessageIndexes();
   } catch (error) {
     showToast(error.message || '手动整理消息映射窗口失败', 'error');
+  }
+});
+elements.settingsPerformanceSaveButton?.addEventListener('click', async () => {
+  try {
+    await savePerformanceSettings();
+  } catch (error) {
+    showToast(error.message || '性能与资源设置保存失败', 'error');
   }
 });
 elements.settingsExportConfigButton?.addEventListener('click', async () => {
@@ -4438,6 +4570,7 @@ window.addEventListener('resize', () => {
   }
 });
 
+relocateMessageIndexSettingsSection();
 setupSidebarToggleButtons();
 
 Promise.all([

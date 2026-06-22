@@ -5,6 +5,7 @@ import hashlib
 import os
 import re
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
@@ -34,7 +35,6 @@ FailureCallback = Callable[[str, int, str], Awaitable[None]]
 
 class RocketChatClient:
     _INBOUND_SIGNATURE_IGNORED_KEYS = {"_updatedAt", "reactions"}
-    _INBOUND_WORKER_COUNT = 2
     _INBOUND_QUEUE_MAX_SIZE = 512
     _SERVER_BRANDING_CACHE_TTL_SECONDS = 300.0
     _WEBSOCKET_HEARTBEAT_SECONDS = 30.0
@@ -80,11 +80,23 @@ class RocketChatClient:
         self._inbound_queues: list[asyncio.Queue[dict[str, Any]]] = []
         self._inbound_workers: set[asyncio.Task[Any]] = set()
         self._subscribed_rooms: set[str] = set()
-        self._room_info_cache: dict[str, dict[str, Any]] = {}
+        self._cache_max_entries = max(
+            64,
+            int(getattr(config, "identity_cache_max_entries", 4096) or 4096),
+        )
+        configured_worker_count = max(
+            0,
+            min(8, int(getattr(config, "inbound_worker_count", 0) or 0)),
+        )
+        self._inbound_worker_count = configured_worker_count or (
+            2 if (os.cpu_count() or 2) <= 4 else 4
+        )
+        self._room_cache_max_entries = max(128, min(4096, self._cache_max_entries))
+        self._room_info_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._room_info_cache_expires_at: dict[str, float] = {}
         self._room_type_cache: dict[str, str] = {}
         self._room_name_cache: dict[str, str] = {}
-        self._user_cache: dict[str, dict[str, Any]] = {}
+        self._user_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._server_branding_cache: dict[str, str] | None = None
         self._server_branding_cache_expires_at = 0.0
         self._seen_inbound_message_signatures: dict[str, str] = {}
@@ -108,6 +120,13 @@ class RocketChatClient:
             self,
             temp_dir=media_temp_dir,
             media_publication_service=media_publication_service,
+            cache_max_bytes=int(
+                getattr(config, "media_cache_max_bytes", 1024 * 1024 * 1024)
+                or 1024 * 1024 * 1024
+            ),
+            cache_max_age_hours=int(
+                getattr(config, "media_cache_max_age_hours", 168) or 168
+            ),
         )
         self._consecutive_reconnect_failures = 0
         self._last_rest_login_at = 0.0
@@ -186,6 +205,11 @@ class RocketChatClient:
         self._server_branding_cache = None
         self._server_branding_cache_expires_at = 0.0
         self._clear_self_message_waiters()
+        self._room_info_cache.clear()
+        self._room_info_cache_expires_at.clear()
+        self._room_type_cache.clear()
+        self._room_name_cache.clear()
+        self._user_cache.clear()
         self._consecutive_reconnect_failures = 0
         self.bot_profile = {}
 
@@ -260,6 +284,18 @@ class RocketChatClient:
             "method_transport": self._method_transport,
             "method_rest_fallbacks": self._method_rest_fallbacks,
             "local_media_base_url": self.media.local_media_base_url,
+            "inbound_worker_count": self._inbound_worker_count,
+            "inbound_queue_depth": sum(
+                queue_obj.qsize() for queue_obj in self._inbound_queues
+            ),
+            "inbound_queue_capacity": (
+                len(self._inbound_queues) * self._INBOUND_QUEUE_MAX_SIZE
+            ),
+            "user_cache_entries": len(self._user_cache),
+            "user_cache_capacity": self._cache_max_entries,
+            "room_cache_entries": len(self._room_info_cache),
+            "room_cache_capacity": self._room_cache_max_entries,
+            "media_cache": self.media.cache_summary(),
         }
 
     def _mark_websocket_activity(self) -> None:
@@ -442,9 +478,9 @@ class RocketChatClient:
             return
         self._inbound_queues = [
             asyncio.Queue(maxsize=self._INBOUND_QUEUE_MAX_SIZE)
-            for _ in range(self._INBOUND_WORKER_COUNT)
+            for _ in range(self._inbound_worker_count)
         ]
-        for index in range(self._INBOUND_WORKER_COUNT):
+        for index in range(self._inbound_worker_count):
             task = asyncio.create_task(
                 self._inbound_worker_loop(self._inbound_queues[index]),
                 name=f"RocketChatInboundWorker:{index + 1}",
@@ -584,7 +620,7 @@ class RocketChatClient:
         if self.user_id:
             self.bot_profile.setdefault("_id", self.user_id)
             self.bot_profile.setdefault("username", self.bot_username)
-            self._user_cache[str(self.user_id)] = dict(self.bot_profile)
+            self._cache_user(str(self.user_id), self.bot_profile)
         logger.info(
             f"[RocketChatOneBotBridge] Rocket.Chat 登录成功 | userId={self.user_id} | username={self.bot_username}"
         )
@@ -628,7 +664,10 @@ class RocketChatClient:
         if expires_at is not None and time.monotonic() >= expires_at:
             self._room_info_cache.pop(room_id, None)
             self._room_info_cache_expires_at.pop(room_id, None)
+            self._room_type_cache.pop(room_id, None)
+            self._room_name_cache.pop(room_id, None)
             return None
+        self._room_info_cache.move_to_end(room_id)
         return cached_room
 
     async def get_room_type(self, room_id: str) -> str:
@@ -637,7 +676,9 @@ class RocketChatClient:
 
     async def get_user_info(self, user_id: str, refresh: bool = False) -> dict[str, Any]:
         if not refresh and user_id in self._user_cache:
-            return self._user_cache[user_id]
+            user = self._user_cache[user_id]
+            self._user_cache.move_to_end(user_id)
+            return user
         data = await self._request_json(
             "GET",
             f"{self.config.server_url}/api/v1/users.info?userId={user_id}",
@@ -645,7 +686,7 @@ class RocketChatClient:
         )
         user = data.get("user", {}) if data.get("success") else {}
         if user:
-            self._user_cache[user_id] = user
+            self._cache_user(user_id, user)
         return user
 
     async def get_current_user_info(self, refresh: bool = False) -> dict[str, Any]:
@@ -656,6 +697,7 @@ class RocketChatClient:
         if not refresh:
             cached = self._user_cache.get(current_user_id)
             if isinstance(cached, dict) and cached:
+                self._user_cache.move_to_end(current_user_id)
                 return dict(cached)
             if self.bot_profile:
                 return dict(self.bot_profile)
@@ -745,13 +787,14 @@ class RocketChatClient:
         for member in members:
             member_id = member.get("_id")
             if member_id:
-                self._user_cache[str(member_id)] = member
+                self._cache_user(str(member_id), member)
         return [member for member in members if isinstance(member, dict)]
 
     async def get_or_create_direct_room(self, user_source_id: str) -> str:
         existing = None
         if user_source_id in self._user_cache:
             existing = self._user_cache[user_source_id]
+            self._user_cache.move_to_end(user_source_id)
         if existing is None:
             existing = await self.get_user_info(user_source_id)
         username = existing.get("username") if isinstance(existing, dict) else None
@@ -1342,7 +1385,21 @@ class RocketChatClient:
                     "e2eKeyId": sub.get("e2eKeyId"),
                 }
             )
-        return [sub for sub in subscriptions if isinstance(sub, dict)]
+        normalized_subscriptions = [
+            sub for sub in subscriptions if isinstance(sub, dict)
+        ]
+        active_room_ids = {
+            str(sub.get("rid"))
+            for sub in normalized_subscriptions
+            if sub.get("rid")
+        }
+        for cached_room_id in tuple(self._room_info_cache):
+            if cached_room_id not in active_room_ids:
+                self._room_info_cache.pop(cached_room_id, None)
+                self._room_info_cache_expires_at.pop(cached_room_id, None)
+                self._room_type_cache.pop(cached_room_id, None)
+                self._room_name_cache.pop(cached_room_id, None)
+        return normalized_subscriptions
 
     def _cache_room_info(self, room: dict[str, Any]) -> None:
         room_id = room.get("_id")
@@ -1351,6 +1408,7 @@ class RocketChatClient:
         cached = dict(self._room_info_cache.get(str(room_id), {}))
         cached.update(room)
         self._room_info_cache[str(room_id)] = cached
+        self._room_info_cache.move_to_end(str(room_id))
         ttl_seconds = max(0.0, float(self.config.room_info_cache_ttl_seconds))
         if ttl_seconds > 0:
             self._room_info_cache_expires_at[str(room_id)] = time.monotonic() + ttl_seconds
@@ -1362,6 +1420,20 @@ class RocketChatClient:
         room_name = cached.get("name") or cached.get("fname")
         if room_name:
             self._room_name_cache[str(room_id)] = str(room_name)
+        while len(self._room_info_cache) > self._room_cache_max_entries:
+            expired_room_id, _ = self._room_info_cache.popitem(last=False)
+            self._room_info_cache_expires_at.pop(expired_room_id, None)
+            self._room_type_cache.pop(expired_room_id, None)
+            self._room_name_cache.pop(expired_room_id, None)
+
+    def _cache_user(self, user_id: str, user: dict[str, Any]) -> None:
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id:
+            return
+        self._user_cache[normalized_user_id] = dict(user)
+        self._user_cache.move_to_end(normalized_user_id)
+        while len(self._user_cache) > self._cache_max_entries:
+            self._user_cache.popitem(last=False)
 
     def _build_message_link(self, room_id: str, message_id: str) -> str:
         room_type = self._room_type_cache.get(room_id, "c")
@@ -1730,7 +1802,7 @@ class RocketChatClient:
         sender = raw_msg.get("u", {}) or {}
         sender_id = sender.get("_id")
         if sender_id:
-            self._user_cache[str(sender_id)] = dict(sender)
+            self._cache_user(str(sender_id), sender)
         if sender_id and str(sender_id) == self.user_id:
             self._remember_self_message(raw_msg)
         if self.config.skip_own_messages and sender_id and str(sender_id) == self.user_id:

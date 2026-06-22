@@ -17,6 +17,16 @@ DEFAULT_ROOM_INFO_CACHE_TTL_SECONDS = 300.0
 DEFAULT_PERF_TRACE_ENABLED = False
 DEFAULT_SKIP_OWN_MESSAGES = True
 DEFAULT_DEBUG = False
+DEFAULT_PERFORMANCE_PROFILE = "balanced"
+DEFAULT_INBOUND_WORKER_COUNT = 0
+DEFAULT_ONEBOT_OUTGOING_QUEUE_MAX_ENTRIES = 512
+DEFAULT_IDENTITY_CACHE_MAX_ENTRIES = 4096
+DEFAULT_MEDIA_CACHE_MAX_BYTES = 1024 * 1024 * 1024
+DEFAULT_MEDIA_CACHE_MAX_AGE_HOURS = 168
+DEFAULT_LOG_FILE_MAX_BYTES = 10 * 1024 * 1024
+DEFAULT_LOG_FILE_BACKUP_COUNT = 3
+DEFAULT_TERMINAL_MAX_SESSIONS = 6
+DEFAULT_TERMINAL_IDLE_TIMEOUT_SECONDS = 0
 
 
 def _coerce_bool(value: Any, default: bool = False) -> bool:
@@ -51,6 +61,11 @@ def _coerce_positive_int(value: Any, default: int, minimum: int = 1) -> int:
     return coerced if coerced >= int(minimum) else int(default)
 
 
+def _coerce_non_negative_int(value: Any, default: int) -> int:
+    coerced = _coerce_int(value, default)
+    return coerced if coerced >= 0 else int(default)
+
+
 def _coerce_float(value: Any, default: float) -> float:
     try:
         if value is None:
@@ -78,6 +93,16 @@ class ShellSettings:
     default_remote_media_max_size: int = DEFAULT_REMOTE_MEDIA_MAX_SIZE
     default_skip_own_messages: bool = DEFAULT_SKIP_OWN_MESSAGES
     default_debug: bool = DEFAULT_DEBUG
+    performance_profile: str = DEFAULT_PERFORMANCE_PROFILE
+    inbound_worker_count: int = DEFAULT_INBOUND_WORKER_COUNT
+    onebot_outgoing_queue_max_entries: int = DEFAULT_ONEBOT_OUTGOING_QUEUE_MAX_ENTRIES
+    identity_cache_max_entries: int = DEFAULT_IDENTITY_CACHE_MAX_ENTRIES
+    media_cache_max_bytes: int = DEFAULT_MEDIA_CACHE_MAX_BYTES
+    media_cache_max_age_hours: int = DEFAULT_MEDIA_CACHE_MAX_AGE_HOURS
+    log_file_max_bytes: int = DEFAULT_LOG_FILE_MAX_BYTES
+    log_file_backup_count: int = DEFAULT_LOG_FILE_BACKUP_COUNT
+    terminal_max_sessions: int = DEFAULT_TERMINAL_MAX_SESSIONS
+    terminal_idle_timeout_seconds: int = DEFAULT_TERMINAL_IDLE_TIMEOUT_SECONDS
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any] | None) -> "ShellSettings":
@@ -118,6 +143,61 @@ class ShellSettings:
                 DEFAULT_SKIP_OWN_MESSAGES,
             ),
             default_debug=_coerce_bool(data.get("default_debug", DEFAULT_DEBUG), DEFAULT_DEBUG),
+            performance_profile=str(
+                data.get("performance_profile", DEFAULT_PERFORMANCE_PROFILE)
+                or DEFAULT_PERFORMANCE_PROFILE
+            ).strip().lower(),
+            inbound_worker_count=max(
+                0,
+                min(
+                    8,
+                    _coerce_int(
+                        data.get("inbound_worker_count", DEFAULT_INBOUND_WORKER_COUNT),
+                        DEFAULT_INBOUND_WORKER_COUNT,
+                    ),
+                ),
+            ),
+            onebot_outgoing_queue_max_entries=_coerce_positive_int(
+                data.get(
+                    "onebot_outgoing_queue_max_entries",
+                    DEFAULT_ONEBOT_OUTGOING_QUEUE_MAX_ENTRIES,
+                ),
+                DEFAULT_ONEBOT_OUTGOING_QUEUE_MAX_ENTRIES,
+            ),
+            identity_cache_max_entries=_coerce_positive_int(
+                data.get("identity_cache_max_entries", DEFAULT_IDENTITY_CACHE_MAX_ENTRIES),
+                DEFAULT_IDENTITY_CACHE_MAX_ENTRIES,
+            ),
+            media_cache_max_bytes=_coerce_positive_int(
+                data.get("media_cache_max_bytes", DEFAULT_MEDIA_CACHE_MAX_BYTES),
+                DEFAULT_MEDIA_CACHE_MAX_BYTES,
+            ),
+            media_cache_max_age_hours=_coerce_positive_int(
+                data.get("media_cache_max_age_hours", DEFAULT_MEDIA_CACHE_MAX_AGE_HOURS),
+                DEFAULT_MEDIA_CACHE_MAX_AGE_HOURS,
+            ),
+            log_file_max_bytes=_coerce_positive_int(
+                data.get("log_file_max_bytes", DEFAULT_LOG_FILE_MAX_BYTES),
+                DEFAULT_LOG_FILE_MAX_BYTES,
+            ),
+            log_file_backup_count=max(
+                0,
+                _coerce_int(
+                    data.get("log_file_backup_count", DEFAULT_LOG_FILE_BACKUP_COUNT),
+                    DEFAULT_LOG_FILE_BACKUP_COUNT,
+                ),
+            ),
+            terminal_max_sessions=_coerce_positive_int(
+                data.get("terminal_max_sessions", DEFAULT_TERMINAL_MAX_SESSIONS),
+                DEFAULT_TERMINAL_MAX_SESSIONS,
+            ),
+            terminal_idle_timeout_seconds=_coerce_non_negative_int(
+                data.get(
+                    "terminal_idle_timeout_seconds",
+                    DEFAULT_TERMINAL_IDLE_TIMEOUT_SECONDS,
+                ),
+                DEFAULT_TERMINAL_IDLE_TIMEOUT_SECONDS,
+            ),
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -136,6 +216,16 @@ class ShellSettings:
             "default_remote_media_max_size": self.default_remote_media_max_size,
             "default_skip_own_messages": self.default_skip_own_messages,
             "default_debug": self.default_debug,
+            "performance_profile": self.performance_profile,
+            "inbound_worker_count": self.inbound_worker_count,
+            "onebot_outgoing_queue_max_entries": self.onebot_outgoing_queue_max_entries,
+            "identity_cache_max_entries": self.identity_cache_max_entries,
+            "media_cache_max_bytes": self.media_cache_max_bytes,
+            "media_cache_max_age_hours": self.media_cache_max_age_hours,
+            "log_file_max_bytes": self.log_file_max_bytes,
+            "log_file_backup_count": self.log_file_backup_count,
+            "terminal_max_sessions": self.terminal_max_sessions,
+            "terminal_idle_timeout_seconds": self.terminal_idle_timeout_seconds,
         }
 
 

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>RocketCat Shell</title>
     <link rel="stylesheet" href="/static/vendor/xterm/xterm.css?v=20260615diagicons1" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260615diagicons1" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260622settingsperf2" />
   </head>
   <body>
     <div class="shell-layout">
@@ -364,7 +364,7 @@
               <h1>猫猫日志</h1>
             </div>
             <div class="header-actions">
-              <span class="inline-note">仅捕获 Shell、桥接器与 Perf Trace 日志，最大缓存 5000 条，关闭 WebUI 自动清空。</span>
+              <span class="inline-note">仅捕获 Shell、桥接器与 Perf Trace 日志，最多 2000 条 / 4 MiB，关闭 WebUI 自动清空。</span>
             </div>
           </header>
 
@@ -463,27 +463,76 @@
                 </div>
               </section>
 
-              <section class="form-section">
-                <h3>消息映射窗口</h3>
+              <details class="form-section" open>
+                <summary><h3>性能与资源（高级设置）</h3></summary>
+                <p class="settings-helper">默认 balanced 适合大多数部署。网络 runtime 相关设置保存后仅增量重启受影响的 Bot；日志与终端边界在下次启动 Shell 后完整生效。</p>
                 <div class="field-grid two-columns">
-                  <label class="field-block span-two">
-                    <span>最大消息映射窗口条数</span>
-                    <input
-                      id="settingsMessageIndexMaxEntriesInput"
-                      name="message_index_max_entries"
-                      type="number"
-                      min="1"
-                      step="1"
-                      placeholder="请输入最大消息映射窗口条数"
-                    />
+                  <label class="field-block">
+                    <span>性能策略</span>
+                    <select id="settingsPerformanceProfileInput"><option value="balanced">balanced</option></select>
+                  </label>
+                  <label class="field-block">
+                    <span>入站 Worker（0=自动）</span>
+                    <input id="settingsInboundWorkerCountInput" type="number" min="0" max="8" step="1" />
+                  </label>
+                  <label class="field-block">
+                    <span>OneBot 出站队列上限</span>
+                    <input id="settingsOnebotQueueMaxInput" type="number" min="1" step="1" />
+                  </label>
+                  <label class="field-block">
+                    <span>身份缓存上限</span>
+                    <input id="settingsIdentityCacheMaxInput" type="number" min="128" step="1" />
+                  </label>
+                  <label class="field-block">
+                    <span>媒体缓存上限（字节）</span>
+                    <input id="settingsMediaCacheMaxBytesInput" type="number" min="1048576" step="1048576" />
+                  </label>
+                  <label class="field-block">
+                    <span>媒体缓存保留（小时）</span>
+                    <input id="settingsMediaCacheMaxAgeInput" type="number" min="1" step="1" />
+                  </label>
+                  <label class="field-block">
+                    <span>单个日志文件上限（字节）</span>
+                    <input id="settingsLogFileMaxBytesInput" type="number" min="1048576" step="1048576" />
+                  </label>
+                  <label class="field-block">
+                    <span>日志备份数量</span>
+                    <input id="settingsLogFileBackupCountInput" type="number" min="0" step="1" />
+                  </label>
+                  <label class="field-block">
+                    <span>终端会话上限</span>
+                    <input id="settingsTerminalMaxSessionsInput" type="number" min="1" max="64" step="1" />
+                  </label>
+                  <label class="field-block">
+                    <span>终端空闲关闭（秒）</span>
+                    <input id="settingsTerminalIdleTimeoutInput" type="number" min="0" step="60" />
                   </label>
                 </div>
-                <p id="settingsMessageIndexHint" class="settings-helper">当前最多保留 1000 条最近 message 映射。当最新 message 编号达到 3000002000 时，会自动把当前映射窗口 3000001001 ~ 3000002000 重新映射为 3000000001 ~ 3000001000。</p>
+                <section class="form-section">
+                  <h3>消息映射窗口</h3>
+                  <div class="field-grid two-columns">
+                    <label class="field-block span-two">
+                      <span>最大消息映射窗口条数</span>
+                      <input
+                        id="settingsMessageIndexMaxEntriesInput"
+                        name="message_index_max_entries"
+                        type="number"
+                        min="1"
+                        step="1"
+                        placeholder="请输入最大消息映射窗口条数"
+                      />
+                    </label>
+                  </div>
+                  <p id="settingsMessageIndexHint" class="settings-helper">当前最多保留 1000 条最近 message 映射。当最新 message 编号达到 3000002000 时，会自动把当前映射窗口 3000001001 ~ 3000002000 重新映射为 3000000001 ~ 3000001000。</p>
+                  <div class="settings-actions">
+                    <button id="settingsMessageIndexRebuildButton" class="action-button subtle" type="button">手动整理映射窗口</button>
+                    <button id="settingsMessageIndexSaveButton" class="action-button primary" type="button">保存窗口条数</button>
+                  </div>
+                </section>
                 <div class="settings-actions">
-                  <button id="settingsMessageIndexRebuildButton" class="action-button subtle" type="button">手动整理映射窗口</button>
-                  <button id="settingsMessageIndexSaveButton" class="action-button primary" type="button">保存窗口条数</button>
+                  <button id="settingsPerformanceSaveButton" class="action-button primary" type="button">保存性能与资源设置</button>
                 </div>
-              </section>
+              </details>
 
               <section class="form-section">
                 <h3>配置文件</h3>
@@ -1097,6 +1146,6 @@
 
     <script src="/static/vendor/xterm/xterm.js?v=20260615diagicons1"></script>
     <script src="/static/vendor/xterm/addon-fit.js?v=20260615diagicons1"></script>
-    <script src="/static/app.js?v=20260615diagicons1"></script>
+    <script src="/static/app.js?v=20260622settingsperf2"></script>
   </body>
 </html>

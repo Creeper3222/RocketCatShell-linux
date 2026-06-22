@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import mimetypes
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import unquote, urlparse
@@ -31,12 +33,21 @@ class RocketChatMediaBridge:
         client: Any,
         *,
         temp_dir: str | os.PathLike[str] | None = None,
+        cache_dir: str | os.PathLike[str] | None = None,
         media_publication_service: MediaPublicationService | None = None,
+        cache_max_bytes: int = 1024 * 1024 * 1024,
+        cache_max_age_hours: float = 168.0,
     ) -> None:
         self.client = client
         self._plain_upload_endpoint_preference: str | None = None
-        self._media_temp_dir = self._resolve_media_temp_dir(temp_dir)
+        self._media_temp_dir = self._resolve_media_temp_dir(temp_dir or cache_dir)
         self._media_publication_service = media_publication_service
+        self._cache_max_bytes = max(0, int(cache_max_bytes))
+        self._cache_max_age_seconds = max(0.0, float(cache_max_age_hours) * 3600.0)
+        self._cache_cleanup_task: asyncio.Task[None] | None = None
+        self._materialize_semaphore = asyncio.Semaphore(2)
+        self._cache_summary_cached_at = 0.0
+        self._cache_summary_cached: dict[str, int | float] | None = None
 
     def _resolve_media_temp_dir(
         self,
@@ -64,8 +75,21 @@ class RocketChatMediaBridge:
 
     async def start(self) -> None:
         self._media_temp_dir.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(self._cleanup_media_cache)
+        if self._cache_cleanup_task is None or self._cache_cleanup_task.done():
+            self._cache_cleanup_task = asyncio.create_task(
+                self._media_cache_cleanup_loop(),
+                name=f"RocketCatMediaCacheCleanup:{getattr(self.client.config, 'bot_id', 'default')}",
+            )
 
     async def stop(self) -> None:
+        if self._cache_cleanup_task is not None:
+            self._cache_cleanup_task.cancel()
+            try:
+                await self._cache_cleanup_task
+            except asyncio.CancelledError:
+                pass
+            self._cache_cleanup_task = None
         if self._media_publication_service is not None:
             self._media_publication_service.invalidate_bot(
                 str(getattr(self.client.config, "bot_id", "") or "")
@@ -101,6 +125,7 @@ class RocketChatMediaBridge:
             try:
                 with target.open("xb") as handle:
                     handle.write(raw)
+                self._invalidate_cache_summary()
             except FileExistsError:
                 pass
         return str(target)
@@ -135,11 +160,104 @@ class RocketChatMediaBridge:
             limit = self._remote_media_size_limit()
             if limit and os.path.getsize(candidate) > limit:
                 return None
+            resolved = Path(candidate).resolve(strict=True)
+            try:
+                if resolved.is_relative_to(self._media_temp_dir):
+                    return str(resolved)
+            except ValueError:
+                pass
             raw = Path(candidate).read_bytes()
         except OSError:
             return None
         suffix = self._safe_media_suffix(candidate)
         return self._write_cached_media_file(raw, suffix)
+
+    async def _media_cache_cleanup_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(1800.0)
+                await asyncio.to_thread(self._cleanup_media_cache)
+        except asyncio.CancelledError:
+            raise
+
+    def _cleanup_media_cache(self) -> None:
+        self._invalidate_cache_summary()
+        if not self._media_temp_dir.exists():
+            return
+        protected = (
+            self._media_publication_service.active_file_paths()
+            if self._media_publication_service is not None
+            else set()
+        )
+        now = time.time()
+        entries: list[tuple[float, int, Path]] = []
+        total_size = 0
+        try:
+            candidates = list(self._media_temp_dir.iterdir())
+        except OSError:
+            return
+        for path in candidates:
+            try:
+                if not path.is_file():
+                    continue
+                stat_result = path.stat()
+            except OSError:
+                continue
+            if path in protected:
+                total_size += stat_result.st_size
+                continue
+            age = max(0.0, now - stat_result.st_mtime)
+            if self._cache_max_age_seconds and age > self._cache_max_age_seconds:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                continue
+            entries.append((stat_result.st_mtime, stat_result.st_size, path))
+            total_size += stat_result.st_size
+        if not self._cache_max_bytes or total_size <= self._cache_max_bytes:
+            return
+        for _mtime, size, path in sorted(entries):
+            if total_size <= self._cache_max_bytes:
+                break
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            total_size -= size
+        self._invalidate_cache_summary()
+
+    def cache_summary(self) -> dict[str, int | float]:
+        now = time.monotonic()
+        if (
+            self._cache_summary_cached is not None
+            and now - self._cache_summary_cached_at < 5.0
+        ):
+            return dict(self._cache_summary_cached)
+        file_count = 0
+        total_bytes = 0
+        try:
+            for path in self._media_temp_dir.iterdir():
+                if not path.is_file():
+                    continue
+                stat_result = path.stat()
+                file_count += 1
+                total_bytes += stat_result.st_size
+        except OSError:
+            pass
+        summary = {
+            "file_count": file_count,
+            "total_bytes": total_bytes,
+            "max_bytes": self._cache_max_bytes,
+            "max_age_hours": self._cache_max_age_seconds / 3600.0,
+        }
+        self._cache_summary_cached = dict(summary)
+        self._cache_summary_cached_at = now
+        return summary
+
+    def _invalidate_cache_summary(self) -> None:
+        self._cache_summary_cached_at = 0.0
+        self._cache_summary_cached = None
 
     def publish_local_media_file(
         self,
@@ -518,6 +636,7 @@ class RocketChatMediaBridge:
     ) -> list[dict[str, str]]:
         media: list[dict[str, str]] = []
         seen: set[tuple[str, str]] = set()
+        candidates: list[dict[str, Any]] = []
         media_shaped_keys = (
             "type",
             "mimeType",
@@ -535,9 +654,22 @@ class RocketChatMediaBridge:
             "link",
         )
 
-        async def append_candidate(candidate: dict[str, Any]) -> None:
+        def collect_candidate(candidate: dict[str, Any]) -> None:
+            candidates.append(candidate)
+
+        async def materialize_candidate(
+            candidate: dict[str, Any],
+        ) -> tuple[str, dict[str, Any], dict[str, str] | None]:
             kind = self.classify_file_kind(candidate)
-            materialized = await self._materialize_media_reference(candidate, kind)
+            async with self._materialize_semaphore:
+                materialized = await self._materialize_media_reference(candidate, kind)
+            return kind, candidate, materialized
+
+        def append_materialized(
+            kind: str,
+            candidate: dict[str, Any],
+            materialized: dict[str, str] | None,
+        ) -> None:
             if not materialized:
                 return
             file_ref = str(materialized.get("path") or materialized.get("url") or "")
@@ -556,22 +688,22 @@ class RocketChatMediaBridge:
                 }
             )
 
-        async def process_source(source: dict[str, Any]) -> None:
+        def process_source(source: dict[str, Any]) -> None:
             files_raw = source.get("files", [])
             if isinstance(files_raw, dict):
-                await append_candidate(files_raw)
+                collect_candidate(files_raw)
             elif isinstance(files_raw, list):
                 for item in files_raw:
                     if isinstance(item, dict):
-                        await append_candidate(item)
+                        collect_candidate(item)
 
             for key in ("file", "fileUpload"):
                 single_file = source.get(key)
                 if isinstance(single_file, dict):
-                    await append_candidate(single_file)
+                    collect_candidate(single_file)
 
             if self._has_media_shaped_value(source, media_shaped_keys):
-                await append_candidate(source)
+                collect_candidate(source)
 
         fast_candidates = self._can_fast_extract_attachment_descriptors(
             payload,
@@ -580,17 +712,23 @@ class RocketChatMediaBridge:
         )
         if fast_candidates is not None:
             for candidate in fast_candidates:
-                await append_candidate(candidate)
-            return media
+                collect_candidate(candidate)
+        else:
+            process_source(payload)
+            for attachment in self._iter_attachment_sources(
+                payload,
+                skip_quote_attachments=skip_quote_attachments,
+            ):
+                process_source(attachment)
 
-        await process_source(payload)
-        for attachment in self._iter_attachment_sources(
-            payload,
-            skip_quote_attachments=skip_quote_attachments,
-        ):
-            await process_source(attachment)
+        if candidates:
+            materialized_candidates = await asyncio.gather(
+                *[materialize_candidate(candidate) for candidate in candidates]
+            )
+            for kind, candidate, materialized in materialized_candidates:
+                append_materialized(kind, candidate, materialized)
 
-        if include_url_images:
+        if include_url_images and fast_candidates is None:
             for url_obj in payload.get("urls", []):
                 if not isinstance(url_obj, dict):
                     continue
@@ -799,6 +937,126 @@ class RocketChatMediaBridge:
     def _write_temp_media_file(self, raw: bytes, suffix: str) -> str:
         return self._write_cached_media_file(raw, suffix)
 
+    async def _download_decrypt_media_to_cache(
+        self,
+        file_obj: dict[str, Any],
+        media_url: str,
+        *,
+        default_suffix: str,
+    ) -> str | None:
+        if self.client._http_session is None:
+            return None
+        encryption = file_obj.get("encryption")
+        if not isinstance(encryption, dict):
+            return None
+        try:
+            decryptor = self.client.e2ee.create_uploaded_media_decryptor(
+                key_data=encryption["key"],
+                iv_b64=encryption["iv"],
+            )
+        except Exception as exc:
+            logger.warning(
+                "[RocketChatOneBotBridge][E2EE] 创建媒体解密器失败: %r",
+                exc,
+            )
+            return None
+
+        limit = self._remote_media_size_limit()
+        self._media_temp_dir.mkdir(parents=True, exist_ok=True)
+        temporary = tempfile.NamedTemporaryFile(
+            suffix=".decrypting",
+            delete=False,
+            dir=self._media_temp_dir,
+        )
+        temporary_path = Path(temporary.name)
+        digest = hashlib.sha256()
+        total_plaintext = 0
+        signature = bytearray()
+        try:
+            async with self.client._http_session.get(
+                media_url,
+                timeout=aiohttp.ClientTimeout(total=30, connect=10),
+                allow_redirects=True,
+                max_redirects=3,
+            ) as resp:
+                if resp.status >= 400:
+                    return None
+                content_length = resp.content_length
+                if limit and content_length is not None and content_length > limit:
+                    self._log_media_size_limit_error(
+                        "下载 E2EE 媒体失败",
+                        actual_size=content_length,
+                        limit=limit,
+                        source=media_url,
+                    )
+                    return None
+                async for chunk in resp.content.iter_chunked(64 * 1024):
+                    plaintext = decryptor.update(chunk)
+                    if not plaintext:
+                        continue
+                    total_plaintext += len(plaintext)
+                    if limit and total_plaintext > limit:
+                        self._log_media_size_limit_error(
+                            "解密 E2EE 媒体失败",
+                            actual_size=total_plaintext,
+                            limit=limit,
+                            source=media_url,
+                        )
+                        return None
+                    if len(signature) < 16:
+                        signature.extend(plaintext[: 16 - len(signature)])
+                    digest.update(plaintext)
+                    temporary.write(plaintext)
+                final_plaintext = decryptor.finalize()
+                if final_plaintext:
+                    total_plaintext += len(final_plaintext)
+                    if limit and total_plaintext > limit:
+                        return None
+                    if len(signature) < 16:
+                        signature.extend(final_plaintext[: 16 - len(signature)])
+                    digest.update(final_plaintext)
+                    temporary.write(final_plaintext)
+            temporary.flush()
+            temporary.close()
+
+            actual_hash = digest.hexdigest()
+            expected_hash = (
+                file_obj.get("hashes", {}).get("sha256")
+                if isinstance(file_obj.get("hashes"), dict)
+                else None
+            )
+            if expected_hash and actual_hash.lower() != str(expected_hash).lower():
+                logger.warning(
+                    "[RocketChatOneBotBridge][E2EE] 媒体哈希校验失败: expected=%s actual=%s",
+                    expected_hash,
+                    actual_hash,
+                )
+                return None
+
+            safe_suffix = self._safe_media_suffix(default_suffix)
+            safe_suffix = self._detect_media_suffix(bytes(signature), safe_suffix)
+            target = self._media_temp_dir / f"e2ee_{actual_hash}{safe_suffix}"
+            if target.exists():
+                temporary_path.unlink(missing_ok=True)
+            else:
+                try:
+                    temporary_path.replace(target)
+                except FileExistsError:
+                    temporary_path.unlink(missing_ok=True)
+            self._invalidate_cache_summary()
+            return str(target)
+        except Exception as exc:
+            logger.warning(
+                "[RocketChatOneBotBridge][E2EE] 流式下载解密媒体失败: %r",
+                exc,
+            )
+            return None
+        finally:
+            if not temporary.closed:
+                temporary.close()
+            if temporary_path.exists() and temporary_path.suffix == ".decrypting":
+                temporary_path.unlink(missing_ok=True)
+
     async def _materialize_media_reference(
         self,
         file_obj: dict[str, Any],
@@ -818,36 +1076,14 @@ class RocketChatMediaBridge:
         if not self._is_encrypted_media_attachment(file_obj):
             return {"name": str(name), "url": media_url}
 
-        raw = await self.download_remote_bytes(media_url)
-        if raw is None:
-            return None
-
-        try:
-            encryption = file_obj["encryption"]
-            decrypted = self.client.e2ee.decrypt_uploaded_media(
-                raw,
-                key_data=encryption["key"],
-                iv_b64=encryption["iv"],
-            )
-        except Exception as exc:
-            logger.warning(f"[RocketChatOneBotBridge][E2EE] 媒体解密失败: {exc!r}")
-            return None
-
-        expected_hash = (
-            file_obj.get("hashes", {}).get("sha256")
-            if isinstance(file_obj.get("hashes"), dict)
-            else None
-        )
-        if expected_hash:
-            actual_hash = hashlib.sha256(decrypted).hexdigest()
-            if actual_hash.lower() != str(expected_hash).lower():
-                logger.warning(
-                    f"[RocketChatOneBotBridge][E2EE] 媒体哈希校验失败: expected={expected_hash} actual={actual_hash}"
-                )
-                return None
-
         suffix = self._guess_media_suffix(file_obj, media_url, ".bin")
-        local_path = self._write_temp_media_file(decrypted, suffix)
+        local_path = await self._download_decrypt_media_to_cache(
+            file_obj,
+            media_url,
+            default_suffix=suffix,
+        )
+        if not local_path:
+            return None
         published_url = self.publish_local_media_file(
             local_path,
             name=str(name),
