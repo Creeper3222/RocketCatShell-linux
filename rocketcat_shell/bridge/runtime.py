@@ -586,18 +586,9 @@ class BridgeRuntime:
     async def reload_plugins(self) -> None:
         if self._plugin_manager is None or self._plugin_runtime_context is None:
             return
-        previous_plugins = list(self._runtime_plugins)
-        next_plugins = await self._plugin_manager.create_runtime_plugins(
-            self._plugin_runtime_context
-        )
-        self._runtime_plugins = next_plugins
-        if previous_plugins:
-            await self._plugin_manager.shutdown_runtime_plugins(
-                previous_plugins,
-                self._plugin_runtime_context,
-            )
+        await self._plugin_manager.reconcile_all(force=True)
         logger.info(
-            "[RocketCatShell][%s] 插件 binding 已增量重载，网络 runtime 保持连接。",
+            "[RocketCatShell][%s] 全局插件 binding 已原子重载，网络 runtime 保持连接。",
             self.instance_name,
         )
 

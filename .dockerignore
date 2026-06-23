@@ -10,3 +10,8 @@ data/temp
 data/user_identity
 data/plugin_data
 data/resource
+data/plugins/*
+!data/plugins/rocketcat_plugin_adapt_iamthinking/
+!data/plugins/rocketcat_plugin_adapt_iamthinking/**
+!data/plugins/rocketcat_plugin_built_in_command/
+!data/plugins/rocketcat_plugin_built_in_command/**

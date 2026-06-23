@@ -4,6 +4,7 @@ import asyncio
 import codecs
 import contextlib
 import io
+import inspect
 import json
 import logging
 import mimetypes
@@ -22,14 +23,21 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, quote
 
 import uvicorn
 from fastapi import Body, FastAPI, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi import File as FastAPIFile
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..__init__ import __version__
+from ..plugin_system import (
+    DashboardFileResponse,
+    DashboardRequest,
+    DashboardResponse,
+    DashboardUpload,
+)
 from ..bridge.user_identity import (
     UserIdentityConflictError,
     UserIdentityError,
@@ -54,6 +62,7 @@ _FILE_UPLOAD_CHUNK_BYTES = 1024 * 1024
 _FILE_UPLOAD_LIMIT_BYTES = 100 * 1024 * 1024
 _FILE_UPLOAD_MAX_FILES = 20
 _FILE_EDIT_LIMIT_BYTES = 1024 * 1024
+_PLUGIN_DASHBOARD_UPLOAD_LIMIT_BYTES = 20 * 1024 * 1024
 _TERMINAL_BUFFER_LIMIT_CHARS = 200_000
 _TERMINAL_DEFAULT_COLS = 80
 _TERMINAL_DEFAULT_ROWS = 24
@@ -347,6 +356,11 @@ class ShellWebUI:
             self._handle_published_media,
             methods=["GET"],
         )
+        self._app.add_api_route(
+            "/_rocketcat/plugin-dashboard/{plugin_id}/{page_name}/{token}/{asset_path:path}",
+            self._handle_plugin_dashboard_asset,
+            methods=["GET"],
+        )
         self._app.add_api_route("/", self._handle_index, methods=["GET"])
         self._app.add_api_route("/api/status", self._handle_status, methods=["GET"])
         self._app.add_api_route("/api/diagnostics", self._handle_diagnostics, methods=["GET"])
@@ -445,6 +459,26 @@ class ShellWebUI:
         self._app.add_api_route(
             "/api/plugins/{plugin_id}/logo",
             self._handle_plugin_logo,
+            methods=["GET"],
+        )
+        self._app.add_api_route(
+            "/api/plugins/{plugin_id}/dashboard/session",
+            self._handle_create_plugin_dashboard_session,
+            methods=["POST"],
+        )
+        self._app.add_api_route(
+            "/api/plugins/{plugin_id}/dashboard/session/{token}",
+            self._handle_revoke_plugin_dashboard_session,
+            methods=["DELETE"],
+        )
+        self._app.add_api_route(
+            "/api/plugins/{plugin_id}/dashboard/api/{api_path:path}",
+            self._handle_plugin_dashboard_api,
+            methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+        )
+        self._app.add_api_route(
+            "/api/plugins/{plugin_id}/dashboard/sse/{api_path:path}",
+            self._handle_plugin_dashboard_sse,
             methods=["GET"],
         )
         self._app.add_api_route(
@@ -2281,6 +2315,339 @@ class ShellWebUI:
         if logo_path is None or not logo_path.exists():
             raise HTTPException(status_code=404, detail="插件 Logo 不存在")
         return FileResponse(logo_path)
+
+    async def _handle_create_plugin_dashboard_session(
+        self,
+        plugin_id: str,
+        payload: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, Any]:
+        payload = payload or {}
+        try:
+            session = await self.manager.plugin_manager.issue_dashboard_session(
+                plugin_id,
+                str(payload.get("page") or "").strip() or None,
+            )
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail="找不到目标插件或 Dashboard 页面",
+            ) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "plugin_id": session.plugin_id,
+            "page": session.page_name,
+            "token": session.token,
+            "url": (
+                "/_rocketcat/plugin-dashboard/"
+                f"{quote(session.plugin_id, safe='')}/"
+                f"{quote(session.page_name, safe='')}/"
+                f"{quote(session.token, safe='')}/index.html"
+            ),
+        }
+
+    async def _handle_revoke_plugin_dashboard_session(
+        self,
+        plugin_id: str,
+        token: str,
+    ) -> dict[str, bool]:
+        del plugin_id
+        await self.manager.plugin_manager.revoke_dashboard_session(token)
+        return {"ok": True}
+
+    async def _handle_plugin_dashboard_asset(
+        self,
+        plugin_id: str,
+        page_name: str,
+        token: str,
+        asset_path: str,
+    ) -> Response:
+        requested_asset = str(asset_path or "index.html").strip() or "index.html"
+        validation_asset = (
+            "index.html"
+            if requested_asset == "__rocketcat_bridge__.js"
+            else requested_asset
+        )
+        try:
+            _descriptor, _page, resolved_path = (
+                await self.manager.plugin_manager.resolve_dashboard_asset(
+                    plugin_id,
+                    page_name,
+                    token,
+                    validation_asset,
+                )
+            )
+        except (KeyError, FileNotFoundError, ValueError):
+            raise HTTPException(status_code=404, detail="Dashboard 资源不存在")
+
+        security_headers = {
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+            "Content-Security-Policy": (
+                "default-src 'none'; "
+                "script-src 'self' 'unsafe-inline'; "
+                "style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data: blob:; "
+                "font-src 'self' data:; "
+                "connect-src 'none'; "
+                "media-src 'self' data: blob:; "
+                "frame-ancestors 'self'; "
+                "form-action 'none'; base-uri 'none'"
+            ),
+        }
+        if requested_asset == "__rocketcat_bridge__.js":
+            bridge_path = self._static_dir / "plugin_dashboard_bridge.js"
+            if not bridge_path.is_file():
+                raise HTTPException(status_code=404, detail="Dashboard Bridge 不存在")
+            return FileResponse(
+                bridge_path,
+                media_type="application/javascript",
+                headers=security_headers,
+            )
+
+        if resolved_path.suffix.lower() == ".html":
+            try:
+                html = await asyncio.to_thread(resolved_path.read_text, "utf-8")
+            except (OSError, UnicodeError) as exc:
+                raise HTTPException(status_code=404, detail="Dashboard 页面无法读取") from exc
+            bridge_tag = '<script src="./__rocketcat_bridge__.js"></script>'
+            if "__rocketcat_bridge__.js" not in html:
+                if "</head>" in html:
+                    html = html.replace("</head>", f"{bridge_tag}\n</head>", 1)
+                else:
+                    html = f"{bridge_tag}\n{html}"
+            return Response(
+                content=html,
+                media_type="text/html",
+                headers=security_headers,
+            )
+
+        media_type = mimetypes.guess_type(resolved_path.name)[0] or "application/octet-stream"
+        return FileResponse(
+            resolved_path,
+            media_type=media_type,
+            headers=security_headers,
+        )
+
+    async def _handle_plugin_dashboard_api(
+        self,
+        plugin_id: str,
+        api_path: str,
+        request: Request,
+    ) -> Response:
+        try:
+            state, route, path_params = (
+                await self.manager.plugin_manager.resolve_dashboard_api(
+                    plugin_id,
+                    api_path,
+                    request.method,
+                )
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=409, detail="插件未启用或没有运行实例") from exc
+        except (LookupError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail="Dashboard API 不存在") from exc
+
+        dashboard_request = await self._build_plugin_dashboard_request(
+            request,
+            api_path,
+            path_params,
+        )
+        try:
+            result = route.handler(dashboard_request)
+            if inspect.isawaitable(result):
+                result = await result
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "[RocketCatShell] 插件 Dashboard API 执行失败 | plugin=%s | path=%s",
+                plugin_id,
+                api_path,
+            )
+            raise HTTPException(status_code=500, detail="插件 Dashboard API 执行失败") from exc
+        return self._build_plugin_dashboard_response(plugin_id, result)
+
+    async def _handle_plugin_dashboard_sse(
+        self,
+        plugin_id: str,
+        api_path: str,
+        request: Request,
+    ) -> StreamingResponse:
+        try:
+            _state, route, path_params = (
+                await self.manager.plugin_manager.resolve_dashboard_sse(
+                    plugin_id,
+                    api_path,
+                )
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=409, detail="插件未启用或没有运行实例") from exc
+        except (LookupError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail="Dashboard SSE 不存在") from exc
+
+        dashboard_request = await self._build_plugin_dashboard_request(
+            request,
+            api_path,
+            path_params,
+        )
+        try:
+            events = route.handler(dashboard_request)
+            if inspect.isawaitable(events):
+                events = await events
+            if not hasattr(events, "__aiter__"):
+                raise TypeError("Dashboard SSE handler 必须返回异步迭代器")
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail="Dashboard SSE 初始化失败") from exc
+
+        async def stream_events():
+            current_task = asyncio.current_task()
+            if current_task is None:
+                return
+            await self.manager.plugin_manager.register_dashboard_sse_task(
+                plugin_id,
+                current_task,
+            )
+            try:
+                async for item in events:
+                    if isinstance(item, bytes):
+                        payload = item.decode("utf-8", errors="replace")
+                    elif isinstance(item, str):
+                        payload = item
+                    else:
+                        payload = json.dumps(item, ensure_ascii=False, default=str)
+                    for line in payload.splitlines() or [""]:
+                        yield f"data: {line}\n"
+                    yield "\n"
+            finally:
+                await self.manager.plugin_manager.unregister_dashboard_sse_task(
+                    plugin_id,
+                    current_task,
+                )
+
+        return StreamingResponse(
+            stream_events(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Accel-Buffering": "no",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    async def _build_plugin_dashboard_request(
+        self,
+        request: Request,
+        api_path: str,
+        path_params: dict[str, str],
+    ) -> DashboardRequest:
+        query: dict[str, list[str]] = {}
+        for key, value in request.query_params.multi_items():
+            query.setdefault(str(key), []).append(str(value))
+        headers = {str(key).lower(): str(value) for key, value in request.headers.items()}
+        content_type = headers.get("content-type", "").lower()
+        form_values: dict[str, list[str]] = {}
+        files: dict[str, list[DashboardUpload]] = {}
+        body = b""
+        json_value: Any = None
+
+        try:
+            content_length = int(headers.get("content-length") or 0)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Dashboard Content-Length 无效") from exc
+        if content_length > _PLUGIN_DASHBOARD_UPLOAD_LIMIT_BYTES:
+            raise HTTPException(status_code=413, detail="Dashboard 请求体过大")
+
+        if content_type.startswith("multipart/form-data"):
+            total_file_bytes = 0
+            form = await request.form()
+            for field_name, value in form.multi_items():
+                if hasattr(value, "filename") and hasattr(value, "read"):
+                    data = await value.read(_PLUGIN_DASHBOARD_UPLOAD_LIMIT_BYTES + 1)
+                    await value.close()
+                    total_file_bytes += len(data)
+                    if total_file_bytes > _PLUGIN_DASHBOARD_UPLOAD_LIMIT_BYTES:
+                        raise HTTPException(status_code=413, detail="Dashboard 上传文件过大")
+                    files.setdefault(str(field_name), []).append(
+                        DashboardUpload(
+                            field_name=str(field_name),
+                            filename=str(value.filename or "upload.bin"),
+                            content_type=str(value.content_type or "application/octet-stream"),
+                            data=data,
+                        )
+                    )
+                else:
+                    form_values.setdefault(str(field_name), []).append(str(value))
+        else:
+            body = await request.body()
+            if len(body) > _PLUGIN_DASHBOARD_UPLOAD_LIMIT_BYTES:
+                raise HTTPException(status_code=413, detail="Dashboard 请求体过大")
+            if content_type.startswith("application/json") and body:
+                try:
+                    json_value = json.loads(body)
+                except json.JSONDecodeError as exc:
+                    raise HTTPException(status_code=400, detail="Dashboard JSON 无效") from exc
+            elif content_type.startswith("application/x-www-form-urlencoded") and body:
+                form_values = {
+                    key: [str(item) for item in values]
+                    for key, values in parse_qs(
+                        body.decode("utf-8", errors="replace"),
+                        keep_blank_values=True,
+                    ).items()
+                }
+
+        return DashboardRequest(
+            method=request.method.upper(),
+            path=str(api_path or "").strip("/"),
+            query=query,
+            headers=headers,
+            path_params=dict(path_params),
+            body=body,
+            json_value=json_value,
+            form=form_values,
+            files=files,
+        )
+
+    def _build_plugin_dashboard_response(
+        self,
+        plugin_id: str,
+        result: Any,
+    ) -> Response:
+        if isinstance(result, DashboardFileResponse):
+            path = Path(result.path)
+            if not self.manager.plugin_manager.is_allowed_dashboard_file(
+                plugin_id,
+                path,
+            ):
+                raise HTTPException(status_code=403, detail="Dashboard 文件下载路径越界")
+            return FileResponse(
+                path,
+                filename=result.filename,
+                media_type=result.media_type,
+                status_code=result.status_code,
+                headers={"Cache-Control": "no-store", **result.headers},
+            )
+
+        if isinstance(result, DashboardResponse):
+            headers = {"Cache-Control": "no-store", **result.headers}
+            if result.media_type or isinstance(result.content, (str, bytes)):
+                return Response(
+                    content=result.content,
+                    status_code=result.status_code,
+                    media_type=result.media_type,
+                    headers=headers,
+                )
+            return JSONResponse(
+                content=result.content,
+                status_code=result.status_code,
+                headers=headers,
+            )
+
+        return JSONResponse(
+            content=result,
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def _handle_uninstall_plugin(
         self,

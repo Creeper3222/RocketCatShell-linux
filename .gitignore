@@ -8,6 +8,17 @@ data/temp/
 data/plugin_data/
 data/resource/
 data/user_identity/
+data/plugins/*
+!data/plugins/rocketcat_plugin_adapt_iamthinking/
+!data/plugins/rocketcat_plugin_adapt_iamthinking/**
+!data/plugins/rocketcat_plugin_built_in_command/
+!data/plugins/rocketcat_plugin_built_in_command/**
 __pycache__/
 *.py[cod]
 .pytest_cache/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.pid
+*.lock

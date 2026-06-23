@@ -66,6 +66,7 @@ class ShellManager:
     async def shutdown(self) -> None:
         self._stop_event.set()
         await self._stop_all_runtimes()
+        await self.plugin_manager.shutdown()
         self.clear_webui_runtime()
         logger.info("[RocketCatShell] shutdown complete.")
 
@@ -93,6 +94,7 @@ class ShellManager:
     def build_status_payload(self) -> dict[str, Any]:
         settings = self._require_settings()
         actual_port = self._webui_actual_port or settings.webui_port
+        plugin_diagnostics = self.plugin_manager.diagnostic_summary()
         return {
             "product": "RocketCat",
             "version": __version__,
@@ -118,6 +120,8 @@ class ShellManager:
                 "enabled_bot_count": sum(1 for bot in self.bots if bot.enabled),
                 "active_runtime_count": sum(1 for runtime in self.runtimes.values() if runtime.started),
                 "plugin_count": len(self.plugin_manager.list_plugins()),
+                "plugin_global_instance_count": plugin_diagnostics["global_instance_count"],
+                "plugin_runtime_binding_count": plugin_diagnostics["runtime_binding_count"],
                 "user_identity_algorithm": "sha256-linear-v1",
             },
             "shell_settings": self._serialize_shell_settings(settings, mask_secrets=True),
@@ -738,19 +742,13 @@ class ShellManager:
         return self.plugin_manager.get_logo_path(plugin_id)
 
     async def set_plugin_enabled(self, plugin_id: str, enabled: bool) -> dict[str, Any]:
-        plugin = self.plugin_manager.set_plugin_enabled(plugin_id, enabled)
-        await self._reload_runtime_plugins("plugin enabled updated")
-        return plugin
+        return await self.plugin_manager.set_plugin_enabled(plugin_id, enabled)
 
     async def update_plugin_config(self, plugin_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        plugin = self.plugin_manager.update_plugin_config(plugin_id, payload)
-        await self._reload_runtime_plugins("plugin config updated")
-        return plugin
+        return await self.plugin_manager.update_plugin_config(plugin_id, payload)
 
     async def reload_plugin(self, plugin_id: str) -> dict[str, Any]:
-        plugin = self.plugin_manager.reload_plugin(plugin_id)
-        await self._reload_runtime_plugins("plugin reloaded")
-        return plugin
+        return await self.plugin_manager.reload_plugin(plugin_id)
 
     async def uninstall_plugin(
         self,
@@ -759,13 +757,11 @@ class ShellManager:
         delete_config: bool = False,
         delete_data: bool = False,
     ) -> dict[str, Any]:
-        result = self.plugin_manager.uninstall_plugin(
+        return await self.plugin_manager.uninstall_plugin(
             plugin_id,
             delete_config=delete_config,
             delete_data=delete_data,
         )
-        await self._reload_runtime_plugins("plugin uninstalled")
-        return result
 
     def _find_bot_index(self, bot_id: str) -> int:
         for index, bot in enumerate(self.bots):
@@ -1048,24 +1044,12 @@ class ShellManager:
         return runtime
 
     async def _reload_runtime_plugins(self, reason: str) -> None:
-        async with self._runtime_lock:
-            results = await asyncio.gather(
-                *(runtime.reload_plugins() for runtime in self.runtimes.values()),
-                return_exceptions=True,
-            )
-        failures = sum(1 for result in results if isinstance(result, Exception))
-        if failures:
-            logger.error(
-                "[RocketCatShell] 插件增量重载完成但存在失败 | reason=%s | failures=%s",
-                reason,
-                failures,
-            )
-        else:
-            logger.info(
-                "[RocketCatShell] 插件增量重载完成 | reason=%s | runtimes=%s",
-                reason,
-                len(results),
-            )
+        await self.plugin_manager.reconcile_all(force=True)
+        logger.info(
+            "[RocketCatShell] 全局插件实例已原子重载 | reason=%s | runtimes=%s",
+            reason,
+            len(self.runtimes),
+        )
 
     async def _stop_all_runtimes(self) -> None:
         if not self.runtimes:

@@ -7,15 +7,29 @@
 
 本项目的目标不是继续做一个“宿主里的桥接插件”，而是把 RocketCat 发展成一套真正独立的 `Rocket.Chat <-> OneBot v11` 桥接软件。
 
-这个 live 目录对应的是 RocketCatShell 的 Linux / Docker 迁移版：核心功能现已与 Windows `v0.2.0` 对齐，同时保留容器初始化、外部挂载目录、内置插件自动补种和 Linux PTY 等 Docker 包装层。RocketChat 媒体通过 RocketCatShell WebUI 端口上的令牌 HTTP URL 统一上报，不再要求与 AstrBot 配置共享目录。
+这个 live 目录对应的是 RocketCatShell 的 Linux / Docker 迁移版：核心功能现已与 Windows `v0.2.1` 对齐，同时保留容器初始化、外部挂载目录、内置插件自动补种和 Linux PTY 等 Docker 包装层。RocketChat 媒体通过 RocketCatShell WebUI 端口上的令牌 HTTP URL 统一上报，不再要求与 AstrBot 配置共享目录。
 
-> 当前 README 对应版本为 `v0.2.0`。本版在保持 v0.1.9 身份、媒体、E2EE 与 Rocket.Chat 兼容行为不变的前提下，集中优化入站热路径、身份映射、媒体缓存、资源边界和 runtime 重载，并继续发布 `linux/amd64` 与 `linux/arm64` 镜像。
+> 当前 README 对应版本为 `v0.2.1`。本版在保持 v0.2.0 性能与资源治理行为不变的前提下，将插件重构为全局单例，并新增不占用额外端口的 RocketCat 原生内置 Dashboard 链路；镜像继续同时发布 `linux/amd64` 与 `linux/arm64`。
 
 这意味着：
 
 - RocketCatShell 自己拥有 `config/`、`data/`、`logs/` 目录边界。
 - RocketCatShell 自己提供本地 WebUI、登录认证、Bot 管理、插件管理、项目根目录内文件管理和系统终端。
 - RocketCatShell 仍然可以作为 OneBot reverse WebSocket 客户端与 AstrBot 协同，但不再依赖 AstrBot 插件宿主才能运行。
+
+---
+
+## v0.2.1（全局插件实例与内置 Dashboard）
+
+- 每个启用插件现在只创建一个全局实例；多个 Bot 仅保留轻量 runtime binding，降低多 Bot 部署中的插件内存、后台任务与初始化开销。
+- 插件可在 `pages/<page_name>/index.html` 提供管理页面。WebUI 仅为拥有页面的插件显示 Dashboard 图标，并在 RocketCatShell 原有 5751 端口内全屏打开，不需要额外暴露容器端口。
+- Dashboard 页面运行在无 `allow-same-origin` 的受限 iframe 中，通过 `window.RocketCatPluginDashboard` Bridge 使用父 WebUI 的认证链路访问插件 API、上传下载与 SSE。
+- 插件可在全局 `on_initialize()` 中通过 `PluginContext.register_dashboard_api()` 和 `register_dashboard_sse()` 注册控制面接口；关闭、禁用、卸载或重载时会撤销页面令牌并终止 SSE。
+- `on_load(runtime)` 与 `on_unload(runtime)` 继续表示单个 Bot runtime 的绑定和解绑；新增 `on_terminate()` 负责全局插件最终清理。
+- 插件重载采用原子切换：候选实例初始化或任一 runtime 绑定失败时继续保留旧实例。
+- 内置指令与 I Am Thinking 适配器的可变状态均按 runtime 隔离，避免不同 Bot 使用相同房间或消息 ID 时互相影响。
+- 纯 Dashboard 插件只需提供 `pages/<page_name>/index.html` 等静态页面即可，不必实现 `main.py` 或处理任何 Bot 消息。
+- Docker Hub 按 `v0.2.1-amd64`、`v0.2.1-arm64`、双架构 `v0.2.1` 和与其同 digest 的 `latest` 发布。
 
 ---
 
@@ -381,13 +395,63 @@ RocketCatShell 当前已经拥有自己的本地插件系统，而不再只是�
 - 读取 `metadata.yaml` 和可选 `_conf_schema.json`
 - 保存插件主配置
 - 启用 / 停用插件
-- 运行时重载插件
+- 全局单例运行：一个启用插件只创建一个实例，各 Bot 只建立轻量 runtime binding
+- 插件级原子重载；候选实例初始化或任一 runtime 绑定失败时继续保留旧实例
+- 自动发现并在现有 WebUI 内打开插件 Dashboard
 - 卸载插件本体，并可选删除插件主配置与插件持久化数据
 
 当前内置示例包括：
 
 - `rocketcat_plugin_built_in_command`：RocketCatShell 自有的内置指令系统插件。当前精确拦截 `#rocketcat` 与 `#system`，在本地直接回复，不再把命令正文继续交给上游；插件回复也会在入站侧抑制自回显再次上报。
 - `rocketcat_plugin_adapt_iamthinking`：用于接管 `set_msg_emoji_like`。除 reaction shortcode 映射外，现在还支持独立的 typing 指示器开关；bot 进入思考阶段时会触发 Rocket.Chat typing，应答结束时主动清除，长时间思考会自动续期心跳。
+- 发布仓库与镜像默认仅包含 `rocketcat_plugin_built_in_command` 与 `rocketcat_plugin_adapt_iamthinking` 两个内置插件；其它位于持久化 `data/plugins/` 的插件属于用户扩展，不会被源码同步或镜像补种流程删除。
+
+### v0.2.1 插件生命周期
+
+| Hook | 作用域 | 用途 |
+|---|---|---|
+| `on_initialize()` | 每个插件实例一次 | 初始化全局资源、注册 Dashboard API / SSE。 |
+| `on_load(runtime)` | 每个已启用 Bot 一次 | 建立当前 Bot 的轻量绑定；消息与 Action 处理仍显式接收该 `runtime`。 |
+| `on_unload(runtime)` | 每个 Bot 解绑一次 | 只清理当前 runtime 的状态，不能误删其他 Bot 的状态。 |
+| `on_terminate()` | 每个插件实例一次 | 插件禁用、卸载、成功替换或 Shell 关闭时清理全局任务。 |
+
+### 内置 Dashboard 目录与接口
+
+插件页面按以下目录自动发现：
+
+```text
+data/plugins/rocketcat_plugin_example/
+├─ metadata.yaml
+├─ main.py                         # 纯静态 Dashboard 可省略
+└─ pages/
+   └─ dashboard/
+      ├─ index.html
+      ├─ app.js
+      └─ styles.css
+```
+
+`metadata.yaml` 可用 `dashboard_page: dashboard` 指定默认页面；否则优先使用名为 `dashboard` 的页面，再回退到按名称排序后的第一个页面。没有有效 `pages/<name>/index.html` 的插件不会显示 Dashboard 按钮。
+
+需要后端能力的插件在全局初始化阶段注册 RocketCat 原生接口：
+
+```python
+from rocketcat_shell.plugin_system.base import RocketCatPlugin
+
+
+class Plugin(RocketCatPlugin):
+    async def on_initialize(self):
+        self.context.register_dashboard_api(
+            "status",
+            self.get_status,
+            methods={"GET"},
+        )
+        self.context.register_dashboard_sse("events", self.stream_events)
+
+    async def get_status(self, request):
+        return {"ok": True, "query": request.query}
+```
+
+页面侧通过注入的 `window.RocketCatPluginDashboard` 使用 `getContext()`、`apiGet()`、`apiPost()`、`upload()`、`download()`、`subscribeSSE()` 和 `unsubscribeSSE()`。iframe 不持有 WebUI Cookie 或登录令牌；父页面负责认证和转发。静态资源 URL 使用高强度临时令牌，并在插件禁用、重载、卸载或页面关闭时失效。
 
 ---
 

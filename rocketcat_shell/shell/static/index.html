@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>RocketCat Shell</title>
     <link rel="stylesheet" href="/static/vendor/xterm/xterm.css?v=20260615diagicons1" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260622settingsperf2" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260623plugindashboard3" />
   </head>
   <body>
     <div class="shell-layout">
@@ -588,6 +588,41 @@
           </section>
         </section>
 
+        <section id="pluginDashboardPage" class="page-view plugin-dashboard-page hidden">
+          <header class="plugin-dashboard-toolbar">
+            <div class="plugin-dashboard-identity">
+              <button id="pluginDashboardBackButton" class="icon-button plugin-dashboard-back" type="button" aria-label="返回插件管理" title="返回插件管理">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="m15 18-6-6 6-6" />
+                </svg>
+              </button>
+              <div id="pluginDashboardLogo" class="plugin-dashboard-logo"></div>
+              <div>
+                <p class="eyebrow">RocketCat Plugin Dashboard</p>
+                <h1 id="pluginDashboardTitle">插件 Dashboard</h1>
+              </div>
+            </div>
+            <div class="plugin-dashboard-actions">
+              <label class="plugin-dashboard-page-picker" for="pluginDashboardPageSelect">
+                <span>页面</span>
+                <select id="pluginDashboardPageSelect"></select>
+              </label>
+              <button id="pluginDashboardRefreshButton" class="action-button subtle" type="button">刷新</button>
+              <button id="pluginDashboardCloseButton" class="action-button primary" type="button">返回插件列表</button>
+            </div>
+          </header>
+          <div class="plugin-dashboard-frame-shell">
+            <div id="pluginDashboardLoading" class="plugin-dashboard-loading">正在建立安全 Dashboard 会话…</div>
+            <iframe
+              id="pluginDashboardFrame"
+              class="plugin-dashboard-frame"
+              title="RocketCat 插件 Dashboard"
+              sandbox="allow-scripts allow-forms allow-downloads"
+              referrerpolicy="no-referrer"
+            ></iframe>
+          </div>
+        </section>
+
         <section id="filesPage" class="page-view hidden">
           <header class="page-header">
             <div>
@@ -1146,6 +1181,6 @@
 
     <script src="/static/vendor/xterm/xterm.js?v=20260615diagicons1"></script>
     <script src="/static/vendor/xterm/addon-fit.js?v=20260615diagicons1"></script>
-    <script src="/static/app.js?v=20260622settingsperf2"></script>
+    <script src="/static/app.js?v=20260623plugindashboard3"></script>
   </body>
 </html>

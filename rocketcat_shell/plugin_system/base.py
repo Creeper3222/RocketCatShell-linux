@@ -1,8 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
+
+from .dashboard import (
+    DashboardHandler,
+    DashboardRoute,
+    DashboardSSEHandler,
+    DashboardSSERoute,
+)
 
 if TYPE_CHECKING:
     from rocketcat_shell.bridge.config import BridgeConfig
@@ -20,6 +27,34 @@ class PluginContext:
     data_dir: Path
     config_path: Path
     metadata: dict[str, Any]
+    _dashboard_api_registrar: Callable[[DashboardRoute], None] | None = field(
+        default=None,
+        repr=False,
+    )
+    _dashboard_sse_registrar: Callable[[DashboardSSERoute], None] | None = field(
+        default=None,
+        repr=False,
+    )
+
+    def register_dashboard_api(
+        self,
+        path: str,
+        handler: DashboardHandler,
+        *,
+        methods: tuple[str, ...] | list[str] | set[str] | frozenset[str] = ("GET",),
+    ) -> None:
+        if self._dashboard_api_registrar is None:
+            raise RuntimeError("当前插件上下文不支持注册 Dashboard API")
+        self._dashboard_api_registrar(DashboardRoute.build(path, handler, methods))
+
+    def register_dashboard_sse(
+        self,
+        path: str,
+        handler: DashboardSSEHandler,
+    ) -> None:
+        if self._dashboard_sse_registrar is None:
+            raise RuntimeError("当前插件上下文不支持注册 Dashboard SSE")
+        self._dashboard_sse_registrar(DashboardSSERoute.build(path, handler))
 
 
 @dataclass(slots=True)
@@ -33,6 +68,11 @@ class PluginExecutionContext:
     context_rooms: ContextRoomStore
     inbound: InboundTranslator
     outbound: OutboundMessageTranslator
+
+    @property
+    def runtime_key(self) -> str:
+        bot_id = str(getattr(self.bridge_config, "bot_id", "") or "").strip()
+        return bot_id or str(self.instance_name or "").strip() or f"runtime-{id(self)}"
 
     async def resolve_message_source_id(self, message_id: int | str | None) -> str | None:
         if message_id is None:
@@ -69,6 +109,12 @@ class RocketCatPlugin:
     @property
     def enabled(self) -> bool:
         return bool(self.config.get("enabled", True))
+
+    async def on_initialize(self) -> None:
+        return None
+
+    async def on_terminate(self) -> None:
+        return None
 
     async def on_load(self, runtime: PluginExecutionContext) -> None:
         return None

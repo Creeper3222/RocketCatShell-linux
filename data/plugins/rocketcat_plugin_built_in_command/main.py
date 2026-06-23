@@ -44,10 +44,15 @@ _METADATA_VERSION_PATTERN = re.compile(r"^(\s*version\s*:\s*)(.+?)(\s*)$")
 class Plugin(RocketCatPlugin):
     def __init__(self, context, config: dict[str, Any]):
         super().__init__(context, config)
-        self._suppressed_self_echo_message_ids: dict[str, float] = {}
-        self._suppressed_self_echo_signatures: dict[str, float] = {}
+        self._suppressed_self_echo_message_ids: dict[tuple[str, str], float] = {}
+        self._suppressed_self_echo_signatures: dict[tuple[str, str], float] = {}
+
+    async def on_initialize(self) -> None:
+        self._sync_metadata_version()
 
     async def on_load(self, runtime: PluginExecutionContext) -> None:
+        # Keep the legacy per-runtime hook idempotent so older plugin tests and
+        # direct embeddings still receive version alignment.
         self._sync_metadata_version()
         logger.info(
             "[RocketCatShell][Plugin:%s] 已加载到运行时 %s。",
@@ -56,13 +61,26 @@ class Plugin(RocketCatPlugin):
         )
 
     async def on_unload(self, runtime: PluginExecutionContext) -> None:
-        self._suppressed_self_echo_message_ids.clear()
-        self._suppressed_self_echo_signatures.clear()
+        runtime_scope = self._runtime_scope(runtime)
+        self._suppressed_self_echo_message_ids = {
+            key: expires_at
+            for key, expires_at in self._suppressed_self_echo_message_ids.items()
+            if key[0] != runtime_scope
+        }
+        self._suppressed_self_echo_signatures = {
+            key: expires_at
+            for key, expires_at in self._suppressed_self_echo_signatures.items()
+            if key[0] != runtime_scope
+        }
         logger.info(
             "[RocketCatShell][Plugin:%s] 已从运行时 %s 卸载。",
             self.context.plugin_id,
             runtime.instance_name,
         )
+
+    async def on_terminate(self) -> None:
+        self._suppressed_self_echo_message_ids.clear()
+        self._suppressed_self_echo_signatures.clear()
 
     async def on_inbound_message(
         self,
@@ -103,7 +121,7 @@ class Plugin(RocketCatPlugin):
             )
             return None
 
-        self._remember_suppressed_self_echoes(sent_messages)
+        self._remember_suppressed_self_echoes(sent_messages, runtime)
 
         logger.info(
             "[RocketCatShell][Plugin:%s] 已处理内置指令 %s | room_id=%s | reply_count=%s",
@@ -688,8 +706,8 @@ class Plugin(RocketCatPlugin):
         if self._is_runtime_self_message(raw_msg, runtime):
             return True
         return bool(
-            self._suppressed_self_echo_message_ids
-            or self._suppressed_self_echo_signatures
+            any(key[0] == self._runtime_scope(runtime) for key in self._suppressed_self_echo_message_ids)
+            or any(key[0] == self._runtime_scope(runtime) for key in self._suppressed_self_echo_signatures)
         )
 
     def _normalize_suppression_text(self, message_text: str) -> str:
@@ -751,14 +769,21 @@ class Plugin(RocketCatPlugin):
         candidate["_rocketcat_expected_text"] = message_text
         return candidate
 
-    def _remember_suppressed_self_echoes(self, sent_messages: list[dict[str, Any]]) -> None:
+    def _remember_suppressed_self_echoes(
+        self,
+        sent_messages: list[dict[str, Any]],
+        runtime: PluginExecutionContext,
+    ) -> None:
         self._prune_suppressed_self_echoes()
         expires_at = time.monotonic() + _SELF_ECHO_SUPPRESSION_TTL_SECONDS
+        runtime_scope = self._runtime_scope(runtime)
         for sent_message in sent_messages:
             remembered = False
             source_message_id = str(sent_message.get("_id") or "").strip()
             if source_message_id:
-                self._suppressed_self_echo_message_ids[source_message_id] = expires_at
+                self._suppressed_self_echo_message_ids[
+                    (runtime_scope, source_message_id)
+                ] = expires_at
                 remembered = True
 
             signature = self._build_suppression_signature(
@@ -766,7 +791,9 @@ class Plugin(RocketCatPlugin):
                 str(sent_message.get("_rocketcat_expected_text") or sent_message.get("msg") or "").strip(),
             )
             if signature:
-                self._suppressed_self_echo_signatures[signature] = expires_at
+                self._suppressed_self_echo_signatures[
+                    (runtime_scope, signature)
+                ] = expires_at
                 remembered = True
 
             if remembered:
@@ -799,9 +826,12 @@ class Plugin(RocketCatPlugin):
         if not self._is_runtime_self_message(raw_msg, runtime):
             return False
         self._prune_suppressed_self_echoes()
+        runtime_scope = self._runtime_scope(runtime)
         source_message_id = str(raw_msg.get("_id") or "").strip()
         now = time.monotonic()
-        expires_at = self._suppressed_self_echo_message_ids.get(source_message_id)
+        expires_at = self._suppressed_self_echo_message_ids.get(
+            (runtime_scope, source_message_id)
+        )
         if expires_at is not None and expires_at > now:
             return True
 
@@ -809,10 +839,22 @@ class Plugin(RocketCatPlugin):
             str(raw_msg.get("rid") or "").strip(),
             str(raw_msg.get("msg") or raw_msg.get("text") or "").strip(),
         )
-        signature_expires_at = self._suppressed_self_echo_signatures.get(signature)
+        signature_expires_at = self._suppressed_self_echo_signatures.get(
+            (runtime_scope, signature)
+        )
         if signature_expires_at is None or signature_expires_at <= now:
             return False
 
         if source_message_id:
-            self._suppressed_self_echo_message_ids[source_message_id] = signature_expires_at
+            self._suppressed_self_echo_message_ids[
+                (runtime_scope, source_message_id)
+            ] = signature_expires_at
         return True
+
+    def _runtime_scope(self, runtime: PluginExecutionContext) -> str:
+        explicit = str(getattr(runtime, "runtime_key", "") or "").strip()
+        if explicit:
+            return explicit
+        bridge_config = getattr(runtime, "bridge_config", None)
+        bot_id = str(getattr(bridge_config, "bot_id", "") or "").strip()
+        return bot_id or str(getattr(runtime, "instance_name", "") or "").strip() or f"runtime-{id(runtime)}"

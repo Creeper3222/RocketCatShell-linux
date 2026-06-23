@@ -76,6 +76,14 @@ const state = {
     current: null,
     pendingUninstall: null,
   },
+  pluginDashboard: {
+    plugin: null,
+    page: '',
+    token: '',
+    sessionUrl: '',
+    sseControllers: new Map(),
+    opening: false,
+  },
   files: {
     path: '',
     parentPath: '',
@@ -144,6 +152,7 @@ const elements = {
   logsPage: document.getElementById('logsPage'),
   settingsPage: document.getElementById('settingsPage'),
   pluginsPage: document.getElementById('pluginsPage'),
+  pluginDashboardPage: document.getElementById('pluginDashboardPage'),
   filesPage: document.getElementById('filesPage'),
   terminalPage: document.getElementById('terminalPage'),
   bridgeStatus: document.getElementById('bridgeStatus'),
@@ -196,6 +205,14 @@ const elements = {
   emptyState: document.getElementById('emptyState'),
   pluginGrid: document.getElementById('pluginGrid'),
   pluginEmptyState: document.getElementById('pluginEmptyState'),
+  pluginDashboardBackButton: document.getElementById('pluginDashboardBackButton'),
+  pluginDashboardCloseButton: document.getElementById('pluginDashboardCloseButton'),
+  pluginDashboardRefreshButton: document.getElementById('pluginDashboardRefreshButton'),
+  pluginDashboardPageSelect: document.getElementById('pluginDashboardPageSelect'),
+  pluginDashboardTitle: document.getElementById('pluginDashboardTitle'),
+  pluginDashboardLogo: document.getElementById('pluginDashboardLogo'),
+  pluginDashboardFrame: document.getElementById('pluginDashboardFrame'),
+  pluginDashboardLoading: document.getElementById('pluginDashboardLoading'),
   createButton: document.getElementById('createButton'),
   refreshButton: document.getElementById('refreshButton'),
   basicRefreshButton: document.getElementById('basicRefreshButton'),
@@ -590,8 +607,10 @@ function setActivePage(page) {
   elements.logsPage.classList.toggle('hidden', page !== 'logs');
   elements.settingsPage.classList.toggle('hidden', page !== 'settings');
   elements.pluginsPage.classList.toggle('hidden', page !== 'plugins');
+  elements.pluginDashboardPage.classList.toggle('hidden', page !== 'plugin-dashboard');
   elements.filesPage.classList.toggle('hidden', page !== 'files');
   elements.terminalPage.classList.toggle('hidden', page !== 'terminal');
+  document.body.classList.toggle('plugin-dashboard-open', page === 'plugin-dashboard');
 
   for (const button of elements.navButtons) {
     const isActive = button.dataset.page === page;
@@ -1570,6 +1589,21 @@ function renderPlugins(payload) {
       ${item.load_error ? `<p class="plugin-load-warning">${escapeHtml(item.load_error)}</p>` : ''}
 
       <div class="card-actions plugin-card-actions">
+        ${item.has_dashboard ? `
+          <button
+            class="plugin-dashboard-launch"
+            type="button"
+            data-plugin-role="dashboard"
+            data-id="${escapeHtml(item.id)}"
+            aria-label="打开插件 UI 界面"
+            title="${item.activated ? '打开插件 UI 界面' : '启用插件后可打开 UI 界面'}"
+            ${item.activated ? '' : 'disabled'}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M21 16V4H3V16H21M21 2C22.1 2 23 2.9 23 4V16C23 17.1 22.1 18 21 18H14V20H16V22H8V20H10V18H3C1.89 18 1 17.1 1 16V4C1 2.89 1.89 2 3 2H21M5 6V12H8V6H5M10 6V9H13V6H10M15 6V12H18V6H15M10 11V12H13V11H10Z" />
+            </svg>
+          </button>
+        ` : ''}
         <button class="action-chip" type="button" data-plugin-role="settings" data-id="${escapeHtml(item.id)}">设置</button>
         <button class="action-chip" type="button" data-plugin-role="reload" data-id="${escapeHtml(item.id)}">重载</button>
         <button class="action-chip danger" type="button" data-plugin-role="uninstall" data-id="${escapeHtml(item.id)}">卸载</button>
@@ -1577,6 +1611,387 @@ function renderPlugins(payload) {
     `;
     elements.pluginGrid.appendChild(card);
   }
+}
+
+const PLUGIN_DASHBOARD_CHANNEL = 'rocketcat-plugin-dashboard';
+
+function normalizePluginDashboardPath(path) {
+  const raw = String(path || '').trim().replaceAll('\\', '/');
+  if (!raw || raw.startsWith('/') || /^[a-z][a-z0-9+.-]*:/i.test(raw)) {
+    throw new Error('Dashboard API 必须使用相对路径');
+  }
+  const parts = raw.split('/').filter(Boolean);
+  if (!parts.length || parts.some((part) => part === '.' || part === '..')) {
+    throw new Error('Dashboard API 路径无效');
+  }
+  return parts.join('/');
+}
+
+function appendPluginDashboardQuery(url, query = {}) {
+  const target = new URL(url, window.location.origin);
+  for (const [key, value] of Object.entries(query || {})) {
+    const values = Array.isArray(value) ? value : [value];
+    for (const item of values) {
+      if (item !== undefined && item !== null) {
+        target.searchParams.append(key, String(item));
+      }
+    }
+  }
+  return `${target.pathname}${target.search}`;
+}
+
+function buildPluginDashboardApiUrl(kind, path, query = {}) {
+  const pluginId = state.pluginDashboard.plugin?.id;
+  if (!pluginId) {
+    throw new Error('Dashboard 会话尚未建立');
+  }
+  const normalizedPath = normalizePluginDashboardPath(path);
+  return appendPluginDashboardQuery(
+    `/api/plugins/${encodeURIComponent(pluginId)}/dashboard/${kind}/${normalizedPath
+      .split('/')
+      .map((part) => encodeURIComponent(part))
+      .join('/')}`,
+    query,
+  );
+}
+
+function postPluginDashboardMessage(message) {
+  const target = elements.pluginDashboardFrame?.contentWindow;
+  if (!target) {
+    return;
+  }
+  target.postMessage(
+    {
+      channel: PLUGIN_DASHBOARD_CHANNEL,
+      ...message,
+    },
+    '*',
+  );
+}
+
+function buildPluginDashboardContext() {
+  const plugin = state.pluginDashboard.plugin || {};
+  return {
+    product: 'RocketCatShell',
+    version: state.status?.version || '-',
+    plugin: {
+      id: plugin.id || '',
+      name: plugin.name || '',
+      display_name: plugin.display_name || plugin.name || plugin.id || '',
+      version: plugin.version || '',
+    },
+    page: state.pluginDashboard.page,
+    pages: Array.isArray(plugin.pages) ? plugin.pages : [],
+    locale: document.documentElement.lang || 'zh-CN',
+    theme: window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light',
+  };
+}
+
+async function parsePluginDashboardResponse(response) {
+  if (response.status === 401) {
+    window.location.replace('/');
+    throw new Error('登录已失效，请重新登录');
+  }
+  const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+  const payload = contentType.includes('application/json')
+    ? await response.json().catch(() => ({}))
+    : await response.text();
+  if (!response.ok) {
+    const detail = typeof payload === 'object'
+      ? payload.detail || payload.error
+      : payload;
+    throw new Error(
+      typeof detail === 'string'
+        ? detail
+        : detail?.message || `Dashboard 请求失败 (${response.status})`,
+    );
+  }
+  return payload;
+}
+
+async function executePluginDashboardApi(payload) {
+  const method = String(payload?.method || 'GET').toUpperCase();
+  const headers = { ...(payload?.headers || {}) };
+  const options = { method, headers };
+  if (!['GET', 'HEAD'].includes(method) && payload?.body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+    options.body = JSON.stringify(payload.body);
+  }
+  const response = await fetch(
+    buildPluginDashboardApiUrl('api', payload?.path, payload?.query),
+    options,
+  );
+  return await parsePluginDashboardResponse(response);
+}
+
+async function executePluginDashboardUpload(payload) {
+  const form = new FormData();
+  for (const [key, value] of Object.entries(payload?.fields || {})) {
+    const values = Array.isArray(value) ? value : [value];
+    for (const item of values) {
+      form.append(key, String(item ?? ''));
+    }
+  }
+  for (const file of Array.from(payload?.files || [])) {
+    if (file instanceof File) {
+      form.append('files', file, file.name);
+    } else if (file instanceof Blob) {
+      form.append('files', file, 'upload.bin');
+    }
+  }
+  const response = await fetch(
+    buildPluginDashboardApiUrl('api', payload?.path),
+    { method: 'POST', body: form },
+  );
+  return await parsePluginDashboardResponse(response);
+}
+
+async function executePluginDashboardDownload(payload) {
+  const response = await fetch(
+    buildPluginDashboardApiUrl('api', payload?.path, payload?.query),
+  );
+  if (!response.ok) {
+    await parsePluginDashboardResponse(response);
+    return;
+  }
+  const blob = await response.blob();
+  const disposition = String(response.headers.get('content-disposition') || '');
+  const fileNameMatch = disposition.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
+  const fileName = fileNameMatch
+    ? decodeURIComponent(fileNameMatch[1])
+    : 'rocketcat-plugin-download';
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = objectUrl;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+  return { ok: true, filename: fileName, size: blob.size };
+}
+
+async function startPluginDashboardSSE(payload) {
+  const subscriptionId = String(payload?.subscriptionId || '');
+  if (!subscriptionId) {
+    throw new Error('SSE subscriptionId 缺失');
+  }
+  state.pluginDashboard.sseControllers.get(subscriptionId)?.abort();
+  const controller = new AbortController();
+  state.pluginDashboard.sseControllers.set(subscriptionId, controller);
+  const response = await fetch(
+    buildPluginDashboardApiUrl('sse', payload?.path, payload?.query),
+    {
+      headers: { Accept: 'text/event-stream' },
+      signal: controller.signal,
+    },
+  );
+  if (!response.ok || !response.body) {
+    state.pluginDashboard.sseControllers.delete(subscriptionId);
+    await parsePluginDashboardResponse(response);
+    return;
+  }
+
+  (async () => {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+        buffer += decoder.decode(value, { stream: true });
+        buffer = buffer.replaceAll('\r\n', '\n');
+        let boundary = buffer.indexOf('\n\n');
+        while (boundary >= 0) {
+          const block = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          const data = block
+            .split(/\r?\n/)
+            .filter((line) => line.startsWith('data:'))
+            .map((line) => line.slice(5).trimStart())
+            .join('\n');
+          postPluginDashboardMessage({
+            kind: 'event',
+            subscriptionId,
+            event: 'message',
+            data,
+          });
+          boundary = buffer.indexOf('\n\n');
+        }
+      }
+    } catch (error) {
+      if (error?.name !== 'AbortError') {
+        postPluginDashboardMessage({
+          kind: 'event',
+          subscriptionId,
+          event: 'error',
+          error: error?.message || 'SSE connection failed',
+        });
+      }
+    } finally {
+      state.pluginDashboard.sseControllers.delete(subscriptionId);
+      reader.releaseLock();
+    }
+  })();
+  return { ok: true, subscriptionId };
+}
+
+function stopPluginDashboardSSE(subscriptionId) {
+  const normalizedId = String(subscriptionId || '');
+  state.pluginDashboard.sseControllers.get(normalizedId)?.abort();
+  state.pluginDashboard.sseControllers.delete(normalizedId);
+  return { ok: true };
+}
+
+async function handlePluginDashboardBridgeMessage(event) {
+  if (
+    state.currentPage !== 'plugin-dashboard'
+    || event.source !== elements.pluginDashboardFrame?.contentWindow
+  ) {
+    return;
+  }
+  const message = event.data;
+  if (
+    !message
+    || message.channel !== PLUGIN_DASHBOARD_CHANNEL
+    || message.kind !== 'request'
+    || typeof message.requestId !== 'string'
+    || typeof message.action !== 'string'
+  ) {
+    return;
+  }
+
+  try {
+    let result;
+    if (message.action === 'ready' || message.action === 'context') {
+      result = buildPluginDashboardContext();
+    } else if (message.action === 'api') {
+      result = await executePluginDashboardApi(message.payload);
+    } else if (message.action === 'upload') {
+      result = await executePluginDashboardUpload(message.payload);
+    } else if (message.action === 'download') {
+      result = await executePluginDashboardDownload(message.payload);
+    } else if (message.action === 'sse-subscribe') {
+      result = await startPluginDashboardSSE(message.payload);
+    } else if (message.action === 'sse-unsubscribe') {
+      result = stopPluginDashboardSSE(message.payload?.subscriptionId);
+    } else {
+      throw new Error(`未知 Dashboard Bridge 操作: ${message.action}`);
+    }
+    postPluginDashboardMessage({
+      kind: 'response',
+      requestId: message.requestId,
+      ok: true,
+      result,
+    });
+  } catch (error) {
+    postPluginDashboardMessage({
+      kind: 'response',
+      requestId: message.requestId,
+      ok: false,
+      error: error?.message || 'Dashboard Bridge 请求失败',
+    });
+  }
+}
+
+async function cleanupPluginDashboardSession() {
+  for (const controller of state.pluginDashboard.sseControllers.values()) {
+    controller.abort();
+  }
+  state.pluginDashboard.sseControllers.clear();
+  const pluginId = state.pluginDashboard.plugin?.id;
+  const token = state.pluginDashboard.token;
+  if (pluginId && token) {
+    await fetch(
+      `/api/plugins/${encodeURIComponent(pluginId)}/dashboard/session/${encodeURIComponent(token)}`,
+      { method: 'DELETE' },
+    ).catch(() => {});
+  }
+  state.pluginDashboard.token = '';
+  state.pluginDashboard.sessionUrl = '';
+  if (elements.pluginDashboardFrame) {
+    elements.pluginDashboardFrame.src = 'about:blank';
+  }
+}
+
+function renderPluginDashboardHeader(plugin, selectedPage) {
+  elements.pluginDashboardTitle.textContent = plugin.display_name || plugin.name || plugin.id;
+  const pages = Array.isArray(plugin.pages) ? plugin.pages : [];
+  elements.pluginDashboardPageSelect.innerHTML = pages
+    .map((page) => (
+      `<option value="${escapeHtml(page.name)}" ${page.name === selectedPage ? 'selected' : ''}>`
+      + `${escapeHtml(page.title || page.name)}</option>`
+    ))
+    .join('');
+  elements.pluginDashboardPageSelect.disabled = pages.length <= 1;
+  elements.pluginDashboardLogo.innerHTML = plugin.has_logo
+    ? `<img src="/api/plugins/${encodeURIComponent(plugin.id)}/logo" alt="" />`
+    : `<span>${escapeHtml((plugin.display_name || plugin.name || plugin.id || '?').charAt(0))}</span>`;
+}
+
+async function openPluginDashboard(pluginId, pageName = '', { pushHistory = true } = {}) {
+  if (state.pluginDashboard.opening) {
+    return;
+  }
+  state.pluginDashboard.opening = true;
+  try {
+    const plugin = state.plugins.items.find((item) => item.id === pluginId);
+    if (!plugin?.has_dashboard) {
+      throw new Error('该插件没有 Dashboard 页面');
+    }
+    if (!plugin.activated) {
+      throw new Error('请先启用插件');
+    }
+    await cleanupPluginDashboardSession();
+    const selectedPage = pageName || plugin.default_page || plugin.pages?.[0]?.name;
+    const session = await requestJson(
+      `/api/plugins/${encodeURIComponent(plugin.id)}/dashboard/session`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ page: selectedPage }),
+      },
+    );
+    state.pluginDashboard.plugin = plugin;
+    state.pluginDashboard.page = session.page;
+    state.pluginDashboard.token = session.token;
+    state.pluginDashboard.sessionUrl = session.url;
+    renderPluginDashboardHeader(plugin, session.page);
+    elements.pluginDashboardLoading.classList.remove('hidden');
+    elements.pluginDashboardFrame.onload = () => {
+      elements.pluginDashboardLoading.classList.add('hidden');
+    };
+    elements.pluginDashboardFrame.src = session.url;
+    setActivePage('plugin-dashboard');
+    if (pushHistory) {
+      window.history.pushState(
+        { rocketcatPage: 'plugin-dashboard', pluginId: plugin.id, page: session.page },
+        '',
+        `#plugin-dashboard/${encodeURIComponent(plugin.id)}/${encodeURIComponent(session.page)}`,
+      );
+    } else if (window.history.state?.rocketcatPage === 'plugin-dashboard') {
+      window.history.replaceState(
+        { rocketcatPage: 'plugin-dashboard', pluginId: plugin.id, page: session.page },
+        '',
+        `#plugin-dashboard/${encodeURIComponent(plugin.id)}/${encodeURIComponent(session.page)}`,
+      );
+    }
+  } finally {
+    state.pluginDashboard.opening = false;
+  }
+}
+
+async function leavePluginDashboard({ fromHistory = false } = {}) {
+  await cleanupPluginDashboardSession();
+  state.pluginDashboard.plugin = null;
+  state.pluginDashboard.page = '';
+  setActivePage('plugins');
+  if (!fromHistory) {
+    window.history.replaceState({ rocketcatPage: 'plugins' }, '', '#plugins');
+  }
+  await loadPlugins({ forceReload: true, silent: true });
 }
 
 function closePluginModal() {
@@ -3920,6 +4335,32 @@ elements.pluginsRefreshButton?.addEventListener('click', async () => {
   await activatePage('plugins', { forceReload: true });
   showToast('插件列表已刷新');
 });
+elements.pluginDashboardBackButton?.addEventListener('click', () => {
+  leavePluginDashboard().catch((error) => {
+    showToast(error.message || '关闭 Dashboard 失败', 'error');
+  });
+});
+elements.pluginDashboardCloseButton?.addEventListener('click', () => {
+  leavePluginDashboard().catch((error) => {
+    showToast(error.message || '关闭 Dashboard 失败', 'error');
+  });
+});
+elements.pluginDashboardRefreshButton?.addEventListener('click', () => {
+  const pluginId = state.pluginDashboard.plugin?.id;
+  if (!pluginId) {
+    return;
+  }
+  openPluginDashboard(pluginId, state.pluginDashboard.page, { pushHistory: false })
+    .catch((error) => showToast(error.message || '刷新 Dashboard 失败', 'error'));
+});
+elements.pluginDashboardPageSelect?.addEventListener('change', (event) => {
+  const pluginId = state.pluginDashboard.plugin?.id;
+  if (!pluginId) {
+    return;
+  }
+  openPluginDashboard(pluginId, event.target.value, { pushHistory: false })
+    .catch((error) => showToast(error.message || '切换 Dashboard 页面失败', 'error'));
+});
 elements.fileRefreshButton?.addEventListener('click', async () => {
   await loadFiles({ forceReload: true });
   showToast('文件列表已刷新');
@@ -4490,6 +4931,10 @@ elements.pluginGrid?.addEventListener('click', async (event) => {
       await openPluginSettings(pluginId);
       return;
     }
+    if (role === 'dashboard') {
+      await openPluginDashboard(pluginId);
+      return;
+    }
     if (role === 'reload') {
       await reloadPlugin(pluginId);
       return;
@@ -4567,6 +5012,23 @@ window.addEventListener('keydown', (event) => {
 window.addEventListener('resize', () => {
   if (state.currentPage === 'terminal' && state.terminal.activeId) {
     fitTerminal(state.terminal.activeId);
+  }
+});
+
+window.addEventListener('message', (event) => {
+  handlePluginDashboardBridgeMessage(event).catch((error) => {
+    showToast(error.message || 'Dashboard Bridge 处理失败', 'error');
+  });
+});
+
+window.addEventListener('popstate', () => {
+  if (
+    state.currentPage === 'plugin-dashboard'
+    && window.history.state?.rocketcatPage !== 'plugin-dashboard'
+  ) {
+    leavePluginDashboard({ fromHistory: true }).catch((error) => {
+      showToast(error.message || '返回插件列表失败', 'error');
+    });
   }
 });
 
