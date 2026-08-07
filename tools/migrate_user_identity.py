@@ -343,10 +343,13 @@ async def migrate(args: argparse.Namespace) -> None:
     remove_legacy_config_fields(config_dir)
 
     if args.inject_synthetic:
+        anchor_user_id = str(args.anchor_user_id or "").strip()
+        if not anchor_user_id:
+            raise ValueError("--inject-synthetic requires --anchor-user-id")
         synthetic = await registry.inject_synthetic_collision(
-            anchor_user_id=args.anchor_user_id,
+            anchor_user_id=anchor_user_id,
             synthetic_user_id=(
-                f"synthetic:collision:{args.bot_id}:{args.anchor_user_id}"
+                f"synthetic:collision:{args.bot_id}:{anchor_user_id}"
             ),
             username="rocketcat_collision_fixture",
             nickname="哈萨维冲突测试（请保留）",
@@ -390,7 +393,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--astrbot-config", default="")
     parser.add_argument(
         "--anchor-user-id",
-        default="6TZ4YPRbmhYwgFZuM",
+        default="",
     )
     return parser
 

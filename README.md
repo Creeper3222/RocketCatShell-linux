@@ -110,7 +110,7 @@
 - OneBot reverse WebSocket 客户端现在会显式放宽 `aiohttp` 的入站消息大小上限，并在断链日志里补充 `close_code`。这修复了 AstrBot 侧较大的 `base64://` 图片动作在进入 RocketCatShell 前就触发 reverse WS 断开的问题；Docker / Linux 版在启用 Base64 兼容传输或接收较大的本地图片动作时，也不再被默认 `4 MiB` 帧限制提前截断。
 - Docker 版这里展示和 `#system` 返回的仍然是当前容器运行环境；容器外宿主机路径可见性不受诊断页面影响，媒体上报由 v0.1.9 的令牌 HTTP 接口独立处理。
 - 入站翻译热路径继续做了针对性优化：引用上下文任务只在确实可能存在引用时才构建；回复来源解析结果复用，避免重复扫描正文；纯文本引用不再误走 quoted media 提取；消息注册表 entry 复制路径改为面向 JSON-like 结构的轻量 clone；媒体描述提取改为单次遍历并为扁平 attachment 场景增加快速路径，继续压低高频图片 / 引用 / 混合消息场景下的固定开销。
-- `tools/benchmark_inbound_translate.py` 现在支持 `--profile realistic`，可直接带入更接近真实环境的 room info / quote fetch / media delay，并新增 `quote_image`、`media_mix` 场景，避免只靠零延迟微基准得到过于理想化的结论。
+- 开发者源码工具 [tools/benchmark_inbound_translate.py](https://github.com/Creeper3222/RocketCatShell-linux/blob/main/tools/benchmark_inbound_translate.py) 现在支持 `--profile realistic`，可直接带入更接近真实环境的 room info / quote fetch / media delay，并新增 `quote_image`、`media_mix` 场景，避免只靠零延迟微基准得到过于理想化的结论。该工具不包含在最小运行 ZIP 或 Docker 镜像中。
 
 升级到 `v0.1.6` 不需要迁移 `v0.1.5` 的配置目录、热存储 snapshot / journal 或本地插件数据；Docker / Linux 版在更新源码后重新构建镜像即可。如果浏览器已经打开旧版 WebUI，刷新页面以获取最新静态资源。
 
@@ -161,7 +161,7 @@
 - 新增房间信息缓存 TTL 配置 `room_info_cache_ttl_seconds`，默认 300 秒，避免同一房间元信息被高频重复拉取。
 - 支持可选性能追踪：可通过环境变量 `ROCKETCAT_PERF_TRACE` 或 bot 原始配置 `perf_trace_enabled` 打开，记录 `translate` / `emit_event` 以及入站 `room_lookup`、`mapping_alloc`、`quote_contexts`、`message_store`、`batch_commit` 等阶段耗时。
 - 猫猫日志现在也会捕获 `RocketCatPerf` 性能追踪日志，并提供左上角 `Perf` 开关用于独立过滤这类日志。
-- 新增 `tools/benchmark_inbound_translate.py`，可在本地对比 control / rebuild 两条入站翻译路径的延迟差异。
+- 新增开发者源码工具 [tools/benchmark_inbound_translate.py](https://github.com/Creeper3222/RocketCatShell-linux/blob/main/tools/benchmark_inbound_translate.py)，可在本地对比 control / rebuild 两条入站翻译路径的延迟差异；该工具不包含在最小运行 ZIP 或 Docker 镜像中。
 - message 索引策略改为固定窗口：只保留最近 N 条 message 映射，超出窗口时裁剪最旧映射，WebUI 的“重建索引”只做窗口整理与关联消息缓存重建，不再保留旧版 reset / compact 语义。
 
 ---
@@ -314,7 +314,7 @@ RocketCatShell 当前这一版明确不承诺合并转发消息语义。
 - 启动恢复阶段会记录 `snapshot_load_ms`、`journal_replay_ms` 和 `journal_records_replayed`，便于判断热存储恢复成本。
 - 入站 tracing 会拆分 `translate` 与 `emit_event` 两个阶段，并把 `room_lookup`、`mapping_alloc`、`room_bindings`、`mention_segments`、`quote_contexts`、`mention_metadata`、`media_segments`、`context_media`、`message_store`、`batch_commit` 等热路径阶段拆开记录。
 - `room_info_cache_ttl_seconds` 用于平衡房间元信息实时性与 REST 开销；默认值适合大多数稳定群组场景。
-- `tools/benchmark_inbound_translate.py` 可用于本地构造文本 / 引用 / 线程 / 图片场景，对比 control 与 rebuild 两条入站翻译链路的延迟。
+- 开发者源码工具 [tools/benchmark_inbound_translate.py](https://github.com/Creeper3222/RocketCatShell-linux/blob/main/tools/benchmark_inbound_translate.py) 可用于本地构造文本 / 引用 / 线程 / 图片场景，对比 control 与 rebuild 两条入站翻译链路的延迟；该工具不包含在最小运行 ZIP 或 Docker 镜像中。
 
 ---
 
