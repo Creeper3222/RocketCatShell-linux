@@ -13,6 +13,7 @@ RocketCatShell 各版本的功能变更、兼容性调整、问题修复和迁�
 - Docker/Linux 同步迁入本版的平台中立性能、稳定性、WebUI、卡片排序、配置兼容和 I Am Thinking v0.2.0 四态适配，同时保留 Linux PTY、OS/CPU 诊断、进程组、文件保护、Docker 网络和媒体 URL 行为。
 - Linux 更新发现固定使用 `Creeper3222/RocketCatShell-linux` 与 `RocketCatShell-linux-vX.Y.Z.zip`，v0.2.1 及更早版本继续排除；清单新增 `platform: linux` 和 `container_runtime_generation: 1`。
 - 容器更新采用无 Docker socket 的可写层事务：PID 1 优雅退出后 `exec` 冻结 helper，精确备份和替换应用层，使用 loopback 健康检查；目标失败或替换中断时由镜像内 helper 恢复。
+- 修复容器内版本切换时旧 WebUI 刚释放端口、目标进程却回退到随机端口而导致健康检查误判的问题；更新启动现在只重试配置端口，并由 PID 1 接管 `SIGTERM` 完整执行最长 30 秒的优雅排空后再进入自动回滚。
 - Dockerfile、Compose、entrypoint、`.env.example` 与 Linux launcher 随正式 ZIP 提供给镜像部署，但被明确排除在 WebUI 热事务受管路径之外。
 - 普通 `docker restart` 保留容器可写层更新；删除或强制重建容器恢复镜像版本，七个持久挂载中的配置、Bot 状态、用户插件、插件数据、身份数据库、媒体与日志不受影响。
 

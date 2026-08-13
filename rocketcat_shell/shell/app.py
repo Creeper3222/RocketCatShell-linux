@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import signal
 import webbrowser
 from typing import Any
 
@@ -48,6 +49,29 @@ def _format_duplicate_instance_message(
     )
 
 
+def _install_termination_signal_handlers(manager: ShellManager) -> list[signal.Signals]:
+    loop = asyncio.get_running_loop()
+    installed: list[signal.Signals] = []
+    for signal_number in (getattr(signal, "SIGTERM", None),):
+        if signal_number is None:
+            continue
+        try:
+            loop.add_signal_handler(signal_number, manager.request_stop)
+        except (NotImplementedError, RuntimeError, ValueError):
+            continue
+        installed.append(signal_number)
+    return installed
+
+
+def _remove_termination_signal_handlers(installed: list[signal.Signals]) -> None:
+    loop = asyncio.get_running_loop()
+    for signal_number in installed:
+        try:
+            loop.remove_signal_handler(signal_number)
+        except (NotImplementedError, RuntimeError, ValueError):
+            continue
+
+
 async def _run_async(args: argparse.Namespace) -> int:
     layout = ProjectLayout.discover()
     layout.ensure_directories()
@@ -70,6 +94,7 @@ async def _run_async(args: argparse.Namespace) -> int:
         print(message)
         return 1
 
+    installed_signals: list[signal.Signals] = []
     try:
         manager = ShellManager(layout)
         await manager.initialize(start_runtimes=False)
@@ -98,6 +123,11 @@ async def _run_async(args: argparse.Namespace) -> int:
             access_password=settings.webui_access_password,
         )
         await webui.start()
+        # Uvicorn installs its own process signal callbacks while serve() is
+        # starting. Reinstall the container-level handler afterwards so a
+        # helper-triggered SIGTERM stops the whole Shell, not only the HTTP
+        # listener, and Docker can restart into transaction recovery.
+        installed_signals = _install_termination_signal_handlers(manager)
         try:
             await manager.start_enabled_runtimes("webui ready")
             webui.mark_application_ready()
@@ -114,6 +144,7 @@ async def _run_async(args: argparse.Namespace) -> int:
             await webui.stop()
             await manager.shutdown()
     finally:
+        _remove_termination_signal_handlers(installed_signals)
         instance_lock.release()
         shutdown_logging(timeout=10.0)
 

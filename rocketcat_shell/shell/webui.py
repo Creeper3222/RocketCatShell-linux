@@ -69,6 +69,8 @@ _PLUGIN_DASHBOARD_UPLOAD_LIMIT_BYTES = 20 * 1024 * 1024
 _TERMINAL_BUFFER_LIMIT_CHARS = 200_000
 _TERMINAL_DEFAULT_COLS = 80
 _TERMINAL_DEFAULT_ROWS = 24
+_UPDATE_PORT_RETRY_SECONDS = 10.0
+_UPDATE_PORT_RETRY_INTERVAL_SECONDS = 0.1
 _PROTECTED_FILE_EXACT_PATHS = {
     (".dockerignore",),
     (".env.example",),
@@ -542,10 +544,21 @@ class ShellWebUI:
 
         self._attach_log_handler()
         try:
-            bound_socket, selected_port, fallback_reason = self._acquire_start_socket(
-                self.host,
-                self.requested_port,
-            )
+            update_transaction = str(
+                os.environ.get("ROCKETCATSHELL_UPDATE_TRANSACTION") or ""
+            ).strip()
+            if update_transaction:
+                bound_socket, selected_port, fallback_reason = (
+                    await self._acquire_update_start_socket(
+                        self.host,
+                        self.requested_port,
+                    )
+                )
+            else:
+                bound_socket, selected_port, fallback_reason = self._acquire_start_socket(
+                    self.host,
+                    self.requested_port,
+                )
             self._bound_socket = bound_socket
             self.port = selected_port
             config = uvicorn.Config(
@@ -662,9 +675,31 @@ class ShellWebUI:
 
         raise RuntimeError("独立WebUI无法绑定任何候选端口")
 
+    async def _acquire_update_start_socket(
+        self,
+        host: str,
+        preferred_port: int,
+    ) -> tuple[socket.socket, int, None]:
+        deadline = time.monotonic() + _UPDATE_PORT_RETRY_SECONDS
+        last_error: OSError | None = None
+        while True:
+            try:
+                sock = self._bind_socket(host, preferred_port)
+                return sock, int(sock.getsockname()[1]), None
+            except OSError as exc:
+                last_error = exc
+                if time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(_UPDATE_PORT_RETRY_INTERVAL_SECONDS)
+
+        raise RuntimeError(
+            f"更新事务无法重新绑定配置端口 {preferred_port}: {last_error}"
+        ) from last_error
+
     def _bind_socket(self, host: str, port: int) -> socket.socket:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((host, int(port)))
             sock.listen(128)
             sock.setblocking(False)

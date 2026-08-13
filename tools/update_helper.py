@@ -48,6 +48,7 @@ PRODUCT_NAME = "RocketCatShell"
 CONTAINER_RUNTIME_GENERATION = 1
 HEALTH_TIMEOUT_SECONDS = 120.0
 ROLLBACK_HEALTH_TIMEOUT_SECONDS = 120.0
+GRACEFUL_TERMINATION_TIMEOUT_SECONDS = 35.0
 
 
 class UpdateHelperError(RuntimeError):
@@ -579,7 +580,10 @@ def watch_transaction(transaction_file: Path, mode: str) -> int:
             # Docker's restart policy restarts the container. The image-frozen
             # helper restores the backup before the application starts again.
             os.kill(1, getattr(signal, "SIGTERM", 15))
-            time.sleep(10.0)
+            # ShellManager allows up to 30 seconds to drain runtimes and
+            # plugins. Keep the watchdog outside that window so a healthy
+            # graceful shutdown is not cut short during rollback handoff.
+            time.sleep(GRACEFUL_TERMINATION_TIMEOUT_SECONDS)
             os.kill(1, getattr(signal, "SIGKILL", 9))
         else:
             _update_transaction(
