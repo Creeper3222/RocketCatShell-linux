@@ -1,4 +1,4 @@
-# RocketCatShell v0.2.2 Linux / Docker runtime dependencies.
+# RocketCatShell v0.2.3 Linux / Docker runtime dependencies.
 # Linux terminal sessions use the standard-library PTY backend.
 aiohttp>=3.9,<4
 cryptography>=44.0.3
