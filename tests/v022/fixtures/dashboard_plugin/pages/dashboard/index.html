@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dashboard Fixture</title>
+</head>
+<body>
+  <main>
+    <h1>Dashboard Bridge 已就绪</h1>
+    <p id="context">正在读取宿主上下文…</p>
+  </main>
+  <script>
+    window.RocketCatPluginDashboard.ready.then((context) => {
+      document.querySelector('#context').textContent = `${context.product} · ${context.theme}`;
+    });
+  </script>
+</body>
+</html>

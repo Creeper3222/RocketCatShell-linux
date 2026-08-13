@@ -15,6 +15,7 @@ from urllib.parse import quote, urlparse
 import aiohttp
 
 from rocketcat_shell.logger import logger
+from rocketcat_shell.performance import RuntimeMetrics
 
 from .config import BridgeConfig
 from .json_codec import json_dumps, json_dumps_compact, json_loads
@@ -35,7 +36,7 @@ FailureCallback = Callable[[str, int, str], Awaitable[None]]
 
 class RocketChatClient:
     _INBOUND_SIGNATURE_IGNORED_KEYS = {"_updatedAt", "reactions"}
-    _INBOUND_QUEUE_MAX_SIZE = 512
+    _INBOUND_QUEUE_MAX_SIZE = 256
     _SERVER_BRANDING_CACHE_TTL_SECONDS = 300.0
     _WEBSOCKET_HEARTBEAT_SECONDS = 30.0
     _WEBSOCKET_READ_TIMEOUT_SECONDS = 90.0
@@ -77,9 +78,15 @@ class RocketChatClient:
         self._ddp_call_id = 0
         self._method_call_id = 0
         self._background_tasks: set[asyncio.Task[Any]] = set()
-        self._inbound_queues: list[asyncio.Queue[dict[str, Any]]] = []
+        self._inbound_queues: list[asyncio.Queue[tuple[dict[str, Any], float]]] = []
         self._inbound_workers: set[asyncio.Task[Any]] = set()
+        self._inbound_metrics = RuntimeMetrics()
+        self._last_inbound_overload_warning_at = 0.0
         self._subscribed_rooms: set[str] = set()
+        self._requested_subscription_ids: set[str] = set()
+        self._ready_subscription_ids: set[str] = set()
+        self._ddp_ping_count = 0
+        self._last_ddp_ping_at = 0.0
         self._cache_max_entries = max(
             64,
             int(getattr(config, "identity_cache_max_entries", 4096) or 4096),
@@ -97,6 +104,9 @@ class RocketChatClient:
         self._room_type_cache: dict[str, str] = {}
         self._room_name_cache: dict[str, str] = {}
         self._user_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._resource_inflight: dict[str, asyncio.Task[Any]] = {}
+        self._negative_message_cache: OrderedDict[str, float] = OrderedDict()
+        self._cache_metrics = RuntimeMetrics()
         self._server_branding_cache: dict[str, str] | None = None
         self._server_branding_cache_expires_at = 0.0
         self._seen_inbound_message_signatures: dict[str, str] = {}
@@ -130,6 +140,7 @@ class RocketChatClient:
         )
         self._consecutive_reconnect_failures = 0
         self._last_rest_login_at = 0.0
+        self._websocket_connected_at = 0.0
         self._last_websocket_activity_at = 0.0
         self._last_inbound_message_at = 0.0
         self._last_outbound_message_at = 0.0
@@ -139,6 +150,7 @@ class RocketChatClient:
         if self._running:
             return
         self._running = True
+        self._start_inbound_workers()
         connector = aiohttp.TCPConnector(
             limit=64,
             limit_per_host=16,
@@ -163,12 +175,14 @@ class RocketChatClient:
             await self._rest_login()
         except UnsupportedRocketChatVersionError:
             self._running = False
+            await self._stop_inbound_workers()
             await self.media.stop()
             await self._http_session.close()
             self._http_session = None
             raise
         except Exception:
             self._running = False
+            await self._stop_inbound_workers()
             await self.media.stop()
             await self._http_session.close()
             self._http_session = None
@@ -193,6 +207,7 @@ class RocketChatClient:
                 pass
             self._task = None
         await self._cancel_background_tasks()
+        await self._drain_inbound_queue(timeout=10.0)
         await self._stop_inbound_workers()
         if self._ws is not None and not self._ws.closed:
             await self._ws.close()
@@ -210,6 +225,13 @@ class RocketChatClient:
         self._room_type_cache.clear()
         self._room_name_cache.clear()
         self._user_cache.clear()
+        for task in tuple(self._resource_inflight.values()):
+            if not task.done():
+                task.cancel()
+        if self._resource_inflight:
+            await asyncio.gather(*self._resource_inflight.values(), return_exceptions=True)
+        self._resource_inflight.clear()
+        self._negative_message_cache.clear()
         self._consecutive_reconnect_failures = 0
         self.bot_profile = {}
 
@@ -233,8 +255,10 @@ class RocketChatClient:
             except Exception as exc:
                 if not self._running:
                     break
-                self.auth_token = None
-                self.user_id = None
+                # A realtime WebSocket failure does not invalidate the active
+                # REST session. Keep the last authenticated headers available
+                # so messages already accepted by the persistent inbound
+                # workers can finish while the supervisor re-authenticates.
                 login_ready = False
                 self._last_disconnect_reason = repr(exc)
                 self._consecutive_reconnect_failures += 1
@@ -253,7 +277,10 @@ class RocketChatClient:
     async def _handle_reconnect_exhausted(self, exc: Exception) -> None:
         self._running = False
         self._last_disconnect_reason = repr(exc)
-        logger.error("[RocketChatOneBotBridge] 连接失败，已自动关闭rocketchat桥接器，请检查网络或目标服务器状态")
+        logger.error(
+            "[RocketChatOneBotBridge] Rocket.Chat 连续重连失败，已自动关闭当前 Bot，"
+            "请检查 Rocket.Chat 网络或服务器状态。"
+        )
         if self._on_reconnect_exhausted is not None:
             await self._on_reconnect_exhausted(
                 "Rocket.Chat",
@@ -269,12 +296,41 @@ class RocketChatClient:
             auth_state = "partial"
         else:
             auth_state = "disconnected"
+        queue_depth = sum(queue_obj.qsize() for queue_obj in self._inbound_queues)
+        queue_capacity = len(self._inbound_queues) * self._INBOUND_QUEUE_MAX_SIZE
+        oldest_wait_ms = 0.0
+        now = time.perf_counter()
+        for queue_obj in self._inbound_queues:
+            try:
+                _payload, queued_at = queue_obj._queue[0]  # type: ignore[attr-defined]
+            except (IndexError, TypeError):
+                continue
+            oldest_wait_ms = max(oldest_wait_ms, (now - queued_at) * 1000.0)
+        metric_snapshot = self._inbound_metrics.snapshot()
+        ingress_timings = metric_snapshot["timings"]
+        ingress_counters = metric_snapshot["counters"]
         return {
             "authenticated": authenticated,
             "auth_state": auth_state,
             "reconnect_failures": self._consecutive_reconnect_failures,
             "last_rest_login_at": self._last_rest_login_at or None,
             "last_websocket_activity_at": self._last_websocket_activity_at or None,
+            "last_ddp_ping_at": self._last_ddp_ping_at or None,
+            "ddp_ping_count": self._ddp_ping_count,
+            "websocket_connected": bool(self._ws is not None and not self._ws.closed),
+            "websocket_connected_at": self._websocket_connected_at or None,
+            "websocket_connected_seconds": round(
+                max(0.0, time.time() - self._websocket_connected_at), 3
+            )
+            if self._websocket_connected_at
+            else 0.0,
+            "subscription_requested_count": len(self._requested_subscription_ids),
+            "subscription_ready_count": len(self._ready_subscription_ids),
+            "subscriptions_ready": bool(
+                self._requested_subscription_ids
+                and self._requested_subscription_ids.issubset(self._ready_subscription_ids)
+            ),
+            "subscribed_room_count": len(self._subscribed_rooms),
             "last_inbound_message_at": self._last_inbound_message_at or None,
             "last_outbound_message_at": self._last_outbound_message_at or None,
             "last_disconnect_reason": self._last_disconnect_reason,
@@ -285,21 +341,59 @@ class RocketChatClient:
             "method_rest_fallbacks": self._method_rest_fallbacks,
             "local_media_base_url": self.media.local_media_base_url,
             "inbound_worker_count": self._inbound_worker_count,
-            "inbound_queue_depth": sum(
-                queue_obj.qsize() for queue_obj in self._inbound_queues
-            ),
-            "inbound_queue_capacity": (
-                len(self._inbound_queues) * self._INBOUND_QUEUE_MAX_SIZE
-            ),
+            "inbound_queue_depth": queue_depth,
+            "inbound_queue_capacity": queue_capacity,
             "user_cache_entries": len(self._user_cache),
             "user_cache_capacity": self._cache_max_entries,
             "room_cache_entries": len(self._room_info_cache),
             "room_cache_capacity": self._room_cache_max_entries,
             "media_cache": self.media.cache_summary(),
+            "performance": {
+                "ingress": {
+                    "depth": queue_depth,
+                    "capacity": queue_capacity,
+                    "high_water": metric_snapshot["high_water"].get("queue_depth", 0),
+                    "oldest_wait_ms": round(oldest_wait_ms, 3),
+                    "wait_p95_ms": ingress_timings.get("queue_wait_ms", {}).get("p95", 0.0),
+                    "wait_p99_ms": ingress_timings.get("queue_wait_ms", {}).get("p99", 0.0),
+                    "processing_p95_ms": ingress_timings.get("processing_ms", {}).get("p95", 0.0),
+                    "processing_p99_ms": ingress_timings.get("processing_ms", {}).get("p99", 0.0),
+                    "accepted": ingress_counters.get("accepted", 0),
+                    "processed": ingress_counters.get("processed", 0),
+                    "overload_dropped": ingress_counters.get("overload_dropped", 0),
+                },
+                "caches": {
+                    **self._cache_metrics.snapshot()["counters"],
+                    "singleflight_inflight": len(self._resource_inflight),
+                    "negative_message_entries": len(self._negative_message_cache),
+                },
+            },
         }
+
+    async def _run_resource_singleflight(self, key: str, factory, *, metric: str) -> Any:
+        task = self._resource_inflight.get(key)
+        if task is None:
+            task = asyncio.create_task(factory())
+            self._resource_inflight[key] = task
+            self._cache_metrics.increment(f"{metric}_misses")
+
+            def cleanup(completed: asyncio.Task[Any]) -> None:
+                if self._resource_inflight.get(key) is completed:
+                    self._resource_inflight.pop(key, None)
+
+            task.add_done_callback(cleanup)
+        else:
+            self._cache_metrics.increment(f"{metric}_singleflight_merges")
+        return await asyncio.shield(task)
 
     def _mark_websocket_activity(self) -> None:
         self._last_websocket_activity_at = time.time()
+
+    def _record_ddp_ping(self) -> None:
+        now = time.time()
+        self._ddp_ping_count += 1
+        self._last_ddp_ping_at = now
+        self._last_websocket_activity_at = now
 
     def _mark_inbound_message_activity(self) -> None:
         now = time.time()
@@ -486,7 +580,22 @@ class RocketChatClient:
                 name=f"RocketChatInboundWorker:{index + 1}",
             )
             self._inbound_workers.add(task)
-            task.add_done_callback(self._inbound_workers.discard)
+            task.add_done_callback(self._on_inbound_worker_done)
+
+    def _on_inbound_worker_done(self, task: asyncio.Task[Any]) -> None:
+        self._inbound_workers.discard(task)
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            logger.error(
+                "[RocketCatShell] inbound worker exited unexpectedly | owner=%s | error=%r",
+                self.config.bot_id or self.config.display_name or "unknown",
+                error,
+            )
 
     async def _stop_inbound_workers(self) -> None:
         workers = list(self._inbound_workers)
@@ -498,14 +607,24 @@ class RocketChatClient:
             await asyncio.gather(*workers, return_exceptions=True)
         self._inbound_queues = []
 
-    async def _drain_inbound_queue(self) -> None:
+    async def _drain_inbound_queue(self, *, timeout: float = 10.0) -> None:
         if not self._inbound_queues:
             return
-        await asyncio.gather(*(queue_obj.join() for queue_obj in self._inbound_queues))
+        try:
+            async with asyncio.timeout(max(0.1, float(timeout))):
+                await asyncio.gather(*(queue_obj.join() for queue_obj in self._inbound_queues))
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[RocketCatShell] inbound drain timed out | remaining=%s | timeout=%.1fs",
+                sum(queue_obj.qsize() for queue_obj in self._inbound_queues),
+                timeout,
+            )
 
     async def _enqueue_incoming_message(self, raw_msg: dict[str, Any]) -> None:
         if not self._inbound_queues:
-            await self._handle_incoming_message(raw_msg)
+            self._start_inbound_workers()
+        if not self._inbound_queues:
+            self._inbound_metrics.increment("overload_dropped")
             return
         room_id = str(raw_msg.get("rid") or "")
         bucket = int.from_bytes(
@@ -513,13 +632,40 @@ class RocketChatClient:
             "big",
         ) % len(self._inbound_queues)
         queue_obj = self._inbound_queues[bucket]
-        await queue_obj.put(raw_msg)
+        try:
+            queue_obj.put_nowait((raw_msg, time.perf_counter()))
+        except asyncio.QueueFull:
+            dropped = self._inbound_metrics.increment("overload_dropped")
+            now = time.monotonic()
+            if now - self._last_inbound_overload_warning_at >= 30.0:
+                self._last_inbound_overload_warning_at = now
+                logger.warning(
+                    "[RocketCatShell] inbound queue overloaded; newest message dropped | "
+                    "bot=%s | dropped_total=%s | depth=%s | capacity=%s",
+                    self.config.bot_id or self.config.display_name or "unknown",
+                    dropped,
+                    sum(item.qsize() for item in self._inbound_queues),
+                    len(self._inbound_queues) * self._INBOUND_QUEUE_MAX_SIZE,
+                )
+            return
+        self._inbound_metrics.increment("accepted")
+        self._inbound_metrics.set_gauge(
+            "queue_depth",
+            sum(item.qsize() for item in self._inbound_queues),
+            high_water=True,
+        )
 
-    async def _inbound_worker_loop(self, queue_obj: asyncio.Queue[dict[str, Any]]) -> None:
-        while self._running:
-            raw_msg = await queue_obj.get()
+    async def _inbound_worker_loop(
+        self,
+        queue_obj: asyncio.Queue[tuple[dict[str, Any], float]],
+    ) -> None:
+        while True:
+            raw_msg, queued_at = await queue_obj.get()
+            started_at = time.perf_counter()
+            self._inbound_metrics.observe("queue_wait_ms", (started_at - queued_at) * 1000.0)
             try:
                 await self._handle_incoming_message(raw_msg)
+                self._inbound_metrics.increment("processed")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -528,6 +674,10 @@ class RocketChatClient:
                     exc,
                 )
             finally:
+                self._inbound_metrics.observe(
+                    "processing_ms",
+                    (time.perf_counter() - started_at) * 1000.0,
+                )
                 queue_obj.task_done()
 
     def _clear_self_message_waiters(self) -> None:
@@ -642,18 +792,26 @@ class RocketChatClient:
         if not refresh:
             cached_room = self._get_cached_room_info(room_id)
             if cached_room is not None:
+                self._cache_metrics.increment("room_hits")
                 return cached_room
 
-        data = await self._request_json(
-            "GET",
-            f"{self.config.server_url}/api/v1/rooms.info?roomId={room_id}",
-            headers=self._auth_headers(),
+        async def fetch() -> dict[str, Any]:
+            data = await self._request_json(
+                "GET",
+                f"{self.config.server_url}/api/v1/rooms.info?roomId={room_id}",
+                headers=self._auth_headers(),
+            )
+            room = data.get("room", {}) if data.get("success") else {}
+            fallback = {"_id": room_id, "t": self._room_type_cache.get(room_id, "c") or "c"}
+            final_room = room or fallback
+            self._cache_room_info(final_room)
+            return self._room_info_cache.get(room_id, final_room)
+
+        return await self._run_resource_singleflight(
+            f"room:{'refresh' if refresh else 'normal'}:{room_id}",
+            fetch,
+            metric="room",
         )
-        room = data.get("room", {}) if data.get("success") else {}
-        fallback = {"_id": room_id, "t": self._room_type_cache.get(room_id, "c") or "c"}
-        final_room = room or fallback
-        self._cache_room_info(final_room)
-        return self._room_info_cache.get(room_id, final_room)
 
     def _get_cached_room_info(self, room_id: str) -> dict[str, Any] | None:
         cached_room = self._room_info_cache.get(room_id)
@@ -678,16 +836,25 @@ class RocketChatClient:
         if not refresh and user_id in self._user_cache:
             user = self._user_cache[user_id]
             self._user_cache.move_to_end(user_id)
+            self._cache_metrics.increment("user_hits")
             return user
-        data = await self._request_json(
-            "GET",
-            f"{self.config.server_url}/api/v1/users.info?userId={user_id}",
-            headers=self._auth_headers(),
+
+        async def fetch() -> dict[str, Any]:
+            data = await self._request_json(
+                "GET",
+                f"{self.config.server_url}/api/v1/users.info?userId={user_id}",
+                headers=self._auth_headers(),
+            )
+            user = data.get("user", {}) if data.get("success") else {}
+            if user:
+                self._cache_user(user_id, user)
+            return user
+
+        return await self._run_resource_singleflight(
+            f"user:{'refresh' if refresh else 'normal'}:{user_id}",
+            fetch,
+            metric="user",
         )
-        user = data.get("user", {}) if data.get("success") else {}
-        if user:
-            self._cache_user(user_id, user)
-        return user
 
     async def get_current_user_info(self, refresh: bool = False) -> dict[str, Any]:
         current_user_id = str(self.user_id or "").strip()
@@ -814,17 +981,33 @@ class RocketChatClient:
         return str(room_id)
 
     async def fetch_message_by_id(self, message_id: str) -> dict[str, Any] | None:
-        data = await self._request_json(
-            "GET",
-            f"{self.config.server_url}/api/v1/chat.getMessage?msgId={message_id}",
-            headers=self._auth_headers(),
+        normalized_id = str(message_id)
+        negative_until = self._negative_message_cache.get(normalized_id, 0.0)
+        if negative_until > time.monotonic():
+            self._cache_metrics.increment("message_negative_hits")
+            return None
+        self._negative_message_cache.pop(normalized_id, None)
+
+        async def fetch() -> dict[str, Any] | None:
+            data = await self._request_json(
+                "GET",
+                f"{self.config.server_url}/api/v1/chat.getMessage?msgId={normalized_id}",
+                headers=self._auth_headers(),
+            )
+            message = data.get("message") if data.get("success") else None
+            if not isinstance(message, dict):
+                self._negative_message_cache[normalized_id] = time.monotonic() + 2.0
+                self._negative_message_cache.move_to_end(normalized_id)
+                while len(self._negative_message_cache) > 2048:
+                    self._negative_message_cache.popitem(last=False)
+                return None
+            return await self.e2ee.maybe_decrypt_message(message)
+
+        return await self._run_resource_singleflight(
+            f"message:{normalized_id}",
+            fetch,
+            metric="message",
         )
-        if not data.get("success"):
-            return None
-        message = data.get("message")
-        if not isinstance(message, dict):
-            return None
-        return await self.e2ee.maybe_decrypt_message(message)
 
     async def set_message_reaction(
         self,
@@ -1451,14 +1634,16 @@ class RocketChatClient:
             raise RuntimeError("Rocket.Chat HTTP session 尚未初始化")
         ws_url = self.config.server_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1) + "/websocket"
         self._subscribed_rooms.clear()
+        self._requested_subscription_ids.clear()
+        self._ready_subscription_ids.clear()
         async with self._http_session.ws_connect(
             ws_url,
             heartbeat=self._WEBSOCKET_HEARTBEAT_SECONDS,
             max_msg_size=8 * 1024 * 1024,
         ) as ws:
             self._ws = ws
+            self._websocket_connected_at = time.time()
             try:
-                self._start_inbound_workers()
                 await self._ddp_connect(ws)
                 await self._ddp_login(ws)
                 subscriptions = await self._get_subscriptions()
@@ -1476,10 +1661,8 @@ class RocketChatClient:
                     e2ee_task.add_done_callback(self._background_tasks.discard)
                 await self._ws_listen_loop(ws)
             finally:
-                if self._running:
-                    await self._drain_inbound_queue()
-                await self._stop_inbound_workers()
                 self._ws = None
+                self._websocket_connected_at = 0.0
 
     async def _receive_ws_frame(
         self,
@@ -1645,6 +1828,7 @@ class RocketChatClient:
                 continue
             data = json_loads(raw.data)
             if data.get("msg") == "ping":
+                self._record_ddp_ping()
                 await ws.send_str(json_dumps({"msg": "pong"}))
             elif data.get("msg") == "connected":
                 return
@@ -1670,6 +1854,7 @@ class RocketChatClient:
                 continue
             data = json_loads(raw.data)
             if data.get("msg") == "ping":
+                self._record_ddp_ping()
                 await ws.send_str(json_dumps({"msg": "pong"}))
             elif data.get("msg") == "result" and data.get("id") == "ddp-login":
                 if data.get("error"):
@@ -1685,29 +1870,33 @@ class RocketChatClient:
             room_id = sub.get("rid")
             if not room_id:
                 continue
+            subscription_id = f"room-{room_id}"
             await ws.send_str(
                 json_dumps(
                     {
                         "msg": "sub",
-                        "id": f"room-{room_id}",
+                        "id": subscription_id,
                         "name": "stream-room-messages",
                         "params": [room_id, False],
                     }
                 )
             )
+            self._requested_subscription_ids.add(subscription_id)
             self._subscribed_rooms.add(str(room_id))
 
     async def _ddp_subscribe_user_events(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        subscription_id = f"user-notif-{self.user_id}"
         await ws.send_str(
             json_dumps(
                 {
                     "msg": "sub",
-                    "id": f"user-notif-{self.user_id}",
+                    "id": subscription_id,
                     "name": "stream-notify-user",
                     "params": [f"{self.user_id}/rooms-changed", False],
                 }
             )
         )
+        self._requested_subscription_ids.add(subscription_id)
 
     async def _ws_listen_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         while self._running:
@@ -1727,7 +1916,18 @@ class RocketChatClient:
         collection = data.get("collection", "")
 
         if msg_type == "ping":
+            self._record_ddp_ping()
             await ws.send_str(json_dumps({"msg": "pong"}))
+            return
+
+        if msg_type == "ready":
+            ready_ids = data.get("subs", [])
+            if isinstance(ready_ids, list):
+                self._ready_subscription_ids.update(
+                    str(subscription_id)
+                    for subscription_id in ready_ids
+                    if str(subscription_id) in self._requested_subscription_ids
+                )
             return
 
         if msg_type == "changed" and collection == "stream-room-messages":
@@ -1777,16 +1977,18 @@ class RocketChatClient:
             }
         )
         if event_type == "inserted" and str(room_id) not in self._subscribed_rooms:
+            subscription_id = f"room-{room_id}"
             await ws.send_str(
                 json_dumps(
                     {
                         "msg": "sub",
-                        "id": f"room-{room_id}",
+                        "id": subscription_id,
                         "name": "stream-room-messages",
                         "params": [room_id, False],
                     }
                 )
             )
+            self._requested_subscription_ids.add(subscription_id)
             self._subscribed_rooms.add(str(room_id))
 
     async def _handle_incoming_message(self, raw_msg: dict[str, Any]) -> None:

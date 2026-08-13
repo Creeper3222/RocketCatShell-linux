@@ -1,0 +1,7 @@
+{
+  "enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "Enable the deterministic Dashboard fixture."
+  }
+}

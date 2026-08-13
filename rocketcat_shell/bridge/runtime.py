@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from rocketcat_shell.diagnostics import build_runtime_diagnostic_item
 from rocketcat_shell.logger import logger
+from rocketcat_shell.performance import RuntimeMetrics
 from rocketcat_shell.plugin_system import (
     PluginExecutionContext,
     RocketCatPluginManager,
@@ -78,10 +80,14 @@ class BridgeRuntime:
         self._plugin_runtime_context: PluginExecutionContext | None = None
         self._runtime_plugins: list[RuntimePluginBinding] = []
         self._failure_task: asyncio.Task | None = None
+        self._connection_supervisor_task: asyncio.Task | None = None
         self._restart_lock = asyncio.Lock()
         self._failure_handled = False
         self._started = False
         self._restart_count = 0
+        self._initial_connect_failures = 0
+        self._plugin_breakers: dict[str, dict[str, Any]] = {}
+        self._plugin_metrics = RuntimeMetrics()
 
     @classmethod
     def from_plugin_root(cls, raw_config: dict[str, Any] | Any) -> "BridgeRuntime":
@@ -104,11 +110,9 @@ class BridgeRuntime:
             )
             return
 
-        await self._start_clients()
-
         await self.state_store.write(
             {
-                "status": "running",
+                "status": "connecting",
                 "server_url": self.config.server_url,
                 "onebot_ws_url": self.config.onebot_ws_url,
                 "onebot_self_id": self.config.onebot_self_id,
@@ -116,9 +120,11 @@ class BridgeRuntime:
             }
         )
         self._started = True
+        self._start_connection_supervisor(reason="startup")
         logger.info(f"[RocketChatOneBotBridge][{self.instance_name}] bridge 运行时已启动。")
 
     async def stop(self) -> None:
+        await self._cancel_connection_supervisor()
         if self._failure_task is not None:
             self._failure_task.cancel()
             try:
@@ -134,6 +140,96 @@ class BridgeRuntime:
             await asyncio.to_thread(hot_store_bundle.close)
         self._started = False
 
+    def _start_connection_supervisor(self, *, reason: str) -> None:
+        if self._connection_supervisor_task is not None and not self._connection_supervisor_task.done():
+            return
+        task = asyncio.create_task(
+            self._connection_supervisor_loop(reason=reason),
+            name=f"RocketCatConnectionSupervisor:{self.instance_name}",
+        )
+        self._connection_supervisor_task = task
+        task.add_done_callback(self._on_connection_supervisor_done)
+
+    async def _cancel_connection_supervisor(self) -> None:
+        task = self._connection_supervisor_task
+        self._connection_supervisor_task = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    def _on_connection_supervisor_done(self, task: asyncio.Task[Any]) -> None:
+        if self._connection_supervisor_task is task:
+            self._connection_supervisor_task = None
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            logger.error(
+                "[RocketCatShell] connection supervisor exited unexpectedly | owner=%s | error=%r",
+                self.instance_name,
+                error,
+            )
+
+    async def _connection_supervisor_loop(self, *, reason: str) -> None:
+        self._initial_connect_failures = 0
+        while self.config.enabled and self._started:
+            try:
+                await self._start_clients()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self._stop_clients()
+                self._initial_connect_failures += 1
+                await self.state_store.write(
+                    {
+                        "status": "reconnecting",
+                        "client": "Rocket.Chat",
+                        "attempts": self._initial_connect_failures,
+                        "error": repr(exc),
+                        "reason": reason,
+                    }
+                )
+                max_attempts = int(self.config.max_reconnect_attempts)
+                if max_attempts > 0 and self._initial_connect_failures >= max_attempts:
+                    await self._handle_rocketchat_reconnect_exhausted(
+                        "Rocket.Chat",
+                        self._initial_connect_failures,
+                        repr(exc),
+                    )
+                    return
+                logger.warning(
+                    "[RocketCatShell][%s] initial Rocket.Chat connection failed | "
+                    "attempt=%s | retry_in=%.1fs | error=%r",
+                    self.instance_name,
+                    self._initial_connect_failures,
+                    self.config.reconnect_delay,
+                    exc,
+                )
+                await asyncio.sleep(max(0.0, float(self.config.reconnect_delay)))
+                continue
+
+            self._initial_connect_failures = 0
+            await self.state_store.write(
+                {
+                    "status": "running",
+                    "server_url": self.config.server_url,
+                    "onebot_ws_url": self.config.onebot_ws_url,
+                    "onebot_self_id": self.config.onebot_self_id,
+                    "max_reconnect_attempts": self.config.max_reconnect_attempts,
+                    "start_reason": reason,
+                }
+            )
+            logger.info(
+                "[RocketCatShell][%s] Rocket.Chat runtime connected; OneBot upstream continues independently",
+                self.instance_name,
+            )
+            return
+
     @property
     def started(self) -> bool:
         return self._started
@@ -146,6 +242,22 @@ class BridgeRuntime:
         self.id_map.set_message_window_size(self.message_index_max_entries)
         if isinstance(self.raw_config, dict):
             self.raw_config["message_index_max_entries"] = self.message_index_max_entries
+
+    async def update_media_cache_policy(self, *, max_bytes: int, max_age_hours: float) -> None:
+        normalized_bytes = max(0, int(max_bytes))
+        normalized_hours = max(0.0, float(max_age_hours))
+        self.config.media_cache_max_bytes = normalized_bytes
+        self.config.media_cache_max_age_hours = normalized_hours
+        if isinstance(self.raw_config, dict):
+            self.raw_config["media_cache_max_bytes"] = normalized_bytes
+            self.raw_config["media_cache_max_age_hours"] = normalized_hours
+        if self.rocketchat is not None:
+            self.rocketchat.config.media_cache_max_bytes = normalized_bytes
+            self.rocketchat.config.media_cache_max_age_hours = normalized_hours
+            await self.rocketchat.media.update_cache_policy(
+                max_bytes=normalized_bytes,
+                max_age_hours=normalized_hours,
+            )
 
     async def rebuild_message_indexes(self, *, force_compact: bool = False) -> dict[str, Any]:
         self._ensure_hot_store_bundle()
@@ -237,8 +349,11 @@ class BridgeRuntime:
             data_dir=self.data_dir,
             message_index_max_entries=self.message_index_max_entries,
         )
+        performance: dict[str, Any] = {}
         if self.onebot is not None:
-            payload.update(self.onebot.build_diagnostic_snapshot())
+            onebot_snapshot = self.onebot.build_diagnostic_snapshot()
+            payload.update({key: value for key, value in onebot_snapshot.items() if key != "performance"})
+            performance.update(onebot_snapshot.get("performance") or {})
         if self.rocketchat is not None:
             client_snapshot = self.rocketchat.build_diagnostic_snapshot()
             payload.update(
@@ -253,8 +368,24 @@ class BridgeRuntime:
                     "media_cache": client_snapshot.get("media_cache", {}),
                 }
             )
+            performance.update(client_snapshot.get("performance") or {})
         if self.identity_registry is not None:
             payload["identity_cache"] = self.identity_registry.cache_summary()
+        if self._hot_store_bundle is not None:
+            performance["persistence"] = self._hot_store_bundle.diagnostic_snapshot()
+        plugin_metrics = self._plugin_metrics.snapshot()
+        performance["plugins"] = {
+            "dispatch_p95_ms": plugin_metrics["timings"].get("dispatch_ms", {}).get("p95", 0.0),
+            "dispatch_p99_ms": plugin_metrics["timings"].get("dispatch_ms", {}).get("p99", 0.0),
+            "timeouts": plugin_metrics["counters"].get("timeouts", 0),
+            "circuit_skips": plugin_metrics["counters"].get("circuit_skips", 0),
+            "open_circuits": sum(
+                1
+                for state in self._plugin_breakers.values()
+                if float(state.get("open_until") or 0.0) > time.monotonic()
+            ),
+        }
+        payload["performance"] = performance
         payload["runtime_restart_count"] = self._restart_count
         return payload
 
@@ -313,6 +444,22 @@ class BridgeRuntime:
                 self._plugin_runtime_context,
             ):
                 continue
+            plugin_id = binding.descriptor.plugin_id
+            breaker = self._plugin_breakers.setdefault(
+                plugin_id,
+                {"consecutive_timeouts": 0, "open_until": 0.0, "probe_in_flight": False},
+            )
+            now = time.monotonic()
+            open_until = float(breaker.get("open_until") or 0.0)
+            if open_until > now:
+                self._plugin_metrics.increment("circuit_skips")
+                continue
+            if open_until and breaker.get("probe_in_flight"):
+                self._plugin_metrics.increment("circuit_skips")
+                continue
+            if open_until:
+                breaker["probe_in_flight"] = True
+            started_at = time.perf_counter()
             try:
                 async with asyncio.timeout(5.0):
                     result = await plugin.on_inbound_message(
@@ -321,18 +468,34 @@ class BridgeRuntime:
                         self._plugin_runtime_context,
                     )
             except asyncio.TimeoutError:
+                self._plugin_metrics.increment("timeouts")
+                breaker["probe_in_flight"] = False
+                breaker["consecutive_timeouts"] = int(breaker.get("consecutive_timeouts") or 0) + 1
+                if int(breaker["consecutive_timeouts"]) >= 3:
+                    breaker["open_until"] = time.monotonic() + 60.0
                 logger.warning(
                     "[RocketCatShell] 插件 %s 处理入站消息超时。",
                     binding.descriptor.plugin_id,
                 )
                 continue
             except Exception as exc:
+                breaker.update(
+                    {"consecutive_timeouts": 0, "open_until": 0.0, "probe_in_flight": False}
+                )
                 logger.error(
                     "[RocketCatShell] 插件 %s 处理入站消息失败: %r",
                     binding.descriptor.plugin_id,
                     exc,
                 )
                 continue
+            finally:
+                self._plugin_metrics.observe(
+                    "dispatch_ms",
+                    (time.perf_counter() - started_at) * 1000.0,
+                )
+            breaker.update(
+                {"consecutive_timeouts": 0, "open_until": 0.0, "probe_in_flight": False}
+            )
             if result is False:
                 return True
         return False
@@ -350,7 +513,7 @@ class BridgeRuntime:
             media_publication_service=self.media_publication_service,
             media_temp_dir=self.media_temp_dir,
             on_message=self._handle_rocketchat_message,
-            on_reconnect_exhausted=self._handle_reconnect_exhausted,
+            on_reconnect_exhausted=self._handle_rocketchat_reconnect_exhausted,
         )
 
         try:
@@ -402,7 +565,6 @@ class BridgeRuntime:
             self.onebot = OneBotReverseWsClient(
                 self.config,
                 action_handler=self.action_handler.handle,
-                on_reconnect_exhausted=self._handle_reconnect_exhausted,
             )
             await self.rocketchat.start_realtime()
             await self.onebot.start()
@@ -426,71 +588,76 @@ class BridgeRuntime:
             warning_path=warning_path,
             cache_max_entries=self.config.identity_cache_max_entries,
         )
-        bot_profile = self.rocketchat.bot_profile or {}
-        self_mapping = await registry.ensure_mapping(
-            self.rocketchat.user_id,
-            username=str(
-                bot_profile.get("username")
-                or self.rocketchat.bot_username
-                or self.config.username
-                or ""
-            ),
-            nickname=str(
-                bot_profile.get("name")
-                or bot_profile.get("nickname")
-                or self.rocketchat.bot_username
-                or self.config.username
-                or ""
-            ),
-            is_bot=True,
-            bot_id=self.config.bot_id,
-        )
-        self.identity_registry = registry
-        self.identity_database_path = registry.database_path
-        self.id_map = UserIdentityIdMap(self._base_id_map, registry)
-        self.config.onebot_self_id = self_mapping.onebot_id
+        try:
+            bot_profile = self.rocketchat.bot_profile or {}
+            self_mapping = await registry.ensure_mapping(
+                self.rocketchat.user_id,
+                username=str(
+                    bot_profile.get("username")
+                    or self.rocketchat.bot_username
+                    or self.config.username
+                    or ""
+                ),
+                nickname=str(
+                    bot_profile.get("name")
+                    or bot_profile.get("nickname")
+                    or self.rocketchat.bot_username
+                    or self.config.username
+                    or ""
+                ),
+                is_bot=True,
+                bot_id=self.config.bot_id,
+            )
+            self.identity_registry = registry
+            self.identity_database_path = registry.database_path
+            self.id_map = UserIdentityIdMap(self._base_id_map, registry)
+            self.config.onebot_self_id = self_mapping.onebot_id
 
-        private_bindings = self._hot_store_bundle.state_engine.get_private_room_source_bindings()
-        rebuilt_private_surrogates: dict[int, str] = {}
-        private_mappings = await registry.ensure_mappings(
-            [
-                {"user_id": user_source_id}
-                for user_source_id in private_bindings
-            ],
-            bot_id=self.config.bot_id,
-        )
-        for mapping in private_mappings:
-            room_source_id = private_bindings.get(mapping.user_id)
-            if not room_source_id:
-                continue
-            rebuilt_private_surrogates[mapping.onebot_id] = room_source_id
-        self._hot_store_bundle.state_engine.replace_private_room_surrogate_bindings(
-            rebuilt_private_surrogates
-        )
+            private_bindings = self._hot_store_bundle.state_engine.get_private_room_source_bindings()
+            rebuilt_private_surrogates: dict[int, str] = {}
+            private_mappings = await registry.ensure_mappings(
+                [
+                    {"user_id": user_source_id}
+                    for user_source_id in private_bindings
+                ],
+                bot_id=self.config.bot_id,
+            )
+            for mapping in private_mappings:
+                room_source_id = private_bindings.get(mapping.user_id)
+                if not room_source_id:
+                    continue
+                rebuilt_private_surrogates[mapping.onebot_id] = room_source_id
+            self._hot_store_bundle.state_engine.replace_private_room_surrogate_bindings(
+                rebuilt_private_surrogates
+            )
 
-        identity_scope_path = self.data_dir / "identity_scope.json"
-        await asyncio.to_thread(
-            identity_scope_path.write_text,
-            (
-                "{\n"
-                f'  "scope_key": {self._json_string(registry.scope_key)},\n'
-                f'  "database_path": {self._json_string(str(registry.database_path))},\n'
-                f'  "onebot_self_id": {self.config.onebot_self_id}\n'
-                "}\n"
-            ),
-            "utf-8",
-        )
-        await registry.sync_warning_file(
-            bot_id=self.config.bot_id,
-            warning_path=warning_path,
-        )
-        registry.repeat_persisted_warnings()
-        logger.info(
-            "[RocketChatOneBotBridge] bot 用户哈希映射就绪 | "
-            "userId=%s | onebot_self_id=%s | algorithm=sha256-linear-v1",
-            self.rocketchat.user_id,
-            self.config.onebot_self_id,
-        )
+            identity_scope_path = self.data_dir / "identity_scope.json"
+            await asyncio.to_thread(
+                identity_scope_path.write_text,
+                (
+                    "{\n"
+                    f'  "scope_key": {self._json_string(registry.scope_key)},\n'
+                    f'  "database_path": {self._json_string(str(registry.database_path))},\n'
+                    f'  "onebot_self_id": {self.config.onebot_self_id}\n'
+                    "}\n"
+                ),
+                "utf-8",
+            )
+            await registry.sync_warning_file(
+                bot_id=self.config.bot_id,
+                warning_path=warning_path,
+            )
+            registry.repeat_persisted_warnings()
+            logger.info(
+                "[RocketChatOneBotBridge] bot 用户哈希映射就绪 | "
+                "userId=%s | onebot_self_id=%s | algorithm=sha256-linear-v1",
+                self.rocketchat.user_id,
+                self.config.onebot_self_id,
+            )
+        except BaseException:
+            if self.identity_registry is not registry:
+                await registry.release()
+            raise
 
     @staticmethod
     def _json_string(value: str) -> str:
@@ -507,6 +674,8 @@ class BridgeRuntime:
             await self.rocketchat.stop()
         if self._plugin_manager is not None and runtime_context is not None and runtime_plugins:
             await self._plugin_manager.shutdown_runtime_plugins(runtime_plugins, runtime_context)
+        if self.identity_registry is not None:
+            await self.identity_registry.release()
         self.rocketchat = None
         self.inbound_translator = None
         self.outbound_translator = None
@@ -514,6 +683,7 @@ class BridgeRuntime:
         self.onebot = None
         self._plugin_runtime_context = None
         self._runtime_plugins = []
+        self._plugin_breakers.clear()
         self.identity_registry = None
         self.identity_database_path = None
         if self._base_id_map is not None:
@@ -560,18 +730,20 @@ class BridgeRuntime:
                 logger.info(
                     f"[RocketChatOneBotBridge][{self.instance_name}] 当前 enabled=false，跳过 bridge 重连。"
                 )
+                await self._cancel_connection_supervisor()
                 await self._stop_clients()
                 await self.state_store.write({"status": "stopped", "reason": reason, "enabled": False})
                 self._started = False
                 return
 
             await self.state_store.write({"status": "restarting", "reason": reason})
+            await self._cancel_connection_supervisor()
             await self._stop_clients()
-            await self._start_clients()
             self._restart_count += 1
+            self._started = True
             await self.state_store.write(
                 {
-                    "status": "running",
+                    "status": "connecting",
                     "server_url": self.config.server_url,
                     "onebot_ws_url": self.config.onebot_ws_url,
                     "onebot_self_id": self.config.onebot_self_id,
@@ -579,6 +751,7 @@ class BridgeRuntime:
                     "restart_reason": reason,
                 }
             )
+            self._start_connection_supervisor(reason=reason)
             logger.info(
                 f"[RocketChatOneBotBridge][{self.instance_name}] bridge 连接已重启，reason={reason}"
             )
@@ -592,7 +765,7 @@ class BridgeRuntime:
             self.instance_name,
         )
 
-    async def _handle_reconnect_exhausted(
+    async def _handle_rocketchat_reconnect_exhausted(
         self,
         client_name: str,
         attempts: int,
@@ -601,7 +774,7 @@ class BridgeRuntime:
         if self._failure_handled:
             return
         self._failure_handled = True
-        await self._disable_bridge_after_reconnect_failure()
+        await self._disable_bridge_after_rocketchat_failure()
         await self.state_store.write(
             {
                 "status": "failed",
@@ -613,7 +786,7 @@ class BridgeRuntime:
             }
         )
         logger.error(
-            f'[RocketChatOneBotBridge][{self.instance_name}] 当前 bot 已因重连失败被自动关闭，请重新开启后再尝试连接。'
+            f'[RocketChatOneBotBridge][{self.instance_name}] 当前 bot 已因 Rocket.Chat 连续重连失败被自动关闭，请重新开启后再尝试连接。'
         )
         if self._failure_task is None or self._failure_task.done():
             self._failure_task = asyncio.create_task(self._enter_failed_state())
@@ -623,7 +796,7 @@ class BridgeRuntime:
             await self._stop_clients()
             self._started = False
 
-    async def _disable_bridge_after_reconnect_failure(self) -> None:
+    async def _disable_bridge_after_rocketchat_failure(self) -> None:
         self.config.enabled = False
         if isinstance(self.raw_config, dict):
             self.raw_config["enabled"] = False

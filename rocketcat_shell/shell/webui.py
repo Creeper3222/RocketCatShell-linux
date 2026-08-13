@@ -26,12 +26,15 @@ from typing import Any
 from urllib.parse import parse_qs, quote
 
 import uvicorn
+import psutil
 from fastapi import Body, FastAPI, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi import File as FastAPIFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..__init__ import __version__
+from ..logger import logger, register_log_sink, unregister_log_sink
+from ..update_manifest import PRODUCT_NAME, UpdatePackageError
 from ..plugin_system import (
     DashboardFileResponse,
     DashboardRequest,
@@ -43,7 +46,7 @@ from ..bridge.user_identity import (
     UserIdentityError,
     UserIdentityRevisionError,
 )
-from ..logger import logger
+from .manager import CardOrderConflictError
 
 try:
     import fcntl
@@ -302,6 +305,10 @@ class ShellWebUI:
             int(raw_terminal_idle_timeout if raw_terminal_idle_timeout is not None else 0),
         )
         self._terminal_cleanup_task: asyncio.Task[Any] | None = None
+        self._update_switch_lock = asyncio.Lock()
+        self._configuration_transaction_lock = asyncio.Lock()
+        self._update_shutdown_task: asyncio.Task[Any] | None = None
+        self._application_ready = False
         self._app = FastAPI(title="RocketCat Shell", version=__version__)
         self._static_dir = Path(__file__).resolve().parent / "static"
         self._login_file = self._static_dir / "login.html"
@@ -310,6 +317,9 @@ class ShellWebUI:
     @property
     def url(self) -> str:
         return f"http://{self.host}:{self.port}/"
+
+    def mark_application_ready(self) -> None:
+        self._application_ready = True
 
     async def _apply_access_password(self, password: str) -> None:
         next_password = str(password or "").strip()
@@ -332,7 +342,10 @@ class ShellWebUI:
         @self._app.middleware("http")
         async def _disable_cache(request: Request, call_next):
             path = request.url.path or "/"
-            if self._auth_required and path.startswith("/api/") and path not in {"/api/login"}:
+            if self._auth_required and path.startswith("/api/") and path not in {
+                "/api/health",
+                "/api/login",
+            }:
                 if not await self._is_request_authenticated(request):
                     return JSONResponse(
                         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -340,10 +353,15 @@ class ShellWebUI:
                     )
 
             response = await call_next(request)
-            if path == "/" or path.startswith("/static/"):
+            if path == "/" or (path.startswith("/static/") and path.endswith(".html")):
                 response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
                 response.headers["Pragma"] = "no-cache"
                 response.headers["Expires"] = "0"
+            elif path.startswith("/static/"):
+                if str(request.query_params.get("v") or "").strip():
+                    response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+                else:
+                    response.headers["Cache-Control"] = "public, max-age=0, must-revalidate"
             return response
 
         self._app.mount(
@@ -362,8 +380,29 @@ class ShellWebUI:
             methods=["GET"],
         )
         self._app.add_api_route("/", self._handle_index, methods=["GET"])
+        self._app.add_api_route("/api/health", self._handle_health, methods=["GET"])
         self._app.add_api_route("/api/status", self._handle_status, methods=["GET"])
         self._app.add_api_route("/api/diagnostics", self._handle_diagnostics, methods=["GET"])
+        self._app.add_api_route(
+            "/api/updates/status",
+            self._handle_update_status,
+            methods=["GET"],
+        )
+        self._app.add_api_route(
+            "/api/updates/releases",
+            self._handle_update_releases,
+            methods=["GET"],
+        )
+        self._app.add_api_route(
+            "/api/updates/transactions/{transaction_id}",
+            self._handle_update_transaction,
+            methods=["GET"],
+        )
+        self._app.add_api_route(
+            "/api/updates/switch",
+            self._handle_update_switch,
+            methods=["POST"],
+        )
         self._app.add_api_route("/api/login", self._handle_login, methods=["POST"])
         self._app.add_api_route("/api/logout", self._handle_logout, methods=["POST"])
         self._app.add_api_route("/api/basic-info", self._handle_basic_info, methods=["GET"])
@@ -375,6 +414,16 @@ class ShellWebUI:
         )
         self._app.add_api_route("/api/settings", self._handle_settings, methods=["GET"])
         self._app.add_api_route("/api/settings", self._handle_update_settings, methods=["PUT"])
+        self._app.add_api_route(
+            "/api/settings/card-order",
+            self._handle_card_order,
+            methods=["GET"],
+        )
+        self._app.add_api_route(
+            "/api/settings/card-order",
+            self._handle_update_card_order,
+            methods=["PUT"],
+        )
         self._app.add_api_route(
             "/api/settings/export-config",
             self._handle_export_configuration,
@@ -555,6 +604,7 @@ class ShellWebUI:
             raise
 
     async def stop(self) -> None:
+        self._application_ready = False
         if self._server is None and self._server_task is None and self._bound_socket is None:
             return
 
@@ -1171,12 +1221,10 @@ class ShellWebUI:
                     session["sockets"].discard(websocket)
 
     def _attach_log_handler(self) -> None:
-        if self._log_handler not in logger.handlers:
-            logger.addHandler(self._log_handler)
+        register_log_sink(self._log_handler)
 
     def _detach_log_handler(self) -> None:
-        if self._log_handler in logger.handlers:
-            logger.removeHandler(self._log_handler)
+        unregister_log_sink(self._log_handler)
 
     async def _handle_index(self, request: Request) -> FileResponse:
         if self._auth_required and not await self._is_request_authenticated(request):
@@ -1254,8 +1302,159 @@ class ShellWebUI:
         response.delete_cookie(key=self._session_cookie_name, path="/")
         return response
 
-    async def _handle_status(self) -> dict[str, Any]:
-        return await self.manager.get_webui_state()
+    async def _handle_status(
+        self,
+        compact: bool = Query(default=False),
+    ) -> dict[str, Any]:
+        return await self.manager.get_webui_state(compact=compact)
+
+    async def _handle_health(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "status": "ok" if self._application_ready else "starting",
+            "product": PRODUCT_NAME,
+            "version": __version__,
+        }
+        transaction_id = str(
+            os.environ.get("ROCKETCATSHELL_UPDATE_TRANSACTION") or ""
+        ).strip()
+        if len(transaction_id) == 24 and all(
+            character in "0123456789abcdef" for character in transaction_id
+        ):
+            payload["update_transaction"] = transaction_id
+        return payload
+
+    async def _handle_update_status(
+        self,
+        refresh: bool = Query(default=False),
+    ) -> dict[str, Any]:
+        return await self.manager.updates.status(refresh=refresh)
+
+    async def _handle_update_releases(
+        self,
+        refresh: bool = Query(default=False),
+    ) -> dict[str, Any]:
+        payload = await self.manager.updates.releases(refresh=refresh)
+        releases = []
+        for release in payload.get("releases") or []:
+            asset = release.get("asset") or {}
+            releases.append(
+                {
+                    "tag_name": release.get("tag_name"),
+                    "version": release.get("version"),
+                    "name": release.get("name"),
+                    "published_at": release.get("published_at"),
+                    "prerelease": bool(release.get("prerelease")),
+                    "notes": release.get("notes") or "",
+                    "action": self.manager.updates.action_for_tag(
+                        str(release.get("tag_name") or "")
+                    ),
+                    "asset": {
+                        "name": asset.get("name"),
+                        "size": int(asset.get("size") or 0),
+                        "digest": asset.get("digest"),
+                    },
+                }
+            )
+        return {
+            "checked_at": payload.get("checked_at"),
+            "stale": bool(payload.get("stale")),
+            "error": payload.get("error") or "",
+            "refresh_limited": bool(payload.get("refresh_limited")),
+            "releases": releases,
+        }
+
+    async def _handle_update_transaction(
+        self,
+        transaction_id: str,
+    ) -> dict[str, Any]:
+        transaction = self.manager.updates.transaction(transaction_id)
+        if transaction is None:
+            raise HTTPException(status_code=404, detail="更新事务不存在")
+        return transaction
+
+    async def _handle_update_switch(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        tag_name = str(payload.get("tag_name") or "").strip()
+        if not tag_name:
+            raise HTTPException(status_code=409, detail="目标版本不能为空")
+        if not self._application_ready:
+            raise HTTPException(status_code=409, detail="RocketCatShell 尚未完成启动")
+        if self._update_switch_lock.locked() or self._update_shutdown_task is not None:
+            raise HTTPException(status_code=409, detail="已有版本切换或重启事务正在进行")
+
+        async with self._configuration_transaction_lock:
+            if self._update_shutdown_task is not None or self.manager.updates.active_transaction():
+                raise HTTPException(status_code=409, detail="已有版本切换或重启事务正在进行")
+            configured_port = int(getattr(self.manager.settings, "webui_port", 0) or 0)
+            if configured_port != self.port:
+                raise HTTPException(
+                    status_code=409,
+                    detail="WebUI 端口设置尚未在当前进程生效，请先重启 RocketCatShell 再切换版本",
+                )
+            async with self._update_switch_lock:
+                try:
+                    process = psutil.Process(os.getpid())
+                    transaction = await self.manager.updates.prepare_switch(
+                        tag_name=tag_name,
+                        service_pid=os.getpid(),
+                        service_create_time=process.create_time(),
+                        health_urls=[f"http://127.0.0.1:{self.port}"],
+                    )
+                except UpdatePackageError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                except (OSError, RuntimeError) as exc:
+                    logger.warning("[RocketCatShell] update preparation failed: %s", exc)
+                    raise HTTPException(status_code=503, detail="更新包准备失败，请稍后重试") from exc
+                except Exception as exc:
+                    logger.exception("[RocketCatShell] unexpected update preparation failure")
+                    raise HTTPException(status_code=500, detail="更新包准备失败") from exc
+
+                self._update_shutdown_task = asyncio.create_task(
+                    self._request_update_shutdown(transaction["transaction_id"])
+                )
+                return transaction
+
+    async def _request_update_shutdown(self, transaction_id: str) -> None:
+        current_task = asyncio.current_task()
+        try:
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                transaction = self.manager.updates.transaction(transaction_id)
+                if transaction is None:
+                    logger.error(
+                        "[RocketCatShell] update transaction disappeared before shutdown"
+                    )
+                    return
+                if transaction.get("status") in {
+                    "failed",
+                    "completed",
+                    "rolled_back",
+                    "recovery_required",
+                }:
+                    logger.error(
+                        "[RocketCatShell] update helper stopped before shutdown: %s",
+                        transaction.get("stage"),
+                    )
+                    return
+                if transaction.get("stage") == "waiting_for_shutdown":
+                    logger.info(
+                        "[RocketCatShell] update helper is ready; stopping gracefully"
+                    )
+                    self.manager.request_stop()
+                    return
+                await asyncio.sleep(0.1)
+            logger.error(
+                "[RocketCatShell] update helper did not become ready; keeping service online"
+            )
+            self.manager.updates.fail_prepared_transaction(
+                transaction_id,
+                error="update helper did not become ready",
+            )
+        finally:
+            if self._update_shutdown_task is current_task:
+                self._update_shutdown_task = None
 
     async def _handle_diagnostics(self) -> dict[str, Any]:
         payload = await self.manager.get_diagnostics_state()
@@ -1291,18 +1490,49 @@ class ShellWebUI:
     async def _handle_settings(self) -> dict[str, Any]:
         return await self.manager.get_settings_state()
 
-    async def _handle_update_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
-        try:
-            updated = await self.manager.update_settings(payload)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except Exception as exc:
-            logger.error(f"[RocketCatShell] 更新 shell 设置失败: {exc!r}")
-            raise HTTPException(status_code=500, detail="更新 shell 设置失败") from exc
+    async def _handle_card_order(self) -> dict[str, list[str]]:
+        return await self.manager.get_card_order_state()
 
-        if hasattr(self.manager, "settings") and getattr(self.manager, "settings") is not None:
-            await self._apply_access_password(self.manager.settings.webui_access_password)
-        return updated
+    async def _handle_update_card_order(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, list[str]]:
+        async with self._configuration_transaction_lock:
+            if (
+                self._update_switch_lock.locked()
+                or self._update_shutdown_task is not None
+                or self.manager.updates.active_transaction()
+            ):
+                raise HTTPException(status_code=409, detail="版本切换期间不能修改卡片顺序")
+            try:
+                return await self.manager.update_card_order(payload)
+            except CardOrderConflictError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                logger.error("[RocketCatShell] 更新卡片顺序失败: %r", exc)
+                raise HTTPException(status_code=500, detail="更新卡片顺序失败") from exc
+
+    async def _handle_update_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        async with self._configuration_transaction_lock:
+            if (
+                self._update_switch_lock.locked()
+                or self._update_shutdown_task is not None
+                or self.manager.updates.active_transaction()
+            ):
+                raise HTTPException(status_code=409, detail="版本切换期间不能修改 Shell 设置")
+            try:
+                updated = await self.manager.update_settings(payload)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                logger.error(f"[RocketCatShell] 更新 shell 设置失败: {exc!r}")
+                raise HTTPException(status_code=500, detail="更新 shell 设置失败") from exc
+
+            if hasattr(self.manager, "settings") and getattr(self.manager, "settings") is not None:
+                await self._apply_access_password(self.manager.settings.webui_access_password)
+            return updated
 
     async def _handle_export_configuration(self) -> dict[str, Any]:
         try:
@@ -1312,17 +1542,24 @@ class ShellWebUI:
             raise HTTPException(status_code=500, detail="导出配置失败") from exc
 
     async def _handle_import_configuration(self, payload: dict[str, Any]) -> dict[str, Any]:
-        try:
-            result = await self.manager.import_configuration(payload)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except Exception as exc:
-            logger.error(f"[RocketCatShell] 导入配置失败: {exc!r}")
-            raise HTTPException(status_code=500, detail="导入配置失败") from exc
+        async with self._configuration_transaction_lock:
+            if (
+                self._update_switch_lock.locked()
+                or self._update_shutdown_task is not None
+                or self.manager.updates.active_transaction()
+            ):
+                raise HTTPException(status_code=409, detail="版本切换期间不能导入配置")
+            try:
+                result = await self.manager.import_configuration(payload)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                logger.error(f"[RocketCatShell] 导入配置失败: {exc!r}")
+                raise HTTPException(status_code=500, detail="导入配置失败") from exc
 
-        if hasattr(self.manager, "settings") and getattr(self.manager, "settings") is not None:
-            await self._apply_access_password(self.manager.settings.webui_access_password)
-        return {"ok": True, "result": result}
+            if hasattr(self.manager, "settings") and getattr(self.manager, "settings") is not None:
+                await self._apply_access_password(self.manager.settings.webui_access_password)
+            return {"ok": True, "result": result}
 
     async def _handle_rebuild_message_indexes(self) -> dict[str, Any]:
         try:

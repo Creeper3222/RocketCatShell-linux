@@ -4,22 +4,52 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>RocketCat Shell</title>
+    <link rel="icon" type="image/png" href="/static/logo.png?v=20260814linux0221" />
+    <link rel="apple-touch-icon" href="/static/logo.png?v=20260814linux0221" />
     <link rel="stylesheet" href="/static/vendor/xterm/xterm.css?v=20260615diagicons1" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260623plugindashboard3" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260814linux0221" />
   </head>
   <body>
     <div class="shell-layout">
-      <aside class="sidebar">
+      <header class="mobile-topbar">
+        <button id="mobileMenuButton" class="icon-button mobile-menu-button" type="button" aria-label="打开主导航" aria-controls="appSidebar" aria-expanded="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 7h16M4 12h16M4 17h16" />
+          </svg>
+        </button>
+        <div class="mobile-brand">
+          <span class="brand-avatar brand-avatar-mobile" aria-hidden="true">
+            <img src="/static/logo.png?v=20260814linux0221" alt="" />
+          </span>
+          <div>
+            <strong>RocketCat</strong>
+            <span id="mobilePageTitle">网络配置</span>
+          </div>
+        </div>
+        <span id="mobileRuntimeStatus" class="runtime-dot" data-state="unknown" aria-label="运行状态未知"></span>
+      </header>
+
+      <div id="navigationScrim" class="navigation-scrim" aria-hidden="true"></div>
+      <div id="navigationEdgeGesture" class="navigation-edge-gesture" aria-hidden="true"></div>
+
+      <aside id="appSidebar" class="sidebar" aria-label="主导航">
+        <div id="sidebarDragHandle" class="sidebar-drag-handle" aria-hidden="true">
+          <span></span>
+        </div>
         <div class="brand-mark">
-          <span class="brand-accent"></span>
+          <span class="brand-avatar brand-avatar-sidebar" aria-hidden="true">
+            <img src="/static/logo.png?v=20260814linux0221" alt="" />
+          </span>
           <div>
             <p class="brand-title">RocketCat</p>
-              <p class="brand-subtitle">Unified Bridge</p>
+            <p class="brand-subtitle">Unified Bridge</p>
           </div>
         </div>
 
-        <nav class="nav-section">
-          <button class="nav-item active" type="button" data-page="network">
+        <nav class="nav-section" aria-label="RocketCatShell 页面">
+          <div class="nav-group">
+            <p class="nav-group-label">连接与状态</p>
+            <button class="nav-item active" type="button" data-page="network" aria-current="page">
             <span class="nav-icon" aria-hidden="true">
               <svg viewBox="0 0 24 24">
                 <path d="M2 20h.01" />
@@ -31,7 +61,18 @@
             </span>
             <span>网络配置</span>
           </button>
-          <button class="nav-item" type="button" data-page="diagnostics">
+            <button class="nav-item" type="button" data-page="basic">
+              <span class="nav-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24">
+                  <rect width="7" height="9" x="3" y="3" rx="1" />
+                  <rect width="7" height="5" x="14" y="3" rx="1" />
+                  <rect width="7" height="9" x="14" y="12" rx="1" />
+                  <rect width="7" height="5" x="3" y="16" rx="1" />
+                </svg>
+              </span>
+              <span>基础信息</span>
+            </button>
+            <button class="nav-item" type="button" data-page="diagnostics">
             <span class="nav-icon" aria-hidden="true">
               <svg viewBox="0 0 24 24">
                 <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
@@ -39,18 +80,7 @@
             </span>
             <span>运行诊断</span>
           </button>
-          <button class="nav-item" type="button" data-page="basic">
-            <span class="nav-icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24">
-                <rect width="7" height="9" x="3" y="3" rx="1" />
-                <rect width="7" height="5" x="14" y="3" rx="1" />
-                <rect width="7" height="9" x="14" y="12" rx="1" />
-                <rect width="7" height="5" x="3" y="16" rx="1" />
-              </svg>
-            </span>
-            <span>基础信息</span>
-          </button>
-          <button class="nav-item" type="button" data-page="logs">
+            <button class="nav-item" type="button" data-page="logs">
             <span class="nav-icon" aria-hidden="true">
               <svg viewBox="0 0 24 24">
                 <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
@@ -62,16 +92,11 @@
             </span>
             <span>猫猫日志</span>
           </button>
-          <button class="nav-item" type="button" data-page="settings">
-            <span class="nav-icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24">
-                <path d="M12.22 2h-.44a2 2 0 0 0-2 1.72l-.12.86a2 2 0 0 1-2.9 1.44l-.76-.4a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .55 2.62l.7.53a2 2 0 0 1 0 3.24l-.7.53a2 2 0 0 0-.55 2.62l.22.38a2 2 0 0 0 2.73.73l.76-.4a2 2 0 0 1 2.9 1.44l.12.86a2 2 0 0 0 2 1.72h.44a2 2 0 0 0 2-1.72l.12-.86a2 2 0 0 1 2.9-1.44l.76.4a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.55-2.62l-.7-.53a2 2 0 0 1 0-3.24l.7-.53a2 2 0 0 0 .55-2.62l-.22-.38a2 2 0 0 0-2.73-.73l-.76.4a2 2 0 0 1-2.9-1.44l-.12-.86a2 2 0 0 0-2-1.72Z" />
-                <circle cx="12" cy="12" r="3" />
-              </svg>
-            </span>
-            <span>基础设置</span>
-          </button>
-          <button class="nav-item" type="button" data-page="plugins">
+          </div>
+
+          <div class="nav-group">
+            <p class="nav-group-label">管理工具</p>
+            <button class="nav-item" type="button" data-page="plugins">
             <span class="nav-icon" aria-hidden="true">
               <svg viewBox="0 0 24 24">
                 <path d="m7.5 4.27 9 5.15" />
@@ -82,7 +107,7 @@
             </span>
             <span>插件管理</span>
           </button>
-          <button class="nav-item" type="button" data-page="files">
+            <button class="nav-item" type="button" data-page="files">
             <span class="nav-icon" aria-hidden="true">
               <svg viewBox="0 0 24 24">
                 <path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6A2 2 0 0 1 18.46 20H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2A2 2 0 0 0 13.07 6H19a2 2 0 0 1 2 2v2" />
@@ -90,7 +115,7 @@
             </span>
             <span>文件管理</span>
           </button>
-          <button class="nav-item" type="button" data-page="terminal">
+            <button class="nav-item" type="button" data-page="terminal">
             <span class="nav-icon" aria-hidden="true">
               <svg viewBox="0 0 24 24">
                 <path d="m4 17 6-5-6-5" />
@@ -99,10 +124,35 @@
             </span>
             <span>系统终端</span>
           </button>
+          </div>
+
+          <div class="nav-group">
+            <p class="nav-group-label">系统</p>
+            <button class="nav-item" type="button" data-page="settings">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <path d="M12.22 2h-.44a2 2 0 0 0-2 1.72l-.12.86a2 2 0 0 1-2.9 1.44l-.76-.4a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .55 2.62l.7.53a2 2 0 0 1 0 3.24l-.7.53a2 2 0 0 0-.55 2.62l.22.38a2 2 0 0 0 2.73.73l.76-.4a2 2 0 0 1 2.9 1.44l.12.86a2 2 0 0 0 2 1.72h.44a2 2 0 0 0 2-1.72l.12-.86a2 2 0 0 1 2.9-1.44l.76.4a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.55-2.62l-.7-.53a2 2 0 0 1 0-3.24l.7-.53a2 2 0 0 0 .55-2.62l-.22-.38a2 2 0 0 0-2.73-.73l-.76.4a2 2 0 0 1-2.9-1.44l-.12-.86a2 2 0 0 0-2-1.72Z" />
+                <circle cx="12" cy="12" r="3" />
+              </svg>
+            </span>
+            <span>基础设置</span>
+          </button>
+          </div>
         </nav>
+
+        <footer class="sidebar-footer">
+          <div class="sidebar-runtime">
+            <span id="sidebarRuntimeDot" class="runtime-dot" data-state="unknown" aria-hidden="true"></span>
+            <span id="sidebarRuntimeText">正在读取运行状态</span>
+          </div>
+          <div class="sidebar-meta">
+            <span id="sidebarVersion">v0.2.2</span>
+            <button id="logoutButton" class="sidebar-logout" type="button">退出登录</button>
+          </div>
+        </footer>
       </aside>
 
-      <main class="page-shell">
+      <main id="mainContent" class="page-shell" tabindex="-1">
         <section id="networkPage" class="page-view">
           <header class="page-header">
             <div>
@@ -134,16 +184,19 @@
           </section>
 
           <section class="panel-shell">
-            <div class="tab-row">
-              <button class="tab-pill">全部</button>
-              <button class="tab-pill active">WS bot</button>
+            <div class="panel-heading-row">
+              <div>
+                <p class="eyebrow">ONEBOT CONNECTIONS</p>
+                <h2>Bot 列表</h2>
+              </div>
+              <span id="botListSummary" class="count-badge">0 个 Bot</span>
             </div>
 
             <div id="emptyState" class="empty-state hidden">
               <p>当前还没有 bot。点击右上角“新建 Bot”开始添加。</p>
             </div>
 
-            <div id="botGrid" class="bot-grid"></div>
+            <div id="botGrid" class="bot-grid" data-card-order-grid data-card-order-scope="bots" data-card-order-page="network"></div>
           </section>
         </section>
 
@@ -309,11 +362,34 @@
               </article>
             </section>
 
+            <details class="performance-backpressure-panel">
+              <summary>
+                <span>
+                  <strong>性能与背压</strong>
+                  <small>事件循环、日志、入站、OneBot action 与持久化队列</small>
+                </span>
+                <span id="performanceOverallBadge" class="performance-health-badge">等待采样</span>
+              </summary>
+              <div class="performance-host-grid">
+                <article class="performance-metric-card">
+                  <span>事件循环 p99 / max</span>
+                  <strong id="performanceEventLoop">-</strong>
+                  <small id="performanceEventLoopStatus">尚无采样</small>
+                </article>
+                <article class="performance-metric-card">
+                  <span>日志队列 / 高水位</span>
+                  <strong id="performanceLoggingQueue">-</strong>
+                  <small id="performanceLoggingStatus">尚无采样</small>
+                </article>
+              </div>
+              <div id="performanceBotGrid" class="performance-bot-grid"></div>
+            </details>
+
             <div id="diagnosticsEmptyState" class="empty-state hidden">
               <p>当前还没有可展示的 bot 诊断数据。</p>
             </div>
 
-            <div id="diagnosticsGrid" class="diagnostics-grid"></div>
+            <div id="diagnosticsGrid" class="diagnostics-grid" data-card-order-grid data-card-order-scope="bots" data-card-order-page="diagnostics"></div>
           </section>
         </section>
 
@@ -353,7 +429,7 @@
             <div id="basicEmptyState" class="empty-state hidden">
               <p>当前没有已启用的 bot，因此这里不会显示任何客户端信息。</p>
             </div>
-            <div id="basicInfoGrid" class="basic-info-grid"></div>
+            <div id="basicInfoGrid" class="basic-info-grid" data-card-order-grid data-card-order-scope="bots" data-card-order-page="basic"></div>
           </section>
         </section>
 
@@ -370,12 +446,12 @@
 
           <section class="panel-shell log-panel-shell">
             <div class="log-toolbar">
-              <div class="log-filter-group">
-                <button class="log-filter active" type="button" data-log-level="DEBUG">Debug</button>
-                <button class="log-filter active" type="button" data-log-level="INFO">Info</button>
-                <button class="log-filter active" type="button" data-log-level="WARN">Warn</button>
-                <button class="log-filter active" type="button" data-log-level="ERROR">Error</button>
-                <button class="log-filter active" type="button" data-log-perf="true">Perf</button>
+              <div class="log-filter-group" role="group" aria-label="日志级别筛选">
+                <button class="log-filter active" type="button" aria-pressed="true" data-log-level="DEBUG">Debug</button>
+                <button class="log-filter active" type="button" aria-pressed="true" data-log-level="INFO">Info</button>
+                <button class="log-filter active" type="button" aria-pressed="true" data-log-level="WARN">Warn</button>
+                <button class="log-filter active" type="button" aria-pressed="true" data-log-level="ERROR">Error</button>
+                <button class="log-filter" type="button" aria-pressed="false" data-log-perf="true">Perf</button>
               </div>
               <div class="log-toolbar-actions">
                 <label class="field-switch compact-switch log-auto-scroll-switch">
@@ -384,11 +460,14 @@
                   <i></i>
                 </label>
                 <div id="logMeta" class="log-meta">实时日志</div>
+                <button id="logBackToBottomButton" class="action-button subtle log-back-bottom hidden" type="button">
+                  回到底部 <span id="logUnreadCount" class="count-badge">0</span>
+                </button>
                 <button id="clearLogsButton" class="action-button log-clear-button" type="button">一键清空日志</button>
               </div>
             </div>
 
-            <div id="logConsole" class="log-console" aria-live="polite"></div>
+            <div id="logConsole" class="log-console" tabindex="0" aria-label="Shell 日志输出"></div>
           </section>
         </section>
 
@@ -419,6 +498,35 @@
             </article>
           </section>
 
+          <section class="version-management-card" aria-labelledby="versionManagementTitle">
+            <div class="version-management-main">
+              <p class="version-management-kicker">SYSTEM RELEASE</p>
+              <h2 id="versionManagementTitle">版本管理</h2>
+              <p class="version-management-copy">安全切换当前容器的 RocketCatShell Linux 应用层。普通容器重启会保留；删除或重建容器会恢复镜像版本。配置、Bot 数据、用户插件、日志和数据库均受保护。</p>
+              <div class="version-metrics" aria-live="polite">
+                <div class="version-metric">
+                  <span>当前版本</span>
+                  <strong id="updateCurrentVersion">-</strong>
+                </div>
+                <div class="version-metric">
+                  <span>最新版本</span>
+                  <strong id="updateLatestVersion">-</strong>
+                </div>
+                <div class="version-metric">
+                  <span>检查时间</span>
+                  <strong id="updateCheckedAt">尚未检查</strong>
+                </div>
+              </div>
+              <p id="updateStatusMessage" class="version-status-message">进入版本管理后将使用缓存检查，不会自动安装。</p>
+            </div>
+            <div class="version-action-rail">
+              <span id="updateAvailabilityBadge" class="version-state-badge idle">等待检查</span>
+              <button id="updateCheckButton" class="action-button subtle" type="button">检查更新</button>
+              <button id="updateSelectButton" class="action-button primary" type="button">选择版本</button>
+              <small>兼容范围从 v0.2.2 开始</small>
+            </div>
+          </section>
+
           <section class="panel-shell settings-panel-shell">
             <form id="settingsForm" class="settings-form">
               <section class="form-section">
@@ -436,6 +544,7 @@
                   </label>
                 </div>
                 <p id="settingsPasswordHelper" class="settings-helper">保存后立即生效。该密码同时用于登录 WebUI 和打开敏感持久化数据文件。</p>
+                <p id="settingsPasswordResult" class="form-result" role="status" aria-live="polite"></p>
                 <div class="settings-actions">
                   <button id="settingsPasswordSaveButton" class="action-button primary" type="button">保存密码</button>
                 </div>
@@ -458,12 +567,13 @@
                   </label>
                 </div>
                 <p id="settingsPortHint" class="settings-helper">保存后会写入配置。重启 RocketCat Shell 时会优先尝试该端口；如果端口被占用，仍会自动回退到可用端口。</p>
+                <p id="settingsPortResult" class="form-result" role="status" aria-live="polite"></p>
                 <div class="settings-actions">
                   <button id="settingsPortSaveButton" class="action-button primary" type="button">保存端口</button>
                 </div>
               </section>
 
-              <details class="form-section" open>
+              <details class="form-section settings-advanced-section">
                 <summary><h3>性能与资源（高级设置）</h3></summary>
                 <p class="settings-helper">默认 balanced 适合大多数部署。网络 runtime 相关设置保存后仅增量重启受影响的 Bot；日志与终端边界在下次启动 Shell 后完整生效。</p>
                 <div class="field-grid two-columns">
@@ -508,7 +618,7 @@
                     <input id="settingsTerminalIdleTimeoutInput" type="number" min="0" step="60" />
                   </label>
                 </div>
-                <section class="form-section">
+                <section class="form-section settings-message-index-section">
                   <h3>消息映射窗口</h3>
                   <div class="field-grid two-columns">
                     <label class="field-block span-two">
@@ -532,6 +642,7 @@
                 <div class="settings-actions">
                   <button id="settingsPerformanceSaveButton" class="action-button primary" type="button">保存性能与资源设置</button>
                 </div>
+                <p id="settingsPerformanceResult" class="form-result" role="status" aria-live="polite"></p>
               </details>
 
               <section class="form-section">
@@ -541,6 +652,7 @@
                   <button id="settingsExportConfigButton" class="action-button subtle" type="button">导出配置</button>
                   <button id="settingsImportConfigButton" class="action-button primary" type="button">导入配置</button>
                 </div>
+                <p id="settingsConfigResult" class="form-result" role="status" aria-live="polite"></p>
                 <input
                   id="settingsImportFileInput"
                   class="hidden"
@@ -584,7 +696,7 @@
               <p>当前还没有本地插件。将插件目录放入 data/plugins 后，这里会自动读取。</p>
             </div>
 
-            <div id="pluginGrid" class="plugin-grid"></div>
+            <div id="pluginGrid" class="plugin-grid" data-card-order-grid data-card-order-scope="plugins" data-card-order-page="plugins"></div>
           </section>
         </section>
 
@@ -611,8 +723,13 @@
               <button id="pluginDashboardCloseButton" class="action-button primary" type="button">返回插件列表</button>
             </div>
           </header>
-          <div class="plugin-dashboard-frame-shell">
-            <div id="pluginDashboardLoading" class="plugin-dashboard-loading">正在建立安全 Dashboard 会话…</div>
+          <div id="pluginDashboardFrameShell" class="plugin-dashboard-frame-shell" data-dashboard-phase="loading">
+            <div id="pluginDashboardLoading" class="plugin-dashboard-loading" role="status">正在建立安全 Dashboard 会话…</div>
+            <div id="pluginDashboardError" class="plugin-dashboard-error" role="alert">
+              <strong>Dashboard 未能就绪</strong>
+              <span>插件页面没有在 20 秒内完成安全 Bridge 握手。</span>
+              <button id="pluginDashboardRetryButton" class="action-button primary" type="button">重新连接</button>
+            </div>
             <iframe
               id="pluginDashboardFrame"
               class="plugin-dashboard-frame"
@@ -708,10 +825,10 @@
                 </button>
               </div>
               <div id="fileBreadcrumb" class="file-breadcrumb"></div>
-              <p id="fileStatus" class="inline-note file-status">仅浏览 RocketCatShell 根目录内文件。</p>
+              <p id="fileStatus" class="inline-note file-status" role="status" aria-live="polite">仅浏览 RocketCatShell 根目录内文件。</p>
             </div>
 
-            <div id="fileUploadZone" class="file-upload-zone hidden">
+            <div id="fileUploadZone" class="file-upload-zone hidden" aria-busy="false">
               <input id="fileUploadInput" class="hidden" type="file" multiple />
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M12 15.5V4.8" />
@@ -720,7 +837,7 @@
               </svg>
               <p>拖拽文件到此处上传</p>
               <button id="fileUploadPickButton" class="action-button subtle" type="button">点击选择文件</button>
-              <span id="fileUploadStatus" class="inline-note">单次最多上传 20 个文件，单文件不超过 100 MiB。</span>
+              <span id="fileUploadStatus" class="inline-note" role="status" aria-live="polite">单次最多上传 20 个文件，单文件不超过 100 MiB。</span>
             </div>
 
             <div id="fileEmptyState" class="empty-state hidden">
@@ -731,14 +848,14 @@
               <table class="file-table">
                 <thead>
                   <tr>
-                    <th class="file-select-cell">
+                    <th class="file-select-cell" scope="col">
                       <input id="fileSelectAllInput" class="file-checkbox" type="checkbox" aria-label="选择全部文件" />
                     </th>
-                    <th>名称</th>
-                    <th>类型</th>
-                    <th>大小</th>
-                    <th>修改时间</th>
-                    <th>操作</th>
+                    <th scope="col">名称</th>
+                    <th scope="col">类型</th>
+                    <th scope="col">大小</th>
+                    <th scope="col">修改时间</th>
+                    <th scope="col">操作</th>
                   </tr>
                 </thead>
                 <tbody id="fileTableBody"></tbody>
@@ -780,7 +897,7 @@
       </main>
     </div>
 
-    <div id="botModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <dialog id="botModal" class="modal" aria-labelledby="modalTitle" data-dirty-guard="botForm">
       <div class="modal-panel">
         <div class="modal-header">
           <div>
@@ -791,6 +908,7 @@
         </div>
 
         <form id="botForm" class="form-layout">
+          <p id="botFormStatus" class="form-result" role="status" aria-live="polite"></p>
           <section class="form-section">
             <h3>基础信息</h3>
             <div class="field-grid two-columns">
@@ -853,13 +971,14 @@
             <h3>高级设置</h3>
             <div class="field-grid two-columns compact-grid">
               <label class="field-block">
-                <span>重连延迟(秒)</span>
+                <span>Rocket.Chat 重连延迟（秒）</span>
                 <input name="reconnect_delay" type="number" min="0" step="0.1" />
               </label>
               <label class="field-block">
-                <span>最大连续重连次数</span>
+                <span>Rocket.Chat 最大连续重连次数</span>
                 <input name="max_reconnect_attempts" type="number" min="0" step="1" />
               </label>
+              <p class="settings-helper settings-helper-compact span-two">仅作用于 Rocket.Chat 连接。OneBot 上游未连接时 Bot 会保持启用，并以独立的 5 秒间隔在后台持续等待；离线期间的新事件不会积压或延后重放。</p>
               <label class="field-block">
                 <span>远程媒体大小上限(字节)</span>
                 <input name="remote_media_max_size" type="number" min="0" step="1" />
@@ -896,17 +1015,18 @@
 
         <div class="modal-footer">
           <button id="cancelButton" class="action-button subtle" type="button">取消</button>
-          <button id="submitButton" class="action-button primary" type="button">保存 Bot</button>
+          <button id="submitButton" class="action-button primary" type="submit" form="botForm">保存 Bot</button>
         </div>
       </div>
-    </div>
+    </dialog>
 
-    <div id="userMappingsModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="userMappingsModalTitle">
+    <dialog id="userMappingsModal" class="modal" aria-labelledby="userMappingsModalTitle">
       <div class="modal-panel user-mappings-panel">
         <div class="modal-header">
           <div>
             <p class="eyebrow">User Identity Registry</p>
-            <h2 id="userMappingsModalTitle">User 映射列表</h2>
+            <h2 id="userMappingsModalTitle">User 映射</h2>
+            <p id="userMappingsBotName" class="modal-subtitle"></p>
           </div>
           <button id="userMappingsCloseButton" class="icon-button" type="button" aria-label="关闭">×</button>
         </div>
@@ -921,13 +1041,13 @@
           <table class="user-mappings-table">
             <thead>
               <tr>
-                <th>userId</th>
-                <th>用户名</th>
-                <th>昵称</th>
-                <th>OneBot ID</th>
-                <th>主槽 / 偏移</th>
-                <th>状态</th>
-                <th>操作</th>
+                <th scope="col">userId</th>
+                <th scope="col">用户名</th>
+                <th scope="col">昵称</th>
+                <th scope="col">OneBot ID</th>
+                <th scope="col">主槽 / 偏移</th>
+                <th scope="col">状态</th>
+                <th scope="col">操作</th>
               </tr>
             </thead>
             <tbody id="userMappingsTableBody"></tbody>
@@ -943,9 +1063,9 @@
           <button id="userMappingsDoneButton" class="action-button primary" type="button">完成</button>
         </div>
       </div>
-    </div>
+    </dialog>
 
-    <div id="pluginModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="pluginModalTitle">
+    <dialog id="pluginModal" class="modal" aria-labelledby="pluginModalTitle" data-dirty-guard="pluginSettingsForm">
       <div class="modal-panel plugin-modal-panel">
         <div class="modal-header">
           <div>
@@ -958,15 +1078,48 @@
         <div id="pluginModalMeta" class="plugin-modal-meta"></div>
 
         <form id="pluginSettingsForm" class="form-layout plugin-settings-form"></form>
+        <p id="pluginFormStatus" class="form-result" role="status" aria-live="polite"></p>
 
         <div class="modal-footer">
           <button id="pluginCancelButton" class="action-button subtle" type="button">取消</button>
           <button id="pluginSaveButton" class="action-button primary" type="button">保存插件设置</button>
         </div>
       </div>
-    </div>
+    </dialog>
 
-    <div id="pluginUninstallModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="pluginUninstallTitle">
+    <dialog id="pluginListEditorModal" class="modal" aria-labelledby="pluginListEditorTitle">
+      <div class="modal-panel plugin-list-editor-panel">
+        <div class="modal-header">
+          <div>
+            <p class="eyebrow">UPSTREAM EMOJI IDS</p>
+            <h2 id="pluginListEditorTitle">修改表情 ID 列表</h2>
+            <p id="pluginListEditorDescription" class="modal-subtitle">逐个添加 AstrBot 上游插件使用的数字表情 ID。</p>
+          </div>
+          <button id="pluginListEditorCloseButton" class="icon-button" type="button" aria-label="关闭">×</button>
+        </div>
+
+        <form id="pluginListEditorForm" class="plugin-list-editor-form">
+          <label class="field-block" for="pluginListEditorInput">
+            <span>添加表情数字 ID</span>
+          </label>
+          <div class="plugin-list-editor-add-row">
+            <input id="pluginListEditorInput" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="例如 66" />
+            <button id="pluginListEditorAddButton" class="action-button subtle" type="submit">添加</button>
+          </div>
+          <p id="pluginListEditorStatus" class="form-result" role="alert" aria-live="assertive"></p>
+        </form>
+
+        <div id="pluginListEditorItems" class="plugin-list-editor-items" role="list" aria-label="已添加的表情 ID"></div>
+        <p id="pluginListEditorEmpty" class="plugin-list-editor-empty hidden">尚未添加任何表情 ID。</p>
+
+        <div class="modal-footer">
+          <button id="pluginListEditorCancelButton" class="action-button subtle" type="button">取消</button>
+          <button id="pluginListEditorConfirmButton" class="action-button primary" type="button">确认</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="pluginUninstallModal" class="modal" aria-labelledby="pluginUninstallTitle">
       <div class="modal-panel plugin-uninstall-panel">
         <div class="modal-header">
           <div>
@@ -1007,9 +1160,9 @@
           <button id="pluginUninstallConfirmButton" class="action-button primary danger-button" type="button">确认</button>
         </div>
       </div>
-    </div>
+    </dialog>
 
-    <div id="filePreviewModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="filePreviewTitle">
+    <dialog id="filePreviewModal" class="modal" aria-labelledby="filePreviewTitle">
       <div class="modal-panel file-preview-panel">
         <div class="modal-header">
           <div>
@@ -1025,9 +1178,9 @@
           <button id="filePreviewCancelButton" class="action-button subtle" type="button">关闭</button>
         </div>
       </div>
-    </div>
+    </dialog>
 
-    <div id="fileEditModal" class="modal hidden file-edit-modal" role="dialog" aria-modal="true" aria-labelledby="fileEditTitle">
+    <dialog id="fileEditModal" class="modal file-edit-modal" aria-labelledby="fileEditTitle" data-dirty-guard="fileEditContentInput">
       <div class="modal-panel file-edit-panel">
         <div class="file-edit-header">
           <div class="file-edit-heading">
@@ -1049,9 +1202,9 @@
           <button id="fileEditSaveButton" class="action-button file-edit-save-button" type="button">保存</button>
         </div>
       </div>
-    </div>
+    </dialog>
 
-    <div id="fileSaveConfirmModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="fileSaveConfirmTitle">
+    <dialog id="fileSaveConfirmModal" class="modal" aria-labelledby="fileSaveConfirmTitle">
       <div class="modal-panel file-confirm-panel">
         <div class="modal-header">
           <h2 id="fileSaveConfirmTitle">保存文件</h2>
@@ -1063,9 +1216,9 @@
           <button id="fileSaveConfirmSubmitButton" class="action-button file-edit-save-button" type="button">确认保存</button>
         </div>
       </div>
-    </div>
+    </dialog>
 
-    <div id="fileImageViewer" class="file-image-viewer hidden" role="dialog" aria-modal="true" aria-label="图片预览">
+    <dialog id="fileImageViewer" class="file-image-viewer" aria-label="图片预览">
       <div class="file-image-viewer-topbar">
         <div id="fileImageViewerCount" class="file-image-viewer-count">1 / 1</div>
         <button id="fileImageViewerCloseButton" class="file-image-viewer-close" type="button" aria-label="关闭图片预览">
@@ -1085,18 +1238,18 @@
           <path d="m9 6 6 6-6 6" />
         </svg>
       </button>
-    </div>
+    </dialog>
 
-    <div id="fileCreateModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="fileCreateTitle">
+    <dialog id="fileCreateModal" class="modal" aria-labelledby="fileCreateTitle">
       <div class="modal-panel file-create-panel">
         <div class="modal-header">
           <h2 id="fileCreateTitle">新建</h2>
           <button id="fileCreateCloseButton" class="icon-button" type="button" aria-label="关闭">×</button>
         </div>
         <div class="file-create-body">
-          <div class="file-create-tabs" role="tablist" aria-label="新建类型">
-            <button class="active" type="button" data-file-create-type="file">文件</button>
-            <button type="button" data-file-create-type="directory">目录</button>
+          <div class="file-create-tabs" role="group" aria-label="新建类型">
+            <button class="active" type="button" aria-pressed="true" tabindex="0" data-file-create-type="file">文件</button>
+            <button type="button" aria-pressed="false" tabindex="-1" data-file-create-type="directory">目录</button>
           </div>
           <label class="field-block file-create-field">
             <input id="fileCreateNameInput" type="text" placeholder="名称" autocomplete="off" />
@@ -1107,9 +1260,9 @@
           <button id="fileCreateSubmitButton" class="action-button primary" type="button">创建</button>
         </div>
       </div>
-    </div>
+    </dialog>
 
-    <div id="fileDeleteModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="fileDeleteTitle">
+    <dialog id="fileDeleteModal" class="modal" aria-labelledby="fileDeleteTitle">
       <div class="modal-panel file-confirm-panel">
         <div class="modal-header">
           <h2 id="fileDeleteTitle">批量删除</h2>
@@ -1121,9 +1274,9 @@
           <button id="fileDeleteConfirmButton" class="action-button primary danger-button" type="button">确定</button>
         </div>
       </div>
-    </div>
+    </dialog>
 
-    <div id="fileMoveModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="fileMoveTitle">
+    <dialog id="fileMoveModal" class="modal" aria-labelledby="fileMoveTitle">
       <div class="modal-panel file-move-panel">
         <div class="modal-header">
           <h2 id="fileMoveTitle">选择目标目录</h2>
@@ -1137,9 +1290,9 @@
           <button id="fileMoveConfirmButton" class="action-button primary" type="button">确定</button>
         </div>
       </div>
-    </div>
+    </dialog>
 
-    <div id="fileRenameModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="fileRenameTitle">
+    <dialog id="fileRenameModal" class="modal" aria-labelledby="fileRenameTitle">
       <div class="modal-panel file-rename-panel">
         <div class="modal-header">
           <h2 id="fileRenameTitle">重命名</h2>
@@ -1154,9 +1307,9 @@
           <button id="fileRenameSubmitButton" class="action-button primary" type="button">确定</button>
         </div>
       </div>
-    </div>
+    </dialog>
 
-    <div id="fileAuthModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="fileAuthTitle">
+    <dialog id="fileAuthModal" class="modal" aria-labelledby="fileAuthTitle">
       <div class="modal-panel file-auth-panel">
         <div class="modal-header">
           <div>
@@ -1175,12 +1328,90 @@
           <button id="fileAuthSubmitButton" class="action-button primary" type="button">打开文件</button>
         </div>
       </div>
-    </div>
+    </dialog>
 
-    <div id="toast" class="toast hidden"></div>
+    <dialog id="updateReleaseModal" class="modal" aria-labelledby="updateReleaseTitle">
+      <div class="modal-panel update-release-panel">
+        <div class="modal-header">
+          <div>
+            <p class="eyebrow">RocketCatShell Releases</p>
+            <h2 id="updateReleaseTitle">选择版本</h2>
+          </div>
+          <button id="updateReleaseCloseButton" class="icon-button" type="button" aria-label="关闭">×</button>
+        </div>
+        <p class="update-modal-note">版本按 SemVer 降序排列。v0.2.1 及更早版本不会出现；需要新基础镜像或系统依赖的版本必须通过正式 Docker 部署脚本更新。</p>
+        <div id="updateReleaseList" class="update-release-list" aria-live="polite"></div>
+        <div class="modal-footer">
+          <button id="updateReleaseCancelButton" class="action-button subtle" type="button">关闭</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="updateConfirmModal" class="modal" aria-labelledby="updateConfirmTitle">
+      <div class="modal-panel update-confirm-panel">
+        <div class="modal-header">
+          <div>
+            <p class="eyebrow">Version Transaction</p>
+            <h2 id="updateConfirmTitle">确认切换版本</h2>
+          </div>
+          <button id="updateConfirmCloseButton" class="icon-button" type="button" aria-label="关闭">×</button>
+        </div>
+        <div class="update-confirm-summary">
+          <span id="updateConfirmAction" class="release-action-label">-</span>
+          <strong id="updateConfirmVersion">-</strong>
+        </div>
+        <p id="updateConfirmMessage" class="update-confirm-message">服务会在更新包完成下载与安全校验后重启。持久数据和用户插件不会被替换。</p>
+        <div class="update-protection-list">
+          <span>事务备份</span>
+          <span>哈希校验</span>
+          <span>健康检查</span>
+          <span>失败自动回滚</span>
+        </div>
+        <div class="modal-footer">
+          <button id="updateConfirmCancelButton" class="action-button subtle" type="button">取消</button>
+          <button id="updateConfirmSubmitButton" class="action-button primary" type="button">确认并重启</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="confirmModal" class="modal" aria-labelledby="confirmModalTitle" aria-describedby="confirmModalMessage">
+      <div class="modal-panel confirm-panel">
+        <div class="modal-header">
+          <div>
+            <p id="confirmModalKicker" class="eyebrow">CONFIRM ACTION</p>
+            <h2 id="confirmModalTitle">确认操作</h2>
+          </div>
+          <button id="confirmModalCloseButton" class="icon-button" type="button" aria-label="关闭">×</button>
+        </div>
+        <p id="confirmModalMessage" class="file-confirm-message"></p>
+        <div class="modal-footer">
+          <button id="confirmModalCancelButton" class="action-button subtle" type="button">取消</button>
+          <button id="confirmModalSubmitButton" class="action-button primary" type="button">确认</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="updateRestartOverlay" class="update-restart-overlay" aria-labelledby="updateRestartTitle" aria-describedby="updateRestartMessage">
+      <div class="update-restart-panel" tabindex="-1">
+        <div id="updateRestartSpinner" class="update-restart-spinner" aria-hidden="true"></div>
+        <p class="version-management-kicker">ROCKETCATSHELL UPDATE</p>
+        <h2 id="updateRestartTitle">正在准备重启</h2>
+        <div class="update-transaction-live" role="status" aria-live="assertive" aria-atomic="true">
+          <p id="updateRestartMessage">更新事务已建立，正在等待服务安全退出。</p>
+        </div>
+        <div class="update-restart-track"><span id="updateRestartProgress"></span></div>
+        <code id="updateRestartTransaction">-</code>
+        <button id="updateRestartRetryButton" class="action-button subtle hidden" type="button">重新检查</button>
+      </div>
+    </dialog>
+
+    <div id="toast" class="toast-region" aria-label="通知"></div>
+
+    <p id="cardOrderInstructions" class="visually-hidden">拖动卡片空白区域可以调整顺序；按钮、开关、链接和文字区域不会开始拖动。键盘聚焦卡片后，按空格或回车选择，使用方向键移动，Home 或 End 移至首尾，再按空格或回车保存，Escape 取消。</p>
+    <div id="cardOrderLiveRegion" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
 
     <script src="/static/vendor/xterm/xterm.js?v=20260615diagicons1"></script>
     <script src="/static/vendor/xterm/addon-fit.js?v=20260615diagicons1"></script>
-    <script src="/static/app.js?v=20260623plugindashboard3"></script>
+    <script src="/static/app.js?v=20260814linux0221"></script>
   </body>
 </html>

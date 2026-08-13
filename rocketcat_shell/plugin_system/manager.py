@@ -28,6 +28,8 @@ _PLUGIN_PREFIX = "rocketcat_plugin_"
 _MISSING = object()
 _DASHBOARD_SESSION_TTL_SECONDS = 3600.0
 _DASHBOARD_SESSION_MAX_ENTRIES = 256
+_PLUGIN_SCAN_CACHE_TTL_SECONDS = 2.0
+_MAX_SAFE_INTEGER = 9_007_199_254_740_991
 _ENABLED_SCHEMA = {
     "description": "启用插件",
     "type": "bool",
@@ -139,6 +141,7 @@ class RocketCatPluginManager:
         self.layout = layout
         self._plugins: dict[str, PluginDescriptor] = {}
         self._plugins_signature: tuple[tuple[str, int, int, bool], ...] | None = None
+        self._plugins_signature_valid_until = 0.0
         self._states: dict[str, _GlobalPluginState] = {}
         self._runtime_attachments: dict[int, _RuntimeAttachment] = {}
         self._plugin_generations: dict[str, int] = {}
@@ -161,9 +164,17 @@ class RocketCatPluginManager:
             self._dashboard_sessions.clear()
             self._cancel_dashboard_sse_tasks_locked()
 
-    def refresh(self) -> None:
+    def refresh(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if (
+            not force
+            and self._plugins_signature is not None
+            and now < self._plugins_signature_valid_until
+        ):
+            return
         signature = self._build_plugins_signature()
         if signature == self._plugins_signature:
+            self._plugins_signature_valid_until = now + _PLUGIN_SCAN_CACHE_TTL_SECONDS
             return
 
         discovered: dict[str, PluginDescriptor] = {}
@@ -177,10 +188,11 @@ class RocketCatPluginManager:
                 descriptor = self._build_descriptor(child)
                 discovered[descriptor.plugin_id] = descriptor
         self._plugins = discovered
-        self._plugins_signature = self._build_plugins_signature()
+        self._plugins_signature = signature
+        self._plugins_signature_valid_until = now + _PLUGIN_SCAN_CACHE_TTL_SECONDS
 
     async def reconcile_all(self, *, force: bool = False) -> None:
-        self.refresh()
+        self.refresh(force=force)
         async with self._lock:
             for plugin_id in list(self._states):
                 if plugin_id not in self._plugins:
@@ -194,7 +206,19 @@ class RocketCatPluginManager:
                         await self._deactivate_state_locked(plugin_id)
                     continue
                 if state is None or force:
-                    await self._replace_plugin_locked(plugin_id, descriptor)
+                    try:
+                        await self._replace_plugin_locked(plugin_id, descriptor)
+                    except Exception as exc:
+                        if state is not None:
+                            await self._deactivate_state_locked(plugin_id)
+                        descriptor.load_error = f"插件加载失败：{exc}"
+                        self._plugins[plugin_id] = descriptor
+                        logger.error(
+                            "[RocketCatShell] 插件 %s 加载失败，已隔离该插件：%s",
+                            plugin_id,
+                            exc,
+                            exc_info=True,
+                        )
 
     def list_plugins(self) -> list[dict[str, Any]]:
         self.refresh()
@@ -210,6 +234,41 @@ class RocketCatPluginManager:
             )
             items.append(item)
         return items
+
+    def export_configuration_configs(self) -> dict[str, dict[str, Any]]:
+        """Return complete schema-normalized configs for every installed plugin."""
+        self.refresh()
+        exported: dict[str, dict[str, Any]] = {}
+        if self.layout.plugins_config_dir.exists():
+            for config_path in sorted(self.layout.plugins_config_dir.glob("*_config.json")):
+                plugin_id = config_path.name[:-len("_config.json")]
+                raw_config = read_json(config_path, {})
+                if isinstance(raw_config, dict):
+                    exported[plugin_id] = copy.deepcopy(raw_config)
+        for plugin_id, descriptor in self._plugins.items():
+            exported[plugin_id] = self._normalize_descriptor_config(
+                descriptor,
+                descriptor.config,
+            )
+        return exported
+
+    def normalize_import_configs(
+        self,
+        plugin_configs: dict[str, dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        """Normalize and validate known plugin configs without writing files."""
+        self.refresh()
+        normalized: dict[str, dict[str, Any]] = {}
+        for plugin_id, plugin_config in plugin_configs.items():
+            descriptor = self._plugins.get(plugin_id)
+            if descriptor is None:
+                normalized[plugin_id] = copy.deepcopy(plugin_config)
+                continue
+            normalized[plugin_id] = self._normalize_descriptor_config(
+                descriptor,
+                plugin_config,
+            )
+        return normalized
 
     def diagnostic_summary(self) -> dict[str, int]:
         return {
@@ -245,12 +304,7 @@ class RocketCatPluginManager:
         descriptor = self._require_plugin(plugin_id)
         merged = copy.deepcopy(descriptor.config)
         merged.update(payload)
-        normalized = self._normalize_object_value(
-            {"type": "object", "items": descriptor.schema},
-            merged,
-        )
-        if not isinstance(normalized, dict):
-            raise ValueError("插件配置格式无效")
+        normalized = self._normalize_descriptor_config(descriptor, merged)
         previous_config_bytes = (
             descriptor.config_path.read_bytes()
             if descriptor.config_path.exists()
@@ -840,6 +894,7 @@ class RocketCatPluginManager:
 
     def _invalidate_cache(self) -> None:
         self._plugins_signature = None
+        self._plugins_signature_valid_until = 0.0
 
     def _build_plugins_signature(self) -> tuple[tuple[str, int, int, bool], ...]:
         paths: list[Path] = [self.layout.plugins_dir, self.layout.plugins_config_dir]
@@ -877,9 +932,17 @@ class RocketCatPluginManager:
             except OSError:
                 signature.append((str(path), 0, 0, False))
                 continue
-            signature.append(
-                (str(path), int(stat.st_mtime_ns), int(stat.st_size), path.is_dir())
-            )
+            is_directory = path.is_dir()
+            if is_directory:
+                # Directory mtimes also change for ignored runtime artifacts such as
+                # __pycache__. The enumerated path set already captures meaningful
+                # plugin/page additions and removals, so only track directory
+                # existence here and retain file metadata for content changes.
+                signature.append((str(path), 0, 0, True))
+            else:
+                signature.append(
+                    (str(path), int(stat.st_mtime_ns), int(stat.st_size), False)
+                )
         return tuple(signature)
 
     def _read_metadata(self, path: Path) -> dict[str, Any]:
@@ -938,6 +1001,64 @@ class RocketCatPluginManager:
                 for key, item_schema in items.items()
             }
         return self._normalize_value(schema, value, None)
+
+    def _normalize_descriptor_config(
+        self,
+        descriptor: PluginDescriptor,
+        value: Any,
+    ) -> dict[str, Any]:
+        normalized = self._normalize_object_value(
+            {"type": "object", "items": descriptor.schema},
+            value,
+        )
+        if not isinstance(normalized, dict):
+            raise ValueError(f"插件 {descriptor.plugin_id} 的配置格式无效")
+
+        unique_groups: dict[str, dict[int, str]] = {}
+        for field_name, field_schema in descriptor.schema.items():
+            if not isinstance(field_schema, dict):
+                continue
+            if str(field_schema.get("ui_component") or "") == "integer_list":
+                normalized[field_name] = self._normalize_integer_list(
+                    normalized.get(field_name),
+                    field_name=field_name,
+                )
+            group_name = str(field_schema.get("unique_across") or "").strip()
+            if not group_name:
+                continue
+            values = normalized.get(field_name)
+            if not isinstance(values, list):
+                continue
+            seen_values = unique_groups.setdefault(group_name, {})
+            for item in values:
+                if item in seen_values:
+                    other_field = seen_values[item]
+                    raise ValueError(
+                        f"插件 {descriptor.plugin_id} 的表情 ID {item} 同时出现在 "
+                        f"{other_field} 和 {field_name}，请确保四种状态互不重复"
+                    )
+                seen_values[item] = field_name
+        return normalized
+
+    def _normalize_integer_list(self, value: Any, *, field_name: str) -> list[int]:
+        if not isinstance(value, list):
+            raise ValueError(f"{field_name} 必须是整数列表")
+        normalized: list[int] = []
+        seen: set[int] = set()
+        for item in value:
+            if isinstance(item, bool):
+                raise ValueError(f"{field_name} 只能包含非负安全整数")
+            if isinstance(item, int):
+                candidate = item
+            else:
+                raise ValueError(f"{field_name} 只能包含非负安全整数")
+            if candidate < 0 or candidate > _MAX_SAFE_INTEGER:
+                raise ValueError(f"{field_name} 只能包含非负安全整数")
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            normalized.append(candidate)
+        return normalized
 
     def _normalize_value(
         self,

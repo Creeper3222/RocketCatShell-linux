@@ -1,0 +1,7 @@
+name: rocketcat_plugin_dashboard_fixture
+display_name: Dashboard Fixture
+desc: Deterministic plugin Dashboard used by the browser validation suite.
+version: v0.0.0-test
+author: RocketCatShell Tests
+repo: ""
+dashboard_page: dashboard

@@ -7,6 +7,7 @@ import os
 import tempfile
 import uuid
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Optional
 
 from cryptography.hazmat.primitives import hashes, padding as sym_padding
@@ -15,6 +16,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
+from rocketcat_shell.crypto_executor import CRYPTO_EXECUTOR
 from rocketcat_shell.logger import logger
 
 from .json_codec import json_dumps_compact, json_loads
@@ -203,6 +205,31 @@ def _decrypt_private_key_from_server(
     return _binary_encode(plaintext)
 
 
+def _load_existing_key_pair(
+    user_id: str,
+    password: str,
+    public_key: str,
+    private_key: str,
+) -> tuple[str, rsa.RSAPrivateKey]:
+    private_key_json = _decrypt_private_key_from_server(user_id, password, private_key)
+    return public_key, _import_private_jwk(private_key_json)
+
+
+def _generate_key_pair(
+    user_id: str,
+    password: str,
+) -> tuple[str, str, rsa.RSAPrivateKey]:
+    private_key_obj = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_key_json = _json_dumps(_export_public_jwk(private_key_obj.public_key()))
+    private_key_json = _json_dumps(_export_private_jwk(private_key_obj))
+    encrypted_private_key = _encrypt_private_key_for_server(
+        user_id,
+        password,
+        private_key_json,
+    )
+    return public_key_json, encrypted_private_key, private_key_obj
+
+
 @dataclass
 class SessionKey:
     key_id: str
@@ -341,22 +368,24 @@ class RocketChatE2EEManager:
             private_key = data.get("private_key")
 
             if public_key and private_key:
-                private_key_json = _decrypt_private_key_from_server(
-                    self.client.user_id,
-                    self.password,
-                    private_key,
+                self.public_key_json, self.private_key = await asyncio.get_running_loop().run_in_executor(
+                    CRYPTO_EXECUTOR,
+                    partial(
+                        _load_existing_key_pair,
+                        self.client.user_id,
+                        self.password,
+                        public_key,
+                        private_key,
+                    ),
                 )
-                self.public_key_json = public_key
-                self.private_key = _import_private_jwk(private_key_json)
             else:
-                private_key_obj = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-                public_key_obj = private_key_obj.public_key()
-                public_key_json = _json_dumps(_export_public_jwk(public_key_obj))
-                private_key_json = _json_dumps(_export_private_jwk(private_key_obj))
-                encrypted_private_key = _encrypt_private_key_for_server(
-                    self.client.user_id,
-                    self.password,
-                    private_key_json,
+                public_key_json, encrypted_private_key, private_key_obj = await asyncio.get_running_loop().run_in_executor(
+                    CRYPTO_EXECUTOR,
+                    partial(
+                        _generate_key_pair,
+                        self.client.user_id,
+                        self.password,
+                    ),
                 )
                 await self._rest_post(
                     "/api/v1/e2e.setUserPublicAndPrivateKeys",
@@ -531,6 +560,23 @@ class RocketChatE2EEManager:
         if not session_key:
             return None
 
+        return await asyncio.get_running_loop().run_in_executor(
+            CRYPTO_EXECUTOR,
+            partial(
+                self._prepare_encrypted_upload_sync,
+                file_name=file_name,
+                mime_type=mime_type,
+                file_path=file_path,
+            ),
+        )
+
+    def _prepare_encrypted_upload_sync(
+        self,
+        *,
+        file_name: str,
+        mime_type: str,
+        file_path: str,
+    ) -> EncryptedMediaUpload:
         iv = os.urandom(16)
         file_key = os.urandom(32)
         encryptor = Cipher(algorithms.AES(file_key), modes.CTR(iv)).encryptor()

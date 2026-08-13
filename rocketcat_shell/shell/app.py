@@ -7,12 +7,13 @@ import webbrowser
 from typing import Any
 
 from ..layout import ProjectLayout
-from ..logger import configure_logging, logger
+from ..logger import configure_logging, logger, shutdown_logging
 from ..models import DEFAULT_WEBUI_ACCESS_PASSWORD
 from ..settings import load_or_create_shell_settings
 from .instance_lock import ShellInstanceLock, SingleInstanceError
 from .manager import ShellManager
 from .webui import ShellWebUI
+from ..updates import exec_pending_container_update
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -99,6 +100,7 @@ async def _run_async(args: argparse.Namespace) -> int:
         await webui.start()
         try:
             await manager.start_enabled_runtimes("webui ready")
+            webui.mark_application_ready()
             logger.info("[RocketCatShell] WebUI started at %s", webui.url)
 
             if settings.auto_open_browser and not args.no_browser:
@@ -113,5 +115,12 @@ async def _run_async(args: argparse.Namespace) -> int:
             await manager.shutdown()
     finally:
         instance_lock.release()
+        shutdown_logging(timeout=10.0)
+
+    # In a Linux image RocketCatShell is PID 1. The update request only writes
+    # and validates a handoff while the WebUI is alive; after every subsystem
+    # has stopped cleanly, replace this process with the transaction-local
+    # frozen helper. A normal shutdown has no pending marker and returns here.
+    exec_pending_container_update(layout.project_root)
 
     return 0

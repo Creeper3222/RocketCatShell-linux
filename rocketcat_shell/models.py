@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 
@@ -27,6 +27,25 @@ DEFAULT_LOG_FILE_MAX_BYTES = 10 * 1024 * 1024
 DEFAULT_LOG_FILE_BACKUP_COUNT = 3
 DEFAULT_TERMINAL_MAX_SESSIONS = 6
 DEFAULT_TERMINAL_IDLE_TIMEOUT_SECONDS = 0
+
+
+def _coerce_ui_card_order(value: Any) -> dict[str, list[str]]:
+    source = value if isinstance(value, Mapping) else {}
+    normalized: dict[str, list[str]] = {"bots": [], "plugins": []}
+    for scope in normalized:
+        raw_items = source.get(scope)
+        if not isinstance(raw_items, list):
+            continue
+        seen: set[str] = set()
+        for raw_item in raw_items:
+            if not isinstance(raw_item, str):
+                continue
+            item = raw_item.strip()
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            normalized[scope].append(item)
+    return normalized
 
 
 def _coerce_bool(value: Any, default: bool = False) -> bool:
@@ -103,6 +122,9 @@ class ShellSettings:
     log_file_backup_count: int = DEFAULT_LOG_FILE_BACKUP_COUNT
     terminal_max_sessions: int = DEFAULT_TERMINAL_MAX_SESSIONS
     terminal_idle_timeout_seconds: int = DEFAULT_TERMINAL_IDLE_TIMEOUT_SECONDS
+    ui_card_order: dict[str, list[str]] = field(
+        default_factory=lambda: {"bots": [], "plugins": []}
+    )
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any] | None) -> "ShellSettings":
@@ -198,6 +220,7 @@ class ShellSettings:
                 ),
                 DEFAULT_TERMINAL_IDLE_TIMEOUT_SECONDS,
             ),
+            ui_card_order=_coerce_ui_card_order(data.get("ui_card_order")),
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -226,6 +249,10 @@ class ShellSettings:
             "log_file_backup_count": self.log_file_backup_count,
             "terminal_max_sessions": self.terminal_max_sessions,
             "terminal_idle_timeout_seconds": self.terminal_idle_timeout_seconds,
+            "ui_card_order": {
+                "bots": list(self.ui_card_order.get("bots", [])),
+                "plugins": list(self.ui_card_order.get("plugins", [])),
+            },
         }
 
 

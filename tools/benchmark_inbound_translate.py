@@ -5,16 +5,20 @@ import asyncio
 import copy
 import importlib.util
 import inspect
+import json
 import math
+import os
 import statistics
 import sys
 import tempfile
 import time
 import types
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
+
+import psutil
 
 
 DEFAULT_SELF_ID = 910001
@@ -32,8 +36,19 @@ class ScenarioStats:
     mean_ms: float
     median_ms: float
     p95_ms: float
+    p99_ms: float
     minimum_ms: float
     maximum_ms: float
+    throughput_per_second: float
+    elapsed_seconds: float
+    cpu_seconds: float
+    rss_before_bytes: int
+    rss_after_bytes: int
+    rss_peak_bytes: int
+    threads_before: int
+    threads_after: int
+    handles_before: int
+    handles_after: int
 
 
 @dataclass(slots=True)
@@ -650,17 +665,87 @@ def create_translator(
     return translator, cleanup
 
 
-def summarize_timings(timings_ms: list[float]) -> ScenarioStats:
+def _percentile(ordered: list[float], percentile: float) -> float:
+    index = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * percentile) - 1))
+    return ordered[index]
+
+
+def _handle_count(process: psutil.Process) -> int:
+    return int(process.num_handles()) if hasattr(process, "num_handles") else 0
+
+
+def _materialize_iteration(
+    scenario: Scenario,
+    index: int,
+    *,
+    cache_mode: str,
+    run_number: int,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    token = f"run{run_number}-item{index}"
+    raw_msg = copy.deepcopy(scenario.raw_msg)
+    raw_msg["_id"] = f"{raw_msg.get('_id', scenario.name)}-{token}"
+    timestamp = raw_msg.get("ts")
+    if isinstance(timestamp, dict) and "$date" in timestamp:
+        timestamp["$date"] = int(timestamp["$date"]) + index + (run_number * 1_000_000)
+    if raw_msg.get("tmid"):
+        raw_msg["tmid"] = f"{raw_msg['tmid']}-{token}"
+    if cache_mode == "cold":
+        raw_msg["rid"] = f"{raw_msg.get('rid', 'room')}-{token}"
+        sender = raw_msg.get("u")
+        if isinstance(sender, dict):
+            sender["_id"] = f"{sender.get('_id', 'user')}-{token}"
+
+    quoted_messages: dict[str, dict[str, Any]] = {}
+    for quote_id, quote_payload in scenario.quoted_messages.items():
+        unique_quote_id = f"{quote_id}-{token}"
+        raw_msg["msg"] = str(raw_msg.get("msg") or "").replace(quote_id, unique_quote_id)
+        unique_quote = copy.deepcopy(quote_payload)
+        unique_quote["_id"] = unique_quote_id
+        if cache_mode == "cold":
+            unique_quote["rid"] = raw_msg["rid"]
+            quote_sender = unique_quote.get("u")
+            if isinstance(quote_sender, dict):
+                quote_sender["_id"] = f"{quote_sender.get('_id', 'quote-user')}-{token}"
+        quote_timestamp = unique_quote.get("ts")
+        if isinstance(quote_timestamp, dict) and "$date" in quote_timestamp:
+            quote_timestamp["$date"] = int(quote_timestamp["$date"]) + index + (run_number * 1_000_000)
+        quoted_messages[unique_quote_id] = unique_quote
+    return raw_msg, quoted_messages
+
+
+def summarize_timings(
+    timings_ms: list[float],
+    *,
+    elapsed_seconds: float,
+    cpu_seconds: float,
+    rss_before_bytes: int,
+    rss_after_bytes: int,
+    rss_peak_bytes: int,
+    threads_before: int,
+    threads_after: int,
+    handles_before: int,
+    handles_after: int,
+) -> ScenarioStats:
     if not timings_ms:
         raise ValueError("timings_ms cannot be empty")
     ordered = sorted(timings_ms)
-    p95_index = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * 0.95) - 1))
     return ScenarioStats(
         mean_ms=statistics.fmean(ordered),
         median_ms=statistics.median(ordered),
-        p95_ms=ordered[p95_index],
+        p95_ms=_percentile(ordered, 0.95),
+        p99_ms=_percentile(ordered, 0.99),
         minimum_ms=ordered[0],
         maximum_ms=ordered[-1],
+        throughput_per_second=len(ordered) / max(elapsed_seconds, 1e-9),
+        elapsed_seconds=elapsed_seconds,
+        cpu_seconds=cpu_seconds,
+        rss_before_bytes=rss_before_bytes,
+        rss_after_bytes=rss_after_bytes,
+        rss_peak_bytes=rss_peak_bytes,
+        threads_before=threads_before,
+        threads_after=threads_after,
+        handles_before=handles_before,
+        handles_after=handles_after,
     )
 
 
@@ -668,132 +753,254 @@ async def benchmark_scenario(
     branch: LoadedBranch,
     scenario: Scenario,
     args: argparse.Namespace,
+    *,
+    cache_mode: str,
+    execution_mode: str,
+    run_number: int,
 ) -> ScenarioStats:
-    with tempfile.TemporaryDirectory(prefix=f"rocketcat_bench_{branch.name}_{scenario.name}_") as temp_dir:
+    total_iterations = max(0, int(args.warmup)) + max(1, int(args.iterations))
+    materialized = [
+        _materialize_iteration(
+            scenario,
+            index,
+            cache_mode=cache_mode,
+            run_number=run_number,
+        )
+        for index in range(total_iterations)
+    ]
+    quoted_messages = {
+        quote_id: payload
+        for _raw, quotes in materialized
+        for quote_id, payload in quotes.items()
+    }
+    process = psutil.Process(os.getpid())
+    with tempfile.TemporaryDirectory(
+        prefix=f"rocketcat_bench_{branch.name}_{scenario.name}_{cache_mode}_{execution_mode}_"
+    ) as temp_dir:
         translator, cleanup = create_translator(
             branch,
             Path(temp_dir),
             args,
-            scenario.quoted_messages,
+            quoted_messages,
         )
-        timings_ms: list[float] = []
+
+        async def translate_one(raw_msg: dict[str, Any]) -> float:
+            started_at = time.perf_counter()
+            event = await translator.translate(copy.deepcopy(raw_msg))
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+            if event is None:
+                raise RuntimeError(
+                    f"{branch.name}:{scenario.name}:{cache_mode}:{execution_mode} returned no event"
+                )
+            return elapsed_ms
+
+        async def translate_many(payloads: list[dict[str, Any]]) -> list[float]:
+            if execution_mode == "serial":
+                return [await translate_one(payload) for payload in payloads]
+            results: list[float] = []
+            concurrency = max(2, int(args.concurrency))
+            for offset in range(0, len(payloads), concurrency):
+                results.extend(
+                    await asyncio.gather(
+                        *(translate_one(payload) for payload in payloads[offset : offset + concurrency])
+                    )
+                )
+            return results
+
         try:
-            total_iterations = max(0, int(args.warmup)) + max(1, int(args.iterations))
-            for index in range(total_iterations):
-                raw_msg = copy.deepcopy(scenario.raw_msg)
-                started_at = time.perf_counter()
-                event = await translator.translate(raw_msg)
-                elapsed_ms = (time.perf_counter() - started_at) * 1000.0
-                if event is None:
-                    raise RuntimeError(f"{branch.name}:{scenario.name} returned no event")
-                if index >= int(args.warmup):
-                    timings_ms.append(elapsed_ms)
+            warmup_payloads = [raw for raw, _quotes in materialized[: int(args.warmup)]]
+            if warmup_payloads:
+                await translate_many(warmup_payloads)
+            measured_payloads = [raw for raw, _quotes in materialized[int(args.warmup) :]]
+            cpu_before = process.cpu_times()
+            rss_before = process.memory_info().rss
+            threads_before = process.num_threads()
+            handles_before = _handle_count(process)
+            started_at = time.perf_counter()
+            timings_ms = await translate_many(measured_payloads)
+            elapsed_seconds = time.perf_counter() - started_at
+            cpu_after = process.cpu_times()
+            rss_after = process.memory_info().rss
+            threads_after = process.num_threads()
+            handles_after = _handle_count(process)
         finally:
             maybe_awaitable = cleanup()
             if inspect.isawaitable(maybe_awaitable):
                 await maybe_awaitable
-        return summarize_timings(timings_ms)
+        return summarize_timings(
+            timings_ms,
+            elapsed_seconds=elapsed_seconds,
+            cpu_seconds=(cpu_after.user + cpu_after.system) - (cpu_before.user + cpu_before.system),
+            rss_before_bytes=rss_before,
+            rss_after_bytes=rss_after,
+            rss_peak_bytes=max(rss_before, rss_after),
+            threads_before=threads_before,
+            threads_after=threads_after,
+            handles_before=handles_before,
+            handles_after=handles_after,
+        )
 
 
 async def run_branch(
     branch: LoadedBranch,
     scenarios: list[Scenario],
     args: argparse.Namespace,
+    *,
+    run_number: int,
 ) -> dict[str, ScenarioStats]:
     results: dict[str, ScenarioStats] = {}
+    cache_modes = ["warm", "cold"] if args.cache_mode == "both" else [args.cache_mode]
+    execution_modes = ["serial", "concurrent"] if args.execution_mode == "both" else [args.execution_mode]
     for scenario in scenarios:
-        results[scenario.name] = await benchmark_scenario(branch, scenario, args)
+        for cache_mode in cache_modes:
+            for execution_mode in execution_modes:
+                key = f"{scenario.name}:{cache_mode}:{execution_mode}"
+                results[key] = await benchmark_scenario(
+                    branch,
+                    scenario,
+                    args,
+                    cache_mode=cache_mode,
+                    execution_mode=execution_mode,
+                    run_number=run_number,
+                )
     return results
 
 
-def format_ratio(control_ms: float, rebuild_ms: float) -> str:
-    if control_ms <= 0:
+def _median_stats(runs: list[dict[str, ScenarioStats]]) -> dict[str, ScenarioStats]:
+    result: dict[str, ScenarioStats] = {}
+    for key in runs[0]:
+        values: dict[str, Any] = {}
+        for field in fields(ScenarioStats):
+            samples = [getattr(run[key], field.name) for run in runs]
+            median_value = statistics.median(samples)
+            if field.type is int or field.name.endswith(("_bytes", "_before", "_after")):
+                median_value = int(median_value)
+            values[field.name] = median_value
+        result[key] = ScenarioStats(**values)
+    return result
+
+
+def format_ratio(control_value: float, rebuild_value: float) -> str:
+    if control_value <= 0:
         return "n/a"
-    delta_percent = ((control_ms - rebuild_ms) / control_ms) * 100.0
+    delta_percent = ((control_value - rebuild_value) / control_value) * 100.0
     sign = "+" if delta_percent >= 0 else ""
     return f"{sign}{delta_percent:.1f}%"
 
 
 def print_summary(
-    scenarios: list[Scenario],
     control_results: dict[str, ScenarioStats],
     rebuild_results: dict[str, ScenarioStats],
     args: argparse.Namespace,
 ) -> None:
-    print("settings:")
     print(
-        "  profile={profile} iterations={iterations} warmup={warmup} message_window_size={window} room_info_delay_ms={room_delay:.3f} quote_fetch_delay_ms={quote_delay:.3f} media_delay_ms={media_delay:.3f}".format(
+        "settings: profile={profile} iterations={iterations} warmup={warmup} repeat={repeat} concurrency={concurrency}".format(
             profile=args.profile,
             iterations=args.iterations,
             warmup=args.warmup,
-            window=args.message_window_size,
-            room_delay=args.room_info_delay_ms,
-            quote_delay=args.quote_fetch_delay_ms,
-            media_delay=args.media_delay_ms,
+            repeat=args.repeat,
+            concurrency=args.concurrency,
         )
     )
-    print()
-    print("scenario           control_mean_ms   rebuild_mean_ms   delta_vs_control")
-    print("-----------------  ----------------  ----------------  ----------------")
-    for scenario in scenarios:
-        control_stats = control_results[scenario.name]
-        rebuild_stats = rebuild_results[scenario.name]
-        print(
-            f"{scenario.name:<17}  {control_stats.mean_ms:>16.3f}  {rebuild_stats.mean_ms:>16.3f}  {format_ratio(control_stats.mean_ms, rebuild_stats.mean_ms):>16}"
+    print("scenario:cache:mode                    control_p95  rebuild_p95  latency_delta  throughput_delta")
+    print("-------------------------------------  -----------  -----------  -------------  ----------------")
+    for key in control_results:
+        control = control_results[key]
+        rebuild = rebuild_results[key]
+        throughput_delta = (
+            ((rebuild.throughput_per_second - control.throughput_per_second) / control.throughput_per_second) * 100.0
+            if control.throughput_per_second > 0
+            else 0.0
         )
         print(
-            f"{'':<17}  control p95={control_stats.p95_ms:.3f} ms  rebuild p95={rebuild_stats.p95_ms:.3f} ms"
+            f"{key:<37}  {control.p95_ms:>11.3f}  {rebuild.p95_ms:>11.3f}  "
+            f"{format_ratio(control.p95_ms, rebuild.p95_ms):>13}  {throughput_delta:>+15.1f}%"
         )
 
 
 def parse_args() -> argparse.Namespace:
     default_root = Path(__file__).resolve().parents[1]
-    parser = argparse.ArgumentParser(description="Compare inbound translation latency between control and rebuild branches.")
-    parser.add_argument(
-        "--profile",
-        choices=["micro", "realistic"],
-        default="micro",
-        help="Benchmark profile preset. micro keeps the old zero-delay path; realistic adds modest fetch/media delays and richer scenarios.",
+    parser = argparse.ArgumentParser(
+        description="Compare unique inbound translation workloads between an explicit control checkout and candidate."
     )
+    parser.add_argument("--profile", choices=["micro", "realistic"], default="micro")
     parser.add_argument(
         "--control-root",
         type=Path,
-        default=default_root.parent / "rocketcat_shell",
-        help="Path to the control branch root",
+        required=True,
+        help="Explicit path to the frozen control checkout",
     )
+    parser.add_argument("--rebuild-root", type=Path, default=default_root)
+    parser.add_argument("--iterations", type=int, default=None)
+    parser.add_argument("--warmup", type=int, default=None)
+    parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--concurrency", type=int, default=8)
+    parser.add_argument("--cache-mode", choices=["warm", "cold", "both"], default="both")
     parser.add_argument(
-        "--rebuild-root",
-        type=Path,
-        default=default_root,
-        help="Path to the rebuild branch root",
+        "--execution-mode",
+        choices=["serial", "concurrent", "both"],
+        default="both",
     )
-    parser.add_argument("--iterations", type=int, default=None, help="Measured iterations per scenario")
-    parser.add_argument("--warmup", type=int, default=None, help="Warmup iterations per scenario")
-    parser.add_argument("--message-window-size", type=int, default=1000, help="Message window size for translator dependencies")
-    parser.add_argument("--room-info-delay-ms", type=float, default=None, help="Artificial delay for get_room_info")
-    parser.add_argument("--quote-fetch-delay-ms", type=float, default=None, help="Artificial delay for fetch_message_by_id")
-    parser.add_argument("--media-delay-ms", type=float, default=None, help="Artificial delay for media materialization")
+    parser.add_argument("--message-window-size", type=int, default=1000)
+    parser.add_argument("--room-info-delay-ms", type=float, default=None)
+    parser.add_argument("--quote-fetch-delay-ms", type=float, default=None)
+    parser.add_argument("--media-delay-ms", type=float, default=None)
+    parser.add_argument("--json-output", type=Path)
     parser.add_argument(
         "--scenario",
         action="append",
         dest="scenario",
         choices=["text", "quote", "thread", "image", "quote_image", "media_mix"],
-        help="Restrict benchmark to one or more named scenarios",
     )
-    return apply_profile_defaults(parser.parse_args())
+    args = apply_profile_defaults(parser.parse_args())
+    args.repeat = max(1, int(args.repeat))
+    args.concurrency = max(2, int(args.concurrency))
+    return args
 
 
 async def async_main(args: argparse.Namespace) -> int:
-    control_branch = load_branch("control", args.control_root)
-    rebuild_branch = load_branch("rebuild", args.rebuild_root)
-
+    if not args.control_root.resolve().is_dir():
+        raise FileNotFoundError(f"Control checkout not found: {args.control_root}")
+    control_branch = load_branch("control", args.control_root.resolve())
+    rebuild_branch = load_branch("rebuild", args.rebuild_root.resolve())
     scenario_map = make_scenarios()
-    scenario_names = args.scenario or ["text", "quote", "thread", "image"]
-    scenarios = [scenario_map[name] for name in scenario_names]
+    scenarios = [scenario_map[name] for name in args.scenario]
 
-    control_results = await run_branch(control_branch, scenarios, args)
-    rebuild_results = await run_branch(rebuild_branch, scenarios, args)
-    print_summary(scenarios, control_results, rebuild_results, args)
+    control_runs: list[dict[str, ScenarioStats]] = []
+    rebuild_runs: list[dict[str, ScenarioStats]] = []
+    for run_number in range(1, args.repeat + 1):
+        control_runs.append(await run_branch(control_branch, scenarios, args, run_number=run_number))
+        rebuild_runs.append(await run_branch(rebuild_branch, scenarios, args, run_number=run_number))
+    control_median = _median_stats(control_runs)
+    rebuild_median = _median_stats(rebuild_runs)
+    print_summary(control_median, rebuild_median, args)
+
+    if args.json_output:
+        payload = {
+            "schema_version": 1,
+            "generated_at": time.time(),
+            "settings": {
+                "profile": args.profile,
+                "iterations": args.iterations,
+                "warmup": args.warmup,
+                "repeat": args.repeat,
+                "concurrency": args.concurrency,
+                "cache_mode": args.cache_mode,
+                "execution_mode": args.execution_mode,
+                "control_root": str(args.control_root.resolve()),
+                "candidate_root": str(args.rebuild_root.resolve()),
+            },
+            "runs": {
+                "control": [{key: asdict(value) for key, value in run.items()} for run in control_runs],
+                "candidate": [{key: asdict(value) for key, value in run.items()} for run in rebuild_runs],
+            },
+            "median": {
+                "control": {key: asdict(value) for key, value in control_median.items()},
+                "candidate": {key: asdict(value) for key, value in rebuild_median.items()},
+            },
+        }
+        args.json_output.parent.mkdir(parents=True, exist_ok=True)
+        args.json_output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return 0
 
 

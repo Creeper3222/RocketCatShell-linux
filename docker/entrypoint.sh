@@ -6,6 +6,9 @@ CONFIG_DIR="$APP_DIR/config"
 PLUGINS_DIR="$APP_DIR/data/plugins"
 BUILTIN_PLUGINS_DIR="/opt/rocketcat/builtin_plugins"
 EXAMPLES_DIR="/opt/rocketcat/examples"
+FROZEN_UPDATE_HELPER="/opt/rocketcat/update_helper.py"
+UPDATE_DIR="$APP_DIR/data/update"
+IMAGE_VERSION="${ROCKETCAT_IMAGE_VERSION:-v0.2.2}"
 
 mkdir -p \
     "$CONFIG_DIR/plugins_config" \
@@ -14,7 +17,19 @@ mkdir -p \
     "$APP_DIR/data/user_identity" \
     "$PLUGINS_DIR" \
     "$APP_DIR/data/plugin_data" \
+    "$UPDATE_DIR" \
     "$APP_DIR/logs"
+
+export ROCKETCAT_IMAGE_VERSION="$IMAGE_VERSION"
+export ROCKETCAT_CONTAINER_RUNTIME_GENERATION="1"
+
+# The helper is copied into the immutable image layer. It is deliberately run
+# before plugin seeding so an interrupted replacement is restored before any
+# image-owned files can be refreshed.
+if ! python "$FROZEN_UPDATE_HELPER" recover "$APP_DIR"; then
+    echo "[entrypoint] update transaction recovery failed; refusing to start" >&2
+    exit 70
+fi
 
 if [ ! -f "$CONFIG_DIR/shell.json" ]; then
     python - <<'PY'
@@ -55,11 +70,29 @@ fi
 
 python - <<'PY'
 import hashlib
+import json
+import os
 import shutil
 from pathlib import Path
 
 builtin_root = Path("/opt/rocketcat/builtin_plugins")
 plugins_root = Path("/app/data/plugins")
+runtime_path = Path("/app/data/update/runtime.json")
+image_version = os.environ.get("ROCKETCAT_IMAGE_VERSION", "v0.2.2")
+
+runtime_version = image_version
+if runtime_path.is_file() and not runtime_path.is_symlink():
+    try:
+        payload = json.loads(runtime_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        payload = {}
+    if isinstance(payload, dict):
+        runtime_version = str(payload.get("runtime_version") or image_version)
+
+# A writable-layer update owns its built-in plugin copies until the container
+# is recreated. Recreating the container removes runtime.json and re-enables
+# the normal image seed, returning code and built-ins to the image version.
+refresh_from_image = runtime_version == image_version
 
 
 def digest_dir(path: Path) -> str:
@@ -85,6 +118,13 @@ for plugin_dir in builtin_root.iterdir():
         print(f"[entrypoint] seeded builtin plugin: {plugin_dir.name}")
         continue
 
+    if not refresh_from_image:
+        print(
+            f"[entrypoint] preserving writable-layer builtin plugin: {plugin_dir.name} "
+            f"(runtime={runtime_version}, image={image_version})"
+        )
+        continue
+
     if digest_dir(plugin_dir) == digest_dir(target_dir):
         continue
 
@@ -97,7 +137,7 @@ for plugin_dir in builtin_root.iterdir():
 PY
 
 if [ "$#" -eq 0 ]; then
-    set -- python -m rocketcat_shell --no-browser
+    set -- python "$FROZEN_UPDATE_HELPER" run "$APP_DIR"
 fi
 
 exec "$@"

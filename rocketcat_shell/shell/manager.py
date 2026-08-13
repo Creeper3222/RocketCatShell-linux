@@ -17,15 +17,23 @@ from ..bridge.runtime import BridgeRuntime
 from ..bridge.user_identity import UserIdentityRegistry
 from ..diagnostics import build_runtime_diagnostic_item, collect_cached_host_diagnostics_with_meta
 from ..layout import ProjectLayout
-from ..logger import logger
+from ..logger import logger, logging_diagnostic_snapshot
 from ..models import BotRecord, DEFAULT_WEBUI_ACCESS_PASSWORD, ShellSettings
 from ..plugin_system import RocketCatPluginManager
+from ..performance import EventLoopLagMonitor
 from ..registry import BotRegistry
 from ..settings import load_or_create_shell_settings, read_json, write_json
+from ..updates import UpdateService
 
 
 ROCKETCAT_CONFIG_MARKER_FIELD = "Is rocketcat config"
 _HOST_DIAGNOSTICS_CACHE_TTL_SECONDS = 3.0
+_CARD_ORDER_MAX_ITEMS = 10_000
+_CARD_ORDER_MAX_ID_LENGTH = 256
+
+
+class CardOrderConflictError(ValueError):
+    """Raised when a saved order no longer matches the current entity set."""
 
 
 class ShellManager:
@@ -35,6 +43,7 @@ class ShellManager:
         self.registry = BotRegistry(layout.bot_registry_path)
         self.plugin_manager = RocketCatPluginManager(layout)
         self.media_publication = MediaPublicationService()
+        self.updates = UpdateService(layout.project_root, layout.project_root)
         self.bots: list[BotRecord] = []
         self.runtimes: dict[str, BridgeRuntime] = {}
         self._runtime_reload_counts: dict[str, int] = {}
@@ -44,9 +53,11 @@ class ShellManager:
         self._webui_host: str | None = None
         self._webui_requested_port: int | None = None
         self._webui_actual_port: int | None = None
+        self.event_loop_lag = EventLoopLagMonitor()
 
     async def initialize(self, *, start_runtimes: bool = True) -> None:
         self.layout.ensure_directories()
+        await self.event_loop_lag.start()
         await self.plugin_manager.initialize()
         self.settings = load_or_create_shell_settings(self.layout.shell_settings_path)
         self.bots = self.registry.load(defaults=self.settings)
@@ -65,8 +76,13 @@ class ShellManager:
 
     async def shutdown(self) -> None:
         self._stop_event.set()
-        await self._stop_all_runtimes()
-        await self.plugin_manager.shutdown()
+        try:
+            async with asyncio.timeout(30.0):
+                await self._stop_all_runtimes()
+                await self.plugin_manager.shutdown()
+        except asyncio.TimeoutError:
+            logger.error("[RocketCatShell] shutdown exceeded the 30 second safety limit")
+        await self.event_loop_lag.stop()
         self.clear_webui_runtime()
         logger.info("[RocketCatShell] shutdown complete.")
 
@@ -91,20 +107,37 @@ class ShellManager:
     async def start_enabled_runtimes(self, reason: str = "webui ready") -> None:
         await self._reconcile_runtimes(reason)
 
-    def build_status_payload(self) -> dict[str, Any]:
+    def build_status_payload(self, *, compact: bool = False) -> dict[str, Any]:
         settings = self._require_settings()
         actual_port = self._webui_actual_port or settings.webui_port
         plugin_diagnostics = self.plugin_manager.diagnostic_summary()
+        summary = {
+            "bot_count": len(self.bots),
+            "enabled_bot_count": sum(1 for bot in self.bots if bot.enabled),
+            "active_runtime_count": sum(1 for runtime in self.runtimes.values() if runtime.started),
+            "plugin_count": len(self.plugin_manager.list_plugins()),
+            "plugin_global_instance_count": plugin_diagnostics["global_instance_count"],
+            "plugin_runtime_binding_count": plugin_diagnostics["runtime_binding_count"],
+            "user_identity_algorithm": "sha256-linear-v1",
+        }
+        webui = {
+            "host": self._webui_host or settings.webui_host,
+            "requested_port": settings.webui_port,
+            "port": actual_port,
+            "auth_enabled": bool(settings.webui_access_password),
+            "access_url": f"http://{self._webui_host or settings.webui_host}:{actual_port}/",
+        }
+        if compact:
+            return {
+                "product": "RocketCat",
+                "version": __version__,
+                "webui": {"port": actual_port},
+                "summary": summary,
+            }
         return {
             "product": "RocketCat",
             "version": __version__,
-            "webui": {
-                "host": self._webui_host or settings.webui_host,
-                "requested_port": settings.webui_port,
-                "port": actual_port,
-                "auth_enabled": bool(settings.webui_access_password),
-                "access_url": f"http://{self._webui_host or settings.webui_host}:{actual_port}/",
-            },
+            "webui": webui,
             "paths": {
                 "project_root": str(self.layout.project_root),
                 "config_dir": str(self.layout.config_dir),
@@ -115,15 +148,7 @@ class ShellManager:
                 "plugin_data_dir": str(self.layout.plugin_data_dir),
                 "logs_dir": str(self.layout.logs_dir),
             },
-            "summary": {
-                "bot_count": len(self.bots),
-                "enabled_bot_count": sum(1 for bot in self.bots if bot.enabled),
-                "active_runtime_count": sum(1 for runtime in self.runtimes.values() if runtime.started),
-                "plugin_count": len(self.plugin_manager.list_plugins()),
-                "plugin_global_instance_count": plugin_diagnostics["global_instance_count"],
-                "plugin_runtime_binding_count": plugin_diagnostics["runtime_binding_count"],
-                "user_identity_algorithm": "sha256-linear-v1",
-            },
+            "summary": summary,
             "shell_settings": self._serialize_shell_settings(settings, mask_secrets=True),
             "bots": [self._serialize_bot(bot, mask_secrets=True) for bot in self.bots],
             "notes": [
@@ -160,18 +185,90 @@ class ShellManager:
             "log_file_backup_count": settings.log_file_backup_count,
             "terminal_max_sessions": settings.terminal_max_sessions,
             "terminal_idle_timeout_seconds": settings.terminal_idle_timeout_seconds,
+            "ui_card_order": await self.get_card_order_state(),
         }
+
+    async def get_card_order_state(self) -> dict[str, list[str]]:
+        async with self._lock:
+            settings = self._require_settings()
+            plugin_ids = self._current_plugin_ids()
+            bot_ids = [bot.bot_id for bot in self.bots]
+            preferred = settings.ui_card_order
+            return {
+                "bots": self._canonicalize_card_order(
+                    preferred.get("bots", []),
+                    bot_ids,
+                ),
+                "plugins": self._canonicalize_card_order(
+                    preferred.get("plugins", []),
+                    plugin_ids,
+                ),
+            }
+
+    async def update_card_order(self, payload: dict[str, Any]) -> dict[str, list[str]]:
+        if not isinstance(payload, dict):
+            raise ValueError("卡片顺序必须是对象")
+        supplied_scopes = [scope for scope in ("bots", "plugins") if scope in payload]
+        if not supplied_scopes:
+            raise ValueError("请提供 bots 或 plugins 卡片顺序")
+        unexpected = sorted(set(payload) - {"bots", "plugins"})
+        if unexpected:
+            raise ValueError(f"不支持的卡片顺序字段：{', '.join(unexpected)}")
+        requested = {
+            scope: self._validate_card_order_list(
+                payload[scope],
+                context=f"{scope} 卡片顺序",
+            )
+            for scope in supplied_scopes
+        }
+
+        async with self._lock:
+            settings = self._require_settings()
+            plugin_ids = self._current_plugin_ids()
+            entity_ids = {
+                "bots": [bot.bot_id for bot in self.bots],
+                "plugins": plugin_ids,
+            }
+            current = {
+                scope: self._canonicalize_card_order(
+                    settings.ui_card_order.get(scope, []),
+                    entity_ids[scope],
+                )
+                for scope in ("bots", "plugins")
+            }
+            for scope in supplied_scopes:
+                if (
+                    len(requested[scope]) != len(entity_ids[scope])
+                    or set(requested[scope]) != set(entity_ids[scope])
+                ):
+                    raise CardOrderConflictError(
+                        f"{scope} 实体集合已变化，请刷新列表后重新排序"
+                    )
+                current[scope] = list(requested[scope])
+            settings.ui_card_order = current
+            self._persist_shell_settings()
+            return {
+                "bots": list(current["bots"]),
+                "plugins": list(current["plugins"]),
+            }
 
     async def export_configuration(self) -> dict[str, Any]:
         settings = self._require_settings()
-        plugin_configs: dict[str, Any] = {}
-        if self.layout.plugins_config_dir.exists():
-            for config_path in sorted(self.layout.plugins_config_dir.glob("*_config.json")):
-                plugin_id = config_path.name[:-len("_config.json")]
-                plugin_configs[plugin_id] = read_json(config_path, {})
+        plugin_configs = self.plugin_manager.export_configuration_configs()
+        plugin_ids = self._current_plugin_ids()
 
         async with self._lock:
             bots = [bot.to_mapping() for bot in self.bots]
+            ui_card_order = {
+                "bots": self._canonicalize_card_order(
+                    settings.ui_card_order.get("bots", []),
+                    [bot.bot_id for bot in self.bots],
+                ),
+                "plugins": self._canonicalize_card_order(
+                    settings.ui_card_order.get("plugins", []),
+                    plugin_ids,
+                ),
+            }
 
         return {
             ROCKETCAT_CONFIG_MARKER_FIELD: True,
@@ -189,6 +286,7 @@ class ShellManager:
                 "log_file_backup_count": settings.log_file_backup_count,
                 "terminal_max_sessions": settings.terminal_max_sessions,
                 "terminal_idle_timeout_seconds": settings.terminal_idle_timeout_seconds,
+                "ui_card_order": ui_card_order,
             },
             "bots": bots,
             "plugin_configs": plugin_configs,
@@ -236,9 +334,18 @@ class ShellManager:
             raise ValueError("配置导入失败，最大消息映射窗口条数必须是正整数")
 
         candidate_bots = self._build_import_bots(raw_bots, defaults=settings)
-        candidate_plugin_configs = self._normalize_import_plugin_configs(raw_plugin_configs)
+        candidate_plugin_configs = self.plugin_manager.normalize_import_configs(
+            self._normalize_import_plugin_configs(raw_plugin_configs)
+        )
         candidate_settings = ShellSettings.from_mapping(
             {**settings.to_mapping(), **raw_shell_settings}
+        )
+        current_card_order = await self.get_card_order_state()
+        candidate_settings.ui_card_order = self._build_import_card_order(
+            raw_shell_settings,
+            current_order=current_card_order,
+            candidate_bot_ids=[bot.bot_id for bot in candidate_bots],
+            plugin_ids=self._current_plugin_ids(),
         )
 
         imported_plugin_count = len(candidate_plugin_configs)
@@ -263,6 +370,7 @@ class ShellManager:
                     "terminal_idle_timeout_seconds",
                 ):
                     setattr(settings, field_name, getattr(candidate_settings, field_name))
+                settings.ui_card_order = candidate_settings.ui_card_order
                 self.bots = candidate_bots
                 self._persist_after_bot_change_locked()
                 self._apply_import_plugin_configs(candidate_plugin_configs)
@@ -292,7 +400,7 @@ class ShellManager:
                 )
                 raise
 
-        self.plugin_manager.refresh()
+        self.plugin_manager.refresh(force=True)
         await self._reconcile_runtimes("configuration imported")
         await self._reload_runtime_plugins("configuration imported")
         message_index_summary = await self._apply_message_index_policy(
@@ -318,6 +426,7 @@ class ShellManager:
         changes: list[str] = []
         should_apply_message_index_policy = False
         should_reconcile_runtimes = False
+        should_apply_media_cache_policy = False
 
         async with self._lock:
             if "webui_access_password" in payload:
@@ -380,10 +489,10 @@ class ShellManager:
                     "inbound_worker_count",
                     "onebot_outgoing_queue_max_entries",
                     "identity_cache_max_entries",
-                    "media_cache_max_bytes",
-                    "media_cache_max_age_hours",
                 }:
                     should_reconcile_runtimes = True
+                if field_name in {"media_cache_max_bytes", "media_cache_max_age_hours"}:
+                    should_apply_media_cache_policy = True
 
             if "performance_profile" in payload:
                 profile = str(payload.get("performance_profile") or "").strip().lower()
@@ -401,6 +510,16 @@ class ShellManager:
             await self._apply_message_index_policy(
                 force_compact=False,
                 reason="message mapping window settings updated",
+            )
+        if should_apply_media_cache_policy:
+            await asyncio.gather(
+                *(
+                    runtime.update_media_cache_policy(
+                        max_bytes=settings.media_cache_max_bytes,
+                        max_age_hours=settings.media_cache_max_age_hours,
+                    )
+                    for runtime in self.runtimes.values()
+                )
             )
         if should_reconcile_runtimes:
             await self._reconcile_runtimes("performance settings updated")
@@ -425,13 +544,14 @@ class ShellManager:
             reason="manual message mapping window rebuild",
         )
 
-    async def get_webui_state(self) -> dict[str, Any]:
+    async def get_webui_state(self, *, compact: bool = False) -> dict[str, Any]:
         settings = self._require_settings()
         items = await self.list_bots()
         actual_port = self._webui_actual_port or settings.webui_port
         host = self._webui_host or settings.webui_host
         enabled_count = sum(1 for bot in self.bots if bot.enabled)
-        return {
+        payload = {
+            "product": "RocketCat",
             "version": __version__,
             "bridge_enabled": True,
             "main_bot_enabled": False,
@@ -443,8 +563,10 @@ class ShellManager:
             "user_identity_algorithm": "sha256-linear-v1",
             "enabled_bot_count": enabled_count,
             "bot_count": len(self.bots),
-            "items": items,
         }
+        if not compact:
+            payload["items"] = items
+        return payload
 
     async def get_basic_info_state(self) -> dict[str, Any]:
         async with self._lock:
@@ -542,13 +664,15 @@ class ShellManager:
         total_runtime_journal_bytes = sum(int(item.get("runtime_journal_bytes") or 0) for item in items)
         total_inbound_queue_depth = sum(int(item.get("inbound_queue_depth") or 0) for item in items)
         total_outgoing_queue_depth = sum(int(item.get("outgoing_queue_depth") or 0) for item in items)
-        total_media_cache_files = sum(
-            int((item.get("media_cache") or {}).get("file_count") or 0)
-            for item in items
+        # All Windows runtimes share the Shell media coordinator and directory;
+        # report it once instead of multiplying the same scan by Bot count.
+        total_media_cache_files = max(
+            (int((item.get("media_cache") or {}).get("file_count") or 0) for item in items),
+            default=0,
         )
-        total_media_cache_bytes = sum(
-            int((item.get("media_cache") or {}).get("total_bytes") or 0)
-            for item in items
+        total_media_cache_bytes = max(
+            (int((item.get("media_cache") or {}).get("total_bytes") or 0) for item in items),
+            default=0,
         )
         total_runtime_restarts = sum(
             int(item.get("runtime_restart_count") or 0) for item in items
@@ -559,6 +683,10 @@ class ShellManager:
             "host": host_snapshot,
             "host_cache": host_cache,
             "host_error": host_error,
+            "performance": {
+                "event_loop_lag_ms": self.event_loop_lag.snapshot(),
+                "logging": logging_diagnostic_snapshot(),
+            },
             "items": items,
             "summary": {
                 "bot_count": len(items),
@@ -1037,7 +1165,7 @@ class ShellManager:
             instance_name=bot.name or bot.bot_id,
             message_index_max_entries=self._require_settings().message_index_max_entries,
             media_publication_service=self.media_publication,
-            disable_callback=lambda bot_id=bot.bot_id: self._disable_bot_after_failure(bot_id),
+            disable_callback=lambda bot_id=bot.bot_id: self._disable_bot_after_rocketchat_failure(bot_id),
             plugin_manager=self.plugin_manager,
         )
         runtime._restart_count = self._runtime_reload_counts.get(bot.bot_id, 0)
@@ -1057,10 +1185,9 @@ class ShellManager:
 
         runtimes = list(self.runtimes.items())
         self.runtimes = {}
-        for _, runtime in runtimes:
-            await runtime.stop()
+        await asyncio.gather(*(runtime.stop() for _, runtime in runtimes))
 
-    async def _disable_bot_after_failure(self, bot_id: str) -> None:
+    async def _disable_bot_after_rocketchat_failure(self, bot_id: str) -> None:
         changed = False
         async with self._lock:
             for bot in self.bots:
@@ -1074,7 +1201,10 @@ class ShellManager:
                 self._persist_after_bot_change_locked()
 
         if changed:
-            logger.error("[RocketCatShell] bot %s has been disabled after reconnect failure.", bot_id)
+            logger.error(
+                "[RocketCatShell] bot %s has been disabled after Rocket.Chat reconnect failure.",
+                bot_id,
+            )
 
         runtime = self.runtimes.pop(bot_id, None)
         if runtime is not None:
@@ -1284,6 +1414,100 @@ class ShellManager:
     def _persist_shell_settings(self) -> None:
         settings = self._require_settings()
         write_json(self.layout.shell_settings_path, settings.to_mapping())
+
+    def _current_plugin_ids(self) -> list[str]:
+        return [
+            str(item.get("id") or "")
+            for item in self.plugin_manager.list_plugins()
+            if str(item.get("id") or "")
+        ]
+
+    def _validate_card_order_list(
+        self,
+        value: Any,
+        *,
+        context: str,
+    ) -> list[str]:
+        if not isinstance(value, list):
+            raise ValueError(f"{context}必须是数组")
+        if len(value) > _CARD_ORDER_MAX_ITEMS:
+            raise ValueError(f"{context}不能超过 {_CARD_ORDER_MAX_ITEMS} 项")
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for index, raw_item in enumerate(value):
+            if not isinstance(raw_item, str):
+                raise ValueError(f"{context}第 {index + 1} 项必须是字符串")
+            item = raw_item.strip()
+            if not item:
+                raise ValueError(f"{context}第 {index + 1} 项不能为空")
+            if len(item) > _CARD_ORDER_MAX_ID_LENGTH:
+                raise ValueError(
+                    f"{context}第 {index + 1} 项不能超过 {_CARD_ORDER_MAX_ID_LENGTH} 个字符"
+                )
+            if item in seen:
+                raise ValueError(f"{context}包含重复 ID：{item}")
+            seen.add(item)
+            normalized.append(item)
+        return normalized
+
+    def _canonicalize_card_order(
+        self,
+        preferred: Any,
+        entity_ids: list[str],
+    ) -> list[str]:
+        available = set(entity_ids)
+        ordered: list[str] = []
+        seen: set[str] = set()
+        if isinstance(preferred, list):
+            for raw_item in preferred:
+                if not isinstance(raw_item, str):
+                    continue
+                item = raw_item.strip()
+                if item in available and item not in seen:
+                    seen.add(item)
+                    ordered.append(item)
+        for item in entity_ids:
+            if item not in seen:
+                seen.add(item)
+                ordered.append(item)
+        return ordered
+
+    def _build_import_card_order(
+        self,
+        raw_shell_settings: dict[str, Any],
+        *,
+        current_order: dict[str, list[str]],
+        candidate_bot_ids: list[str],
+        plugin_ids: list[str],
+    ) -> dict[str, list[str]]:
+        entity_ids = {"bots": candidate_bot_ids, "plugins": plugin_ids}
+        raw_order = raw_shell_settings.get("ui_card_order", None)
+        if "ui_card_order" not in raw_shell_settings:
+            return {
+                scope: self._canonicalize_card_order(current_order[scope], entity_ids[scope])
+                for scope in ("bots", "plugins")
+            }
+        if not isinstance(raw_order, dict):
+            raise ValueError("配置导入失败，ui_card_order 字段必须是对象")
+        unexpected = sorted(set(raw_order) - {"bots", "plugins"})
+        if unexpected:
+            raise ValueError(
+                f"配置导入失败，ui_card_order 包含不支持的字段：{', '.join(unexpected)}"
+            )
+        normalized: dict[str, list[str]] = {}
+        for scope in ("bots", "plugins"):
+            if scope in raw_order:
+                preferred = self._validate_card_order_list(
+                    raw_order[scope],
+                    context=f"配置导入失败，ui_card_order.{scope} ",
+                )
+            else:
+                preferred = current_order[scope]
+            normalized[scope] = self._canonicalize_card_order(
+                preferred,
+                entity_ids[scope],
+            )
+        return normalized
 
     def _normalize_import_plugin_configs(
         self,

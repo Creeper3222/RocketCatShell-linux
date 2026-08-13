@@ -4,12 +4,13 @@
 !.env.example
 config/
 logs/
-tests/
 data/bots/
 data/temp/
 data/plugin_data/
 data/resource/
 data/user_identity/
+data/update/
+data/perf/
 data/plugins/*
 !data/plugins/rocketcat_plugin_adapt_iamthinking/
 !data/plugins/rocketcat_plugin_adapt_iamthinking/**

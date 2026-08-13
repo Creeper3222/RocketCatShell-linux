@@ -14,6 +14,8 @@ data/temp
 data/user_identity
 data/plugin_data
 data/resource
+data/update
+data/perf
 data/plugins/*
 !data/plugins/rocketcat_plugin_adapt_iamthinking/
 !data/plugins/rocketcat_plugin_adapt_iamthinking/**
@@ -21,6 +23,10 @@ data/plugins/*
 !data/plugins/rocketcat_plugin_built_in_command/**
 tools/benchmark_inbound_translate.py
 tools/stress_v020.py
+tools/stress_v022_full_stack.py
+tools/smoke_v022_readonly.py
+tools/build_v022_acceptance_report.py
+tools/build_linux_release.py
 tools/deploy_user_identity_windows_live.ps1
 *.log
 *.db

@@ -7,9 +7,9 @@
 
 本项目的目标不是继续做一个“宿主里的桥接插件”，而是把 RocketCat 发展成一套真正独立的 `Rocket.Chat <-> OneBot v11` 桥接软件。
 
-这个 live 目录对应的是 RocketCatShell 的 Linux / Docker 迁移版：核心功能现已与 Windows `v0.2.1` 对齐，同时保留容器初始化、外部挂载目录、内置插件自动补种和 Linux PTY 等 Docker 包装层。RocketChat 媒体通过 RocketCatShell WebUI 端口上的令牌 HTTP URL 统一上报，不再要求与 AstrBot 配置共享目录。
+这个 live 目录对应 RocketCatShell 的 Linux / Docker 版：平台中立功能与 Windows 版保持同代，同时保留容器初始化、外部持久挂载、内置插件安全播种、Linux PTY、容器诊断和应用层事务更新等 Linux 专属实现。Rocket.Chat 媒体通过 RocketCatShell WebUI 端口上的令牌 HTTP URL 统一上报，不要求与 AstrBot 共享目录。
 
-> 当前 README 对应版本为 `v0.2.1`。本版在保持 v0.2.0 性能与资源治理行为不变的前提下，将插件重构为全局单例，并新增不占用额外端口的 RocketCat 原生内置 Dashboard 链路；镜像继续同时发布 `linux/amd64` 与 `linux/arm64`。
+当前发布版本为 `v0.2.2`，完整版本变化与迁移记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 这意味着：
 
@@ -373,6 +373,15 @@ RocketCatShell 启动后会在本地启动一个独立 WebUI：本机直接运�
 - 顶层判别字段为 `Is rocketcat config`。
 - 导出内容包含所有 Bot 设置（包括 `room_info_cache_ttl_seconds` 与 `perf_trace_enabled`）、WebUI 登录认证 / 文件管理鉴权密码、WebUI 端口、消息映射窗口条数上限和本地插件主配置。
 - 导入时会先校验判别字段；若不是 RocketCatShell 配置文件，则会返回失败提示。
+- Bot 卡片顺序会在网络配置、基础信息和运行诊断间共享，插件卡片使用独立顺序；顺序随配置导入导出。缺少该字段的 v0.2.1 配置仍可直接导入。
+
+### Docker 容器内版本管理
+
+- 版本管理固定读取 `Creeper3222/RocketCatShell-linux` 的官方 Release 和 `RocketCatShell-linux-vX.Y.Z.zip` 资产。
+- 更新包必须通过 Linux 清单、SHA-256、路径、大小、文件数量、持久状态兼容和 runtime generation 校验。
+- 更新事务会先备份精确应用层，再由容器 PID 1 切换到冻结 helper；目标版本未在 120 秒内健康启动时会在容器重启时自动恢复备份。
+- 两个内置插件随 RocketCatShell 整体更新，不提供独立更新器；用户插件和插件数据不会被替换。
+- 普通容器重启保留 WebUI 切换后的版本；容器删除或重建恢复镜像版本。如要永久升级镜像，请使用 Docker Hub 正式标签和部署脚本。
 
 ---
 

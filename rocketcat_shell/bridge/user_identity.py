@@ -8,8 +8,10 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -63,7 +65,9 @@ class UserIdentityMapping:
 
 @dataclass(slots=True)
 class _UserIdentitySharedState:
+    state_key: str
     connection: sqlite3.Connection | None
+    executor: ThreadPoolExecutor
     lock: threading.RLock
     by_user: OrderedDict[str, UserIdentityMapping]
     by_onebot: OrderedDict[int, str]
@@ -72,6 +76,10 @@ class _UserIdentitySharedState:
     initialized: bool = False
     cache_hits: int = 0
     cache_misses: int = 0
+    ref_count: int = 0
+    inflight_lock: threading.Lock = field(default_factory=threading.Lock)
+    inflight: dict[tuple[int, str], asyncio.Future[Any]] = field(default_factory=dict)
+    singleflight_merges: int = 0
 
 
 def compute_primary_onebot_id(user_id: str) -> int:
@@ -157,6 +165,8 @@ class UserIdentityRegistry:
         except (OSError, ValueError):
             is_temporary_database = False
         self._persistent_connection = not is_temporary_database
+        self._state_key = state_key
+        self._released = False
         with self._shared_states_lock:
             state = self._shared_states.get(state_key)
             if state is None:
@@ -166,7 +176,12 @@ class UserIdentityRegistry:
                     else None
                 )
                 state = _UserIdentitySharedState(
+                    state_key=state_key,
                     connection=connection,
+                    executor=ThreadPoolExecutor(
+                        max_workers=1,
+                        thread_name_prefix=f"RocketCatIdentity:{self.database_path.stem[:12]}",
+                    ),
                     lock=threading.RLock(),
                     by_user=OrderedDict(),
                     by_onebot=OrderedDict(),
@@ -176,6 +191,7 @@ class UserIdentityRegistry:
                 self._shared_states[state_key] = state
             else:
                 state.cache_max_entries = normalized_cache_max
+            state.ref_count += 1
         self._state = state
         self._lock = state.lock
         self._by_user = state.by_user
@@ -234,7 +250,63 @@ class UserIdentityRegistry:
                 "max_entries": self._state.cache_max_entries,
                 "hits": self._state.cache_hits,
                 "misses": self._state.cache_misses,
+                "singleflight_merges": self._state.singleflight_merges,
+                "ref_count": self._state.ref_count,
             }
+
+    async def _run_database(self, function, *args, **kwargs):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._state.executor,
+            partial(function, *args, **kwargs),
+        )
+
+    async def _run_singleflight(self, key: str, function, *args, **kwargs):
+        loop = asyncio.get_running_loop()
+        flight_key = (id(loop), str(key))
+        with self._state.inflight_lock:
+            future = self._state.inflight.get(flight_key)
+            if future is None:
+                future = asyncio.ensure_future(
+                    self._run_database(function, *args, **kwargs)
+                )
+                self._state.inflight[flight_key] = future
+
+                def cleanup(completed: asyncio.Future[Any]) -> None:
+                    with self._state.inflight_lock:
+                        if self._state.inflight.get(flight_key) is completed:
+                            self._state.inflight.pop(flight_key, None)
+
+                future.add_done_callback(cleanup)
+            else:
+                self._state.singleflight_merges += 1
+        return await asyncio.shield(future)
+
+    async def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        state_to_close: _UserIdentitySharedState | None = None
+        with self._shared_states_lock:
+            self._state.ref_count = max(0, self._state.ref_count - 1)
+            if self._state.ref_count == 0:
+                if self._shared_states.get(self._state_key) is self._state:
+                    self._shared_states.pop(self._state_key, None)
+                state_to_close = self._state
+        if state_to_close is None:
+            return
+        connection = state_to_close.connection
+        state_to_close.connection = None
+        if connection is not None:
+            await asyncio.get_running_loop().run_in_executor(
+                state_to_close.executor,
+                connection.close,
+            )
+        await asyncio.to_thread(
+            state_to_close.executor.shutdown,
+            wait=True,
+            cancel_futures=True,
+        )
 
     @contextmanager
     def _open_connection(self):
@@ -354,7 +426,19 @@ class UserIdentityRegistry:
             self._record_cache_result(hit=True)
             return cached
         self._record_cache_result(hit=False)
-        return await asyncio.to_thread(
+        flight_key = "\x1f".join(
+            [
+                "ensure",
+                str(user_id),
+                str(username),
+                str(nickname),
+                str(bool(is_bot)),
+                str(bool(synthetic)),
+                str(primary_override),
+            ]
+        )
+        mapping = await self._run_singleflight(
+            flight_key,
             self.ensure_mapping_sync,
             user_id,
             username=username,
@@ -364,6 +448,17 @@ class UserIdentityRegistry:
             primary_override=primary_override,
             bot_id=bot_id,
         )
+        normalized_bot_id = str(bot_id if bot_id is not None else self.bot_id).strip()
+        if normalized_bot_id:
+            with self._lock:
+                membership_known = (normalized_bot_id, mapping.user_id) in self._bot_user_seen
+            if not membership_known:
+                await self._run_database(
+                    self._touch_bot_user,
+                    normalized_bot_id,
+                    mapping.user_id,
+                )
+        return mapping
 
     def ensure_mapping_sync(
         self,
@@ -593,7 +688,7 @@ class UserIdentityRegistry:
             with self._lock:
                 self._state.cache_hits += len(cached_results)
             return cached_results
-        return await asyncio.to_thread(
+        return await self._run_database(
             self.ensure_mappings_sync,
             items,
             bot_id=bot_id,
@@ -776,7 +871,11 @@ class UserIdentityRegistry:
             self._touch_cached_mapping(cached)
             return cached
         self._record_cache_result(hit=False)
-        return await asyncio.to_thread(self.get_by_user_id_sync, user_id)
+        return await self._run_singleflight(
+            f"get-user\x1f{user_id}",
+            self.get_by_user_id_sync,
+            user_id,
+        )
 
     def get_by_user_id_sync(self, user_id: str) -> UserIdentityMapping | None:
         normalized = str(user_id or "").strip()
@@ -815,7 +914,11 @@ class UserIdentityRegistry:
                 self._touch_cached_mapping(cached)
                 return cached
         self._record_cache_result(hit=False)
-        return await asyncio.to_thread(self.get_by_onebot_id_sync, onebot_id)
+        return await self._run_singleflight(
+            f"get-onebot\x1f{onebot_id}",
+            self.get_by_onebot_id_sync,
+            onebot_id,
+        )
 
     def invalidate_cache(self, user_id: str | None = None) -> None:
         with self._lock:
@@ -858,7 +961,7 @@ class UserIdentityRegistry:
         offset: int = 0,
         limit: int = 50,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(
+        return await self._run_database(
             self.list_mappings_sync,
             bot_id=bot_id,
             search=search,
@@ -981,7 +1084,7 @@ class UserIdentityRegistry:
         onebot_id: int | str,
         revision: int,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(
+        return await self._run_database(
             self.override_onebot_id_sync,
             bot_id=bot_id,
             user_id=user_id,
@@ -1153,7 +1256,7 @@ class UserIdentityRegistry:
         user_id: str,
         revision: int,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(
+        return await self._run_database(
             self.delete_mapping_sync,
             bot_id=bot_id,
             user_id=user_id,
@@ -1241,7 +1344,7 @@ class UserIdentityRegistry:
         bot_id: str | None = None,
         warning_path: Path | None = None,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(
+        return await self._run_database(
             self.sync_warning_file_sync,
             bot_id=bot_id,
             warning_path=warning_path,

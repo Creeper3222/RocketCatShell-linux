@@ -1,0 +1,29 @@
+{
+  "Is rocketcat config": true,
+  "shell_settings": {
+    "webui_access_password": "import-secret",
+    "webui_port": 5751,
+    "message_index_max_entries": 1000
+  },
+  "bots": [
+    {
+      "id": "bot-a",
+      "name": "Bot A",
+      "enabled": false
+    },
+    {
+      "id": "bot-c",
+      "name": "Bot C",
+      "enabled": false
+    }
+  ],
+  "plugin_configs": {
+    "rocketcat_plugin_adapt_iamthinking": {
+      "enabled": true,
+      "enable_reactions": false,
+      "enable_typing_indicator": true,
+      "llm_thinking_reaction": ":coffee:",
+      "llm_done_reaction": ":sparkles:"
+    }
+  }
+}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import pickle
 import queue
 import struct
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from rocketcat_shell.logger import logger
+from rocketcat_shell.performance import RollingMetric
 
 from .id_map import DurableIdMap, IdMapping, MessageWindowSnapshot
 from .storage import ContextRoomStore, MessageStore, PrivateRoomStore
@@ -31,6 +33,11 @@ class RuntimeHotStoreBundle:
 
     def flush(self) -> None:
         self.writer.flush()
+
+    def diagnostic_snapshot(self) -> dict[str, Any]:
+        payload = self.writer.diagnostic_snapshot()
+        payload["state_entries"] = self.state_engine.diagnostic_counts()
+        return payload
 
 
 @dataclass(slots=True)
@@ -115,19 +122,33 @@ class RuntimeStateMutationBatch:
         self._mutations.append({"op": "context_bind", "entry": normalized_entry})
 
     def put_message(self, entry: dict[str, Any]) -> None:
-        self._state_engine._put_message_without_record(entry)
-        self._mutations.append({"op": "message_put", "entry": entry})
+        # Translator batches hand ownership of a freshly constructed entry to
+        # the hot store. Keep one copy-on-write object for both the in-memory
+        # window and the queued journal record instead of recursively cloning
+        # the same JSON-like tree on every message.
+        normalized_entry = self._state_engine._adopt_message_entry(entry)
+        self._state_engine._put_normalized_message_without_record(normalized_entry)
+        self._mutations.append({"op": "message_put", "entry": normalized_entry})
 
-    def commit(self) -> None:
+    def commit(self) -> Any:
         if self._committed:
-            return
+            return None
         if self._mutations:
-            self._state_engine._record_batch(self._mutations)
+            pending = self._state_engine._record_batch_async(self._mutations)
+            if pending is not None:
+                return self._finish_commit(pending)
+        self._committed = True
+        return None
+
+    async def _finish_commit(self, pending: Any) -> None:
+        await pending
         self._committed = True
 
 
 class JournalPersistenceWorker:
     _SNAPSHOT_VERSION = 1
+    _QUEUE_CAPACITY = 1024
+    _FORCE_SNAPSHOT_BYTES = 64 * 1024 * 1024
 
     def __init__(
         self,
@@ -136,7 +157,7 @@ class JournalPersistenceWorker:
         journal_path: Path,
         snapshot_provider: Callable[[], dict[str, Any]],
         flush_every_records: int = 32,
-        snapshot_every_records: int = 512,
+        snapshot_every_records: int = 2048,
         idle_flush_interval: float = 0.5,
     ):
         self.snapshot_path = snapshot_path
@@ -147,7 +168,18 @@ class JournalPersistenceWorker:
         self._flush_every_records = max(1, int(flush_every_records))
         self._snapshot_every_records = max(self._flush_every_records, int(snapshot_every_records))
         self._idle_flush_interval = max(0.1, float(idle_flush_interval))
-        self._queue: queue.Queue[Any] = queue.Queue()
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=self._QUEUE_CAPACITY)
+        self._accepted_batches = 0
+        self._enqueue_observations = 0
+        self._queue_high_water = 0
+        self._enqueue_wait_metric = RollingMetric(capacity=2048)
+        self._snapshot_capture_metric = RollingMetric(capacity=128)
+        self._snapshot_serialize_metric = RollingMetric(capacity=128)
+        self._snapshot_total_metric = RollingMetric(capacity=128)
+        self._state_lock = threading.Lock()
+        self._last_error = ""
+        self._snapshot_count = 0
+        self._closed = False
         self._thread = threading.Thread(
             target=self._run,
             name=f"RocketCatStateWriter:{self.journal_path.parent.name}",
@@ -156,21 +188,129 @@ class JournalPersistenceWorker:
         self._thread.start()
 
     def enqueue(self, record: dict[str, Any]) -> None:
-        self._queue.put(record)
+        self._put_sync(record)
 
     def enqueue_batch(self, mutations: list[dict[str, Any]]) -> None:
-        self._queue.put({"op": "batch", "mutations": mutations})
+        self._put_sync({"op": "batch", "mutations": mutations})
 
-    def flush(self) -> None:
-        done = threading.Event()
-        self._queue.put(_FlushCommand(done=done))
-        done.wait()
+    async def enqueue_batch_async(self, mutations: list[dict[str, Any]]) -> None:
+        pending = self.enqueue_batch_maybe_async(mutations)
+        if pending is not None:
+            await pending
 
-    def close(self) -> None:
+    def enqueue_batch_maybe_async(self, mutations: list[dict[str, Any]]) -> Any:
+        item = {"op": "batch", "mutations": mutations}
+        self._raise_if_failed()
+        try:
+            self._queue.put_nowait(item)
+        except queue.Full:
+            return self._enqueue_when_available(item, time.perf_counter())
+        self._record_enqueue_metrics(0.0, mutation=True)
+        return None
+
+    async def _enqueue_when_available(self, item: Any, started_at: float) -> None:
+        while True:
+            self._raise_if_failed()
+            try:
+                self._queue.put_nowait(item)
+                break
+            except queue.Full:
+                await asyncio.sleep(0.005)
+        self._record_enqueue_metrics(
+            (time.perf_counter() - started_at) * 1000.0,
+            mutation=True,
+        )
+
+    def _put_sync(self, item: Any, *, timeout: float = 15.0) -> None:
+        started_at = time.perf_counter()
+        deadline = time.monotonic() + max(0.1, float(timeout))
+        while True:
+            self._raise_if_failed()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("runtime journal queue remained full")
+            try:
+                self._queue.put(item, timeout=min(0.1, remaining))
+                break
+            except queue.Full:
+                continue
+        self._record_enqueue_metrics(
+            (time.perf_counter() - started_at) * 1000.0,
+            mutation=isinstance(item, dict),
+        )
+
+    def _record_enqueue_metrics(self, wait_ms: float, *, mutation: bool) -> None:
+        depth = self._queue.qsize()
+        if mutation:
+            self._accepted_batches += 1
+        self._enqueue_observations += 1
+        observation_index = self._enqueue_observations
+        self._queue_high_water = max(self._queue_high_water, depth)
+        # Queue wait is normally effectively zero. Sample the uncontended
+        # fast path and always retain actual contention so diagnostics remain
+        # representative without taking several locks for every message.
+        if wait_ms >= 0.05 or observation_index % 64 == 0:
+            self._enqueue_wait_metric.observe(wait_ms)
+
+    def flush(self, *, timeout: float = 15.0) -> None:
         done = threading.Event()
-        self._queue.put(_StopCommand(done=done))
-        done.wait()
-        self._thread.join(timeout=5.0)
+        self._put_sync(_FlushCommand(done=done), timeout=timeout)
+        self._wait_command(done, timeout=timeout)
+
+    def close(self, *, timeout: float = 15.0) -> None:
+        if self._closed:
+            return
+        done = threading.Event()
+        self._put_sync(_StopCommand(done=done), timeout=timeout)
+        self._wait_command(done, timeout=timeout)
+        self._thread.join(timeout=max(0.1, float(timeout)))
+        if self._thread.is_alive():
+            raise TimeoutError("runtime journal writer did not stop")
+        self._closed = True
+        self._raise_if_failed()
+
+    def _wait_command(self, done: threading.Event, *, timeout: float) -> None:
+        deadline = time.monotonic() + max(0.1, float(timeout))
+        while not done.wait(timeout=min(0.1, max(0.0, deadline - time.monotonic()))):
+            self._raise_if_failed()
+            if time.monotonic() >= deadline:
+                raise TimeoutError("runtime journal command timed out")
+
+    def _raise_if_failed(self) -> None:
+        last_error = self._last_error
+        if last_error:
+            raise RuntimeError(f"runtime journal writer failed: {last_error}")
+        if hasattr(self, "_thread") and not self._thread.is_alive() and not self._closed:
+            raise RuntimeError("runtime journal writer stopped unexpectedly")
+
+    def diagnostic_snapshot(self) -> dict[str, Any]:
+        wait_snapshot = self._enqueue_wait_metric.snapshot()
+        snapshot_capture = self._snapshot_capture_metric.snapshot()
+        snapshot_serialize = self._snapshot_serialize_metric.snapshot()
+        snapshot_total = self._snapshot_total_metric.snapshot()
+        accepted_batches = self._accepted_batches
+        queue_high_water = self._queue_high_water
+        with self._state_lock:
+            last_error = self._last_error
+            snapshot_count = self._snapshot_count
+        return {
+            "backlog": self._queue.qsize(),
+            "capacity": self._queue.maxsize,
+            "high_water": queue_high_water,
+            "enqueue_wait_p95_ms": wait_snapshot["p95"],
+            "enqueue_wait_p99_ms": wait_snapshot["p99"],
+            "accepted_batches": accepted_batches,
+            "snapshot_count": snapshot_count,
+            "snapshot_capture_p95_ms": snapshot_capture["p95"],
+            "snapshot_capture_max_ms": snapshot_capture["max"],
+            "snapshot_serialize_p95_ms": snapshot_serialize["p95"],
+            "snapshot_serialize_max_ms": snapshot_serialize["max"],
+            "snapshot_total_p95_ms": snapshot_total["p95"],
+            "snapshot_total_max_ms": snapshot_total["max"],
+            "writer_alive": self._thread.is_alive(),
+            "last_error": last_error,
+            "journal_bytes": self.journal_path.stat().st_size if self.journal_path.exists() else 0,
+        }
 
     @classmethod
     def load_snapshot_payload(cls, snapshot_path: Path) -> dict[str, Any] | None:
@@ -217,12 +357,15 @@ class JournalPersistenceWorker:
     def _run(self) -> None:
         pending_since_flush = 0
         records_since_snapshot = 0
-        journal_handle = self.journal_path.open("ab")
+        journal_handle = None
+        current_item: Any = None
         try:
+            journal_handle = self.journal_path.open("ab")
             while True:
                 try:
-                    item = self._queue.get(timeout=self._idle_flush_interval)
+                    current_item = self._queue.get(timeout=self._idle_flush_interval)
                 except queue.Empty:
+                    current_item = None
                     if pending_since_flush:
                         self._flush_handle(journal_handle)
                         pending_since_flush = 0
@@ -231,44 +374,87 @@ class JournalPersistenceWorker:
                         records_since_snapshot = 0
                     continue
 
-                if isinstance(item, _FlushCommand):
+                if isinstance(current_item, _FlushCommand):
                     if pending_since_flush:
                         self._flush_handle(journal_handle)
                         pending_since_flush = 0
-                    if records_since_snapshot >= self._snapshot_every_records:
+                    if self._snapshot_due(journal_handle, records_since_snapshot):
                         journal_handle = self._write_snapshot_and_rotate(journal_handle)
                         records_since_snapshot = 0
-                    item.done.set()
+                    current_item.done.set()
+                    current_item = None
                     continue
 
-                if isinstance(item, _StopCommand):
+                if isinstance(current_item, _StopCommand):
                     if pending_since_flush:
                         self._flush_handle(journal_handle)
                         pending_since_flush = 0
                     journal_handle = self._write_snapshot_and_rotate(journal_handle)
-                    item.done.set()
+                    records_since_snapshot = 0
+                    current_item.done.set()
+                    current_item = None
                     break
 
-                self._write_record(journal_handle, item)
+                self._write_record(journal_handle, current_item)
                 pending_since_flush += 1
                 records_since_snapshot += 1
+                current_item = None
                 if pending_since_flush >= self._flush_every_records:
                     self._flush_handle(journal_handle)
                     pending_since_flush = 0
-                if records_since_snapshot >= self._snapshot_every_records:
+                if self._snapshot_due(journal_handle, records_since_snapshot):
                     journal_handle = self._write_snapshot_and_rotate(journal_handle)
                     records_since_snapshot = 0
+        except BaseException as exc:
+            with self._state_lock:
+                self._last_error = repr(exc)
+            if isinstance(current_item, (_FlushCommand, _StopCommand)):
+                current_item.done.set()
+            while True:
+                try:
+                    queued_item = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(queued_item, (_FlushCommand, _StopCommand)):
+                    queued_item.done.set()
+            logger.error(
+                "[RocketCatShell] runtime journal writer failed | owner=%s | error=%r",
+                self.journal_path.parent.name,
+                exc,
+            )
         finally:
-            journal_handle.close()
+            if journal_handle is not None:
+                journal_handle.close()
+
+    def _snapshot_due(self, journal_handle, records_since_snapshot: int) -> bool:
+        if journal_handle.tell() >= self._FORCE_SNAPSHOT_BYTES:
+            return True
+        return (
+            records_since_snapshot >= self._snapshot_every_records
+            and self._queue.qsize() < max(1, self._queue.maxsize // 4)
+        )
 
     def _write_snapshot_and_rotate(self, journal_handle):
+        snapshot_started_at = time.perf_counter()
+        capture_started_at = snapshot_started_at
+        state = self._snapshot_provider()
+        capture_finished_at = time.perf_counter()
         snapshot_payload = {
             "version": self._SNAPSHOT_VERSION,
-            "state": self._snapshot_provider(),
+            "state": state,
         }
+        serialize_started_at = time.perf_counter()
+        encoded_snapshot = pickle.dumps(snapshot_payload, protocol=pickle.HIGHEST_PROTOCOL)
+        serialize_finished_at = time.perf_counter()
         tmp_path = self.snapshot_path.with_suffix(self.snapshot_path.suffix + ".tmp")
-        tmp_path.write_bytes(pickle.dumps(snapshot_payload, protocol=pickle.HIGHEST_PROTOCOL))
+        tmp_path.write_bytes(encoded_snapshot)
         tmp_path.replace(self.snapshot_path)
+        snapshot_finished_at = time.perf_counter()
+        self._snapshot_capture_metric.observe((capture_finished_at - capture_started_at) * 1000.0)
+        self._snapshot_serialize_metric.observe((serialize_finished_at - serialize_started_at) * 1000.0)
+        self._snapshot_total_metric.observe((snapshot_finished_at - snapshot_started_at) * 1000.0)
+        with self._state_lock:
+            self._snapshot_count += 1
         journal_handle.close()
         self.journal_path.write_bytes(b"")
         return self.journal_path.open("ab")
@@ -366,47 +552,58 @@ class RuntimeStateEngine:
     def begin_batch(self) -> RuntimeStateMutationBatch:
         return RuntimeStateMutationBatch(self)
 
+    def diagnostic_counts(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "message_order": len(self._message_order),
+                "messages_by_source": len(self._messages_by_source),
+                "messages_by_surrogate": len(self._messages_by_surrogate),
+                "latest_context_senders": len(self._latest_by_context_sender),
+                "context_sender_pairs": len(self._context_sender_message_order),
+                "context_sender_entries": sum(
+                    len(order) for order in self._context_sender_message_order.values()
+                ),
+                "private_rooms_by_source": len(self._private_room_by_user_source),
+                "private_rooms_by_surrogate": len(self._private_room_by_user_surrogate),
+                "context_rooms_by_source": len(self._context_room_by_source),
+                "context_rooms_by_surrogate": len(self._context_room_by_surrogate),
+                "forward_mappings": {
+                    namespace: len(values) for namespace, values in self._forward.items()
+                },
+                "reverse_mappings": {
+                    namespace: len(values) for namespace, values in self._reverse.items()
+                },
+            }
+
     def export_snapshot_payload(self) -> dict[str, Any]:
         with self._lock:
-            messages_by_source: dict[str, dict[str, Any]] = {}
-            messages_by_surrogate: dict[str, dict[str, Any]] = {}
-            for source_id, entry in self._messages_by_source.items():
-                if not isinstance(entry, dict):
-                    continue
-                cloned_entry = self._clone_message_entry(entry)
-                messages_by_source[str(source_id)] = cloned_entry
-                surrogate_id = str(cloned_entry.get("surrogate_id") or "").strip()
-                if surrogate_id:
-                    messages_by_surrogate[surrogate_id] = cloned_entry
-
-            context_room_by_source: dict[str, dict[str, Any]] = {}
-            context_room_by_surrogate: dict[str, dict[str, Any]] = {}
-            for context_source_id, entry in self._context_room_by_source.items():
-                if not isinstance(entry, dict):
-                    continue
-                cloned_entry = deepcopy(entry)
-                context_room_by_source[str(context_source_id)] = cloned_entry
-                context_surrogate_id = str(cloned_entry.get("context_surrogate_id") or "").strip()
-                if context_surrogate_id:
-                    context_room_by_surrogate[context_surrogate_id] = cloned_entry
-
+            # Message/context payloads are copy-on-write after insertion. Only
+            # freeze the top-level containers while holding the state lock;
+            # recursive pickle serialization belongs to the writer thread and
+            # must not stall inbound event-loop mutations.
             return {
                 "message_window_size": self._message_window_size,
-                "counters": deepcopy(self._counters),
-                "forward": deepcopy(self._forward),
-                "reverse": deepcopy(self._reverse),
+                "counters": dict(self._counters),
+                "forward": {
+                    namespace: dict(values)
+                    for namespace, values in self._forward.items()
+                },
+                "reverse": {
+                    namespace: dict(values)
+                    for namespace, values in self._reverse.items()
+                },
                 "message_order": list(self._message_order),
-                "messages_by_source": messages_by_source,
-                "messages_by_surrogate": messages_by_surrogate,
-                "latest_by_context_sender": deepcopy(self._latest_by_context_sender),
+                "messages_by_source": dict(self._messages_by_source),
+                "messages_by_surrogate": dict(self._messages_by_surrogate),
+                "latest_by_context_sender": dict(self._latest_by_context_sender),
                 "context_sender_message_order": {
                     key: list(value)
                     for key, value in self._context_sender_message_order.items()
                 },
-                "private_room_by_user_source": deepcopy(self._private_room_by_user_source),
-                "private_room_by_user_surrogate": deepcopy(self._private_room_by_user_surrogate),
-                "context_room_by_source": context_room_by_source,
-                "context_room_by_surrogate": context_room_by_surrogate,
+                "private_room_by_user_source": dict(self._private_room_by_user_source),
+                "private_room_by_user_surrogate": dict(self._private_room_by_user_surrogate),
+                "context_room_by_source": dict(self._context_room_by_source),
+                "context_room_by_surrogate": dict(self._context_room_by_surrogate),
             }
 
     def load_snapshot_payload(self, payload: dict[str, Any]) -> None:
@@ -900,6 +1097,9 @@ class RuntimeStateEngine:
 
     def _put_message_without_record(self, entry: dict[str, Any]) -> None:
         normalized_entry = self._normalize_message_entry(entry)
+        self._put_normalized_message_without_record(normalized_entry)
+
+    def _put_normalized_message_without_record(self, normalized_entry: dict[str, Any]) -> None:
         source_id = str(normalized_entry["source_id"])
         with self._lock:
             previous_entry = self._messages_by_source.get(source_id)
@@ -1037,9 +1237,20 @@ class RuntimeStateEngine:
             return
         self._writer.enqueue_batch(mutations)
 
+    def _record_batch_async(self, mutations: list[dict[str, Any]]) -> Any:
+        if not mutations or self._writer is None:
+            return None
+        return self._writer.enqueue_batch_maybe_async(mutations)
+
     @staticmethod
     def _normalize_message_entry(entry: dict[str, Any]) -> dict[str, Any]:
         return RuntimeStateEngine._clone_json_like_mapping(entry)
+
+    @staticmethod
+    def _adopt_message_entry(entry: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(entry, dict):
+            return {}
+        return {str(key): value for key, value in entry.items()}
 
     @staticmethod
     def _clone_message_entry(entry: dict[str, Any]) -> dict[str, Any]:

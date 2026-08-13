@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import re
 import time
 from copy import deepcopy
@@ -63,16 +64,52 @@ class InboundTranslator:
         multi_quote_nodes: list[dict[str, Any]] = []
         multi_quote_fallbacks: list[bool] = []
         runtime_batch = self._begin_runtime_batch()
-        try:
-            with perf_stage(perf_trace, "room_lookup"):
-                room_info = await self._rocketchat.get_room_info(room_id)
-                room_type = str(room_info.get("t") or "c")
-            with perf_stage(perf_trace, "mapping_alloc"):
-                room_mapping = await self._get_or_create_mapping("room", room_id, batch=runtime_batch)
-                sender_mapping = await self._ensure_user_mapping(
+        async_identity_lookup = callable(getattr(self._id_map, "ensure_user", None))
+        has_current_media = self._payload_may_have_context_media(raw_msg)
+        should_prefetch_room = async_identity_lookup or has_current_media
+        room_info_task = (
+            asyncio.create_task(self._rocketchat.get_room_info(room_id))
+            if should_prefetch_room
+            else None
+        )
+        sender_mapping_task = (
+            asyncio.create_task(
+                self._ensure_user_mapping(
                     sender_source_id,
                     username=str(sender.get("username") or ""),
                     nickname=str(sender.get("name") or ""),
+                )
+            )
+            if async_identity_lookup
+            else None
+        )
+        try:
+            # Media materialization can wait on remote I/O. Run it while the
+            # already-started room and identity requests progress, without
+            # allocating a third task for the common no-I/O path.
+            with perf_stage(perf_trace, "context_media"):
+                current_media = (
+                    await self._extract_context_media_descriptors(raw_msg)
+                    if has_current_media
+                    else []
+                )
+            with perf_stage(perf_trace, "room_lookup"):
+                room_info = (
+                    await room_info_task
+                    if room_info_task is not None
+                    else await self._rocketchat.get_room_info(room_id)
+                )
+                room_type = str(room_info.get("t") or "c")
+            with perf_stage(perf_trace, "mapping_alloc"):
+                room_mapping = await self._get_or_create_mapping("room", room_id, batch=runtime_batch)
+                sender_mapping = (
+                    await sender_mapping_task
+                    if sender_mapping_task is not None
+                    else await self._ensure_user_mapping(
+                        sender_source_id,
+                        username=str(sender.get("username") or ""),
+                        nickname=str(sender.get("name") or ""),
+                    )
                 )
                 if is_multi_quote:
                     for quoted_source_id in multi_reply_source_ids:
@@ -152,8 +189,6 @@ class InboundTranslator:
                 for item in mention_metadata
                 if str(item.get("name") or "")
             ]
-            with perf_stage(perf_trace, "context_media"):
-                current_media = await self._extract_context_media_descriptors(raw_msg)
             with perf_stage(perf_trace, "media_segments"):
                 media_segments = self._rocketchat.media.build_onebot_segments_from_descriptors(current_media)
             quote_media_segments = (
@@ -179,6 +214,10 @@ class InboundTranslator:
                     batch=runtime_batch,
                 )
                 segments.append({"type": "reply", "data": {"id": str(reply_mapping.surrogate_id)}})
+            # Keep referenced media adjacent to the reply segment and preserve
+            # the current message text/media ordering. This also makes the
+            # last text segment remain the user's actual reply body.
+            segments.extend(quote_media_segments)
             segments.extend(message_segments)
 
             message_text = cleaned_text.strip()
@@ -190,7 +229,6 @@ class InboundTranslator:
                 media=current_media,
             )
 
-            segments.extend(quote_media_segments)
             segments.extend(media_segments)
 
             if not segments:
@@ -305,10 +343,18 @@ class InboundTranslator:
                 )
             return event
         finally:
-            await self._cancel_pending_task(quote_contexts_task)
-            await self._cancel_pending_task(multi_quote_fetch_task)
+            if room_info_task is not None:
+                await self._cancel_pending_task(room_info_task)
+            if sender_mapping_task is not None:
+                await self._cancel_pending_task(sender_mapping_task)
+            if quote_contexts_task is not None:
+                await self._cancel_pending_task(quote_contexts_task)
+            if multi_quote_fetch_task is not None:
+                await self._cancel_pending_task(multi_quote_fetch_task)
             with perf_stage(perf_trace, "batch_commit"):
-                self._commit_runtime_batch(runtime_batch)
+                pending_commit = self._commit_runtime_batch(runtime_batch)
+                if pending_commit is not None:
+                    await pending_commit
 
     def _build_translation_plan(
         self,
@@ -745,21 +791,30 @@ class InboundTranslator:
             return begin_batch()
         return None
 
-    def _commit_runtime_batch(self, batch: Any = None) -> None:
+    def _commit_runtime_batch(self, batch: Any = None) -> Any:
         if batch is None:
-            return
+            return None
         has_pending = getattr(batch, "has_pending", None)
         commit = getattr(batch, "commit", None)
         if callable(has_pending) and callable(commit) and has_pending():
-            commit()
+            result = commit()
+            if inspect.isawaitable(result):
+                return result
+        return None
 
     async def _cancel_pending_task(self, task: asyncio.Task[Any] | None) -> None:
-        if task is None or task.done():
+        if task is None:
             return
-        task.cancel()
+        if not task.done():
+            task.cancel()
         try:
             await task
         except asyncio.CancelledError:
+            return
+        except Exception:
+            # The primary translation path owns error reporting. This helper
+            # only guarantees that speculative work never becomes an
+            # un-retrieved background task or masks the original failure.
             return
 
     async def _get_or_create_mapping(self, namespace: str, source_id: str, *, batch: Any = None) -> Any:
@@ -1531,6 +1586,8 @@ class InboundTranslator:
     @staticmethod
     def _source_may_have_context_media(source: dict[str, Any]) -> bool:
         for key in (
+            "_media",
+            "media",
             "files",
             "file",
             "fileUpload",

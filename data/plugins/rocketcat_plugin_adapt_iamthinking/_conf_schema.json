@@ -10,19 +10,72 @@
     "default": true
   },
   "enable_typing_indicator": {
-    "description": "启用typing指示器",
+    "description": "启用 typing 指示器",
+    "hint": "思考与工具调用状态保持输入中；超时/失败与完成状态会立即结束输入中。",
     "type": "bool",
     "default": true
   },
+  "thinking_emoji_ids": {
+    "description": "上游思考状态表情 ID",
+    "hint": "与 AstrBot I Am Thinking 插件的 thinking_emoji_ids 保持一致，仅用于识别状态。",
+    "type": "list",
+    "default": [66],
+    "ui_component": "integer_list",
+    "ui_group": "thinking",
+    "ui_group_label": "思考状态",
+    "ui_pair": "llm_thinking_reaction",
+    "unique_across": "iamthinking_state_emoji_ids"
+  },
+  "using_tool_emoji_ids": {
+    "description": "上游工具调用状态表情 ID",
+    "hint": "与 AstrBot I Am Thinking 插件的 using_tool_emoji_ids 保持一致，仅用于识别状态。",
+    "type": "list",
+    "default": [270],
+    "ui_component": "integer_list",
+    "ui_group": "using-tool",
+    "ui_group_label": "工具调用状态",
+    "ui_pair": "llm_using_tool_reaction",
+    "unique_across": "iamthinking_state_emoji_ids"
+  },
+  "error_emoji_ids": {
+    "description": "上游超时/失败状态表情 ID",
+    "hint": "与 AstrBot I Am Thinking 插件的 error_emoji_ids 保持一致，仅用于识别状态。",
+    "type": "list",
+    "default": [264],
+    "ui_component": "integer_list",
+    "ui_group": "error",
+    "ui_group_label": "超时 / 失败状态",
+    "ui_pair": "llm_error_reaction",
+    "unique_across": "iamthinking_state_emoji_ids"
+  },
+  "done_emoji_ids": {
+    "description": "上游完成状态表情 ID",
+    "hint": "与 AstrBot I Am Thinking 插件的 done_emoji_ids 保持一致，仅用于识别状态。",
+    "type": "list",
+    "default": [74],
+    "ui_component": "integer_list",
+    "ui_group": "done",
+    "ui_group_label": "完成状态",
+    "ui_pair": "llm_done_reaction",
+    "unique_across": "iamthinking_state_emoji_ids"
+  },
   "llm_thinking_reaction": {
-    "description": "LLM 思考中贴表情shortcode",
-    "hint": "不维护完整 QQ 表情映射表，只把思考中阶段归一为一个可配置的 Rocket.Chat shortcode。默认值为 :heart:。",
+    "description": "LLM 思考中 Rocket.Chat shortcode",
     "type": "string",
     "default": ":heart:"
   },
+  "llm_using_tool_reaction": {
+    "description": "LLM 工具调用 Rocket.Chat shortcode",
+    "type": "string",
+    "default": ":tools:"
+  },
+  "llm_error_reaction": {
+    "description": "LLM 超时/失败 Rocket.Chat shortcode",
+    "type": "string",
+    "default": ":octagonal_sign:"
+  },
   "llm_done_reaction": {
-    "description": "LLM应答完成时贴表情shortcode",
-    "hint": "不维护完整 QQ 表情映射表，只把完成阶段归一为一个可配置的 Rocket.Chat shortcode。默认值为 :sunny:。",
+    "description": "LLM 应答完成 Rocket.Chat shortcode",
     "type": "string",
     "default": ":sunny:"
   }

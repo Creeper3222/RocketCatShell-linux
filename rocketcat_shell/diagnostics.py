@@ -309,6 +309,13 @@ def format_host_diagnostics_text(
 
 
 def format_runtime_diagnostic_lines(item: dict[str, Any]) -> list[str]:
+    if item.get("onebot_connected") is True:
+        onebot_state = "已连接"
+    elif item.get("onebot_waiting_for_upstream") is True:
+        retry_delay = float(item.get("onebot_retry_delay_seconds") or 5.0)
+        onebot_state = f"等待上游（每 {retry_delay:g} 秒重试）"
+    else:
+        onebot_state = "未连接"
     lines = [
         f"Bot：{item.get('client_name') or '-'}",
         f"连接状态：{item.get('status_label') or '-'}",
@@ -318,7 +325,9 @@ def format_runtime_diagnostic_lines(item: dict[str, Any]) -> list[str]:
         f"媒体上传端点：{item.get('upload_endpoint') or '-'}",
         f"Method 传输：{item.get('method_transport') or '-'}（REST 回退 {int(item.get('method_rest_fallbacks') or 0)} 次）",
         f"OneBot self_id：{item.get('onebot_self_id') or '-'}",
-        f"重连失败次数：{int(item.get('reconnect_failures') or 0)}",
+        f"Rocket.Chat 重连失败次数：{int(item.get('reconnect_failures') or 0)}",
+        f"OneBot 上游：{onebot_state}",
+        f"OneBot 丢弃事件：{int(item.get('onebot_dropped_event_count') or 0)}",
         f"最近 REST 登录：{format_timestamp_label(item.get('last_rest_login_at'))}",
         f"最近 WebSocket 活动：{format_timestamp_label(item.get('last_websocket_activity_at'))}",
         f"最近入站消息：{format_timestamp_label(item.get('last_inbound_message_at'))}",

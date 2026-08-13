@@ -4,7 +4,9 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>RocketCat Shell 登录</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260501a" />
+    <link rel="icon" type="image/png" href="/static/logo.png?v=20260814linux0221" />
+    <link rel="apple-touch-icon" href="/static/logo.png?v=20260814linux0221" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260814linux0221" />
   </head>
   <body>
     <section class="auth-shell">
@@ -13,7 +15,9 @@
 
       <div class="auth-card">
         <div class="auth-brand-mark">
-          <span class="brand-accent"></span>
+          <span class="brand-avatar auth-brand-avatar" aria-hidden="true">
+            <img src="/static/logo.png?v=20260814linux0221" alt="" />
+          </span>
           <div>
             <p class="auth-eyebrow">RocketCat Shell</p>
             <h1 class="auth-title">独立 WebUI 登录</h1>
@@ -21,7 +25,7 @@
         </div>
         <p class="auth-subtitle">请输入你在 RocketCat Shell 配置中设置的 WebUI 访问密码。</p>
 
-        <form id="authLoginForm" class="auth-form" autocomplete="off">
+        <form id="authLoginForm" class="auth-form" autocomplete="off" aria-describedby="authLoginError" aria-busy="false">
           <label for="authPasswordInput" class="auth-label">WebUI 访问密码</label>
           <input
             id="authPasswordInput"
@@ -33,7 +37,7 @@
             required
           />
           <p id="authLoginError" class="auth-error" role="alert"></p>
-          <button id="authSubmitButton" class="action-button primary auth-submit" type="submit">进入管理界面</button>
+          <button id="authSubmitButton" class="action-button primary auth-submit" type="submit" aria-busy="false">进入管理界面</button>
         </form>
       </div>
     </section>
@@ -44,6 +48,7 @@
         const passwordInput = document.getElementById('authPasswordInput');
         const errorBox = document.getElementById('authLoginError');
         const submitButton = document.getElementById('authSubmitButton');
+        errorBox.tabIndex = -1;
 
         form?.addEventListener('submit', async (event) => {
           event.preventDefault();
@@ -52,9 +57,12 @@
 
           if (!password) {
             errorBox.textContent = '请输入访问密码';
+            passwordInput.focus();
             return;
           }
 
+          form.setAttribute('aria-busy', 'true');
+          submitButton.setAttribute('aria-busy', 'true');
           submitButton.disabled = true;
           submitButton.textContent = '登录中...';
 
@@ -72,7 +80,10 @@
             window.location.replace('/');
           } catch (error) {
             errorBox.textContent = error.message || '登录失败，请稍后再试';
+            errorBox.focus({ preventScroll: true });
           } finally {
+            form.setAttribute('aria-busy', 'false');
+            submitButton.setAttribute('aria-busy', 'false');
             submitButton.disabled = false;
             submitButton.textContent = '进入管理界面';
           }
