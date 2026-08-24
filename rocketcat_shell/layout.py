@@ -19,6 +19,7 @@ class ProjectLayout:
     shell_settings_path: Path
     bot_registry_path: Path
     log_file_path: Path
+    onebot_transports_path: Path | None = None
 
     @classmethod
     def discover(cls) -> "ProjectLayout":
@@ -46,6 +47,7 @@ class ProjectLayout:
             shell_settings_path=config_dir / "shell.json",
             bot_registry_path=config_dir / "bots.json",
             log_file_path=logs_dir / "rocketcat.log",
+            onebot_transports_path=config_dir / "onebot_transports.json",
         )
 
     def ensure_directories(self) -> None:

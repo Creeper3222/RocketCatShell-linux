@@ -69,7 +69,10 @@ class PerformanceMetricTests(unittest.IsolatedAsyncioTestCase):
             metrics.increment("processed")
         snapshot = metrics.snapshot()
         self.assertEqual(100, snapshot["counters"]["processed"])
-        self.assertEqual(32, snapshot["timings"]["latency"]["sample_count"])
+        timing = snapshot["timings"]["latency"]
+        self.assertEqual(7, timing["sample_count"])
+        self.assertEqual(16, timing["sample_every"])
+        self.assertEqual(0.0625, timing["sample_rate"])
         self.assertNotIn("payload", repr(snapshot).lower())
 
     def test_rss_slope_uses_stable_low_water_windows(self) -> None:
@@ -169,6 +172,21 @@ class InboundQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, snapshot["ddp_ping_count"])
         self.assertIsNotNone(snapshot["last_ddp_ping_at"])
 
+    async def test_inbound_workers_retire_after_idle_window(self) -> None:
+        client = RocketChatClient(build_config())
+        client._running = True
+        client._start_inbound_workers()
+        with mock.patch(
+            "rocketcat_shell.bridge.rocketchat_client.INBOUND_WORKER_IDLE_SECONDS",
+            0.02,
+        ):
+            await client._enqueue_incoming_message({"_id": "m1", "rid": "room-a"})
+            await client._drain_inbound_queue(timeout=1)
+            self.assertEqual(1, len(client._inbound_workers))
+            await asyncio.sleep(0.15)
+            self.assertEqual(0, len(client._inbound_workers))
+        await client._stop_inbound_workers()
+
     async def test_subscription_ready_diagnostics_require_every_requested_id(self) -> None:
         client = RocketChatClient(build_config())
         websocket = _FakeWebSocket()
@@ -190,7 +208,7 @@ class InboundQueueTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ActionWorkerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_fixed_worker_pool_and_diagnostics(self) -> None:
+    async def test_action_workers_start_lazily_and_report_diagnostics(self) -> None:
         async def handler(_action, _params):
             return {"status": "ok", "retcode": 0, "data": {"ok": True}}
 
@@ -198,11 +216,33 @@ class ActionWorkerTests(unittest.IsolatedAsyncioTestCase):
         client._running = True
         client._start_action_workers()
         try:
-            self.assertEqual(8, len(client._action_workers))
+            self.assertEqual(0, len(client._action_workers))
+            response = await client._dispatcher.execute("get_status", {}, "probe")
+            self.assertEqual("ok", response["status"])
+            self.assertEqual(1, len(client._action_workers))
             snapshot = client.build_diagnostic_snapshot()["performance"]["onebot_actions"]
             self.assertEqual(256, snapshot["capacity"])
+            self.assertEqual(1, snapshot["workers"])
+            self.assertEqual(8, snapshot["worker_limit"])
         finally:
             await client._stop_action_workers()
+
+    async def test_action_workers_retire_after_idle_window(self) -> None:
+        async def handler(_action, _params):
+            return {"status": "ok", "retcode": 0, "data": None}
+
+        client = OneBotReverseWsClient(build_config(), handler)
+        client._running = True
+        client._start_action_workers()
+        with mock.patch(
+            "rocketcat_shell.bridge.transports.action_dispatcher.ACTION_WORKER_IDLE_SECONDS",
+            0.02,
+        ):
+            await client._dispatcher.execute("get_status", {}, "probe")
+            self.assertEqual(1, len(client._action_workers))
+            await asyncio.sleep(0.15)
+            self.assertEqual(0, len(client._action_workers))
+        await client._stop_action_workers()
 
 
 class PersistenceWorkerTests(unittest.IsolatedAsyncioTestCase):

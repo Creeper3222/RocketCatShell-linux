@@ -309,7 +309,11 @@ def format_host_diagnostics_text(
 
 
 def format_runtime_diagnostic_lines(item: dict[str, Any]) -> list[str]:
-    if item.get("onebot_connected") is True:
+    transport_label = str(item.get("onebot_transport_label") or "Websocket客户端").strip()
+    transport_status = str(item.get("onebot_transport_status") or "").strip()
+    if transport_status:
+        onebot_state = transport_status
+    elif item.get("onebot_connected") is True:
         onebot_state = "已连接"
     elif item.get("onebot_waiting_for_upstream") is True:
         retry_delay = float(item.get("onebot_retry_delay_seconds") or 5.0)
@@ -325,6 +329,7 @@ def format_runtime_diagnostic_lines(item: dict[str, Any]) -> list[str]:
         f"媒体上传端点：{item.get('upload_endpoint') or '-'}",
         f"Method 传输：{item.get('method_transport') or '-'}（REST 回退 {int(item.get('method_rest_fallbacks') or 0)} 次）",
         f"OneBot self_id：{item.get('onebot_self_id') or '-'}",
+        f"OneBot 网络类型：{transport_label}",
         f"Rocket.Chat 重连失败次数：{int(item.get('reconnect_failures') or 0)}",
         f"OneBot 上游：{onebot_state}",
         f"OneBot 丢弃事件：{int(item.get('onebot_dropped_event_count') or 0)}",

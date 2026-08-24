@@ -6,6 +6,7 @@ import queue
 import struct
 import threading
 import time
+from collections.abc import Iterator, Mapping
 from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass
@@ -48,6 +49,25 @@ class _FlushCommand:
 @dataclass(slots=True)
 class _StopCommand:
     done: threading.Event
+
+
+@dataclass(slots=True)
+class SnapshotCapture(Mapping[str, Any]):
+    state: dict[str, Any]
+    lock_wait_ms: float
+    copy_ms: float
+
+    # v0.2.2 callers received the state dictionary directly.  Keep the richer
+    # capture timings for the writer while preserving that read-only mapping
+    # contract for integrations which inspect a snapshot synchronously.
+    def __getitem__(self, key: str) -> Any:
+        return self.state[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.state)
+
+    def __len__(self) -> int:
+        return len(self.state)
 
 
 class RuntimeStateMutationBatch:
@@ -155,9 +175,9 @@ class JournalPersistenceWorker:
         *,
         snapshot_path: Path,
         journal_path: Path,
-        snapshot_provider: Callable[[], dict[str, Any]],
+        snapshot_provider: Callable[[], dict[str, Any] | SnapshotCapture],
         flush_every_records: int = 32,
-        snapshot_every_records: int = 2048,
+        snapshot_every_records: int = 8192,
         idle_flush_interval: float = 0.5,
     ):
         self.snapshot_path = snapshot_path
@@ -174,11 +194,15 @@ class JournalPersistenceWorker:
         self._queue_high_water = 0
         self._enqueue_wait_metric = RollingMetric(capacity=2048)
         self._snapshot_capture_metric = RollingMetric(capacity=128)
+        self._snapshot_lock_wait_metric = RollingMetric(capacity=128)
+        self._snapshot_copy_metric = RollingMetric(capacity=128)
         self._snapshot_serialize_metric = RollingMetric(capacity=128)
         self._snapshot_total_metric = RollingMetric(capacity=128)
         self._state_lock = threading.Lock()
         self._last_error = ""
         self._snapshot_count = 0
+        self._physical_records_written = 0
+        self._coalesced_batch_count = 0
         self._closed = False
         self._thread = threading.Thread(
             target=self._run,
@@ -286,6 +310,8 @@ class JournalPersistenceWorker:
     def diagnostic_snapshot(self) -> dict[str, Any]:
         wait_snapshot = self._enqueue_wait_metric.snapshot()
         snapshot_capture = self._snapshot_capture_metric.snapshot()
+        snapshot_lock_wait = self._snapshot_lock_wait_metric.snapshot()
+        snapshot_copy = self._snapshot_copy_metric.snapshot()
         snapshot_serialize = self._snapshot_serialize_metric.snapshot()
         snapshot_total = self._snapshot_total_metric.snapshot()
         accepted_batches = self._accepted_batches
@@ -293,6 +319,8 @@ class JournalPersistenceWorker:
         with self._state_lock:
             last_error = self._last_error
             snapshot_count = self._snapshot_count
+            physical_records_written = self._physical_records_written
+            coalesced_batch_count = self._coalesced_batch_count
         return {
             "backlog": self._queue.qsize(),
             "capacity": self._queue.maxsize,
@@ -303,12 +331,18 @@ class JournalPersistenceWorker:
             "snapshot_count": snapshot_count,
             "snapshot_capture_p95_ms": snapshot_capture["p95"],
             "snapshot_capture_max_ms": snapshot_capture["max"],
+            "snapshot_lock_wait_p95_ms": snapshot_lock_wait["p95"],
+            "snapshot_lock_wait_max_ms": snapshot_lock_wait["max"],
+            "snapshot_copy_p95_ms": snapshot_copy["p95"],
+            "snapshot_copy_max_ms": snapshot_copy["max"],
             "snapshot_serialize_p95_ms": snapshot_serialize["p95"],
             "snapshot_serialize_max_ms": snapshot_serialize["max"],
             "snapshot_total_p95_ms": snapshot_total["p95"],
             "snapshot_total_max_ms": snapshot_total["max"],
             "writer_alive": self._thread.is_alive(),
             "last_error": last_error,
+            "physical_records_written": physical_records_written,
+            "coalesced_batch_count": coalesced_batch_count,
             "journal_bytes": self.journal_path.stat().st_size if self.journal_path.exists() else 0,
         }
 
@@ -359,13 +393,19 @@ class JournalPersistenceWorker:
         records_since_snapshot = 0
         journal_handle = None
         current_item: Any = None
+        deferred_item: Any = None
         try:
             journal_handle = self.journal_path.open("ab")
             while True:
-                try:
-                    current_item = self._queue.get(timeout=self._idle_flush_interval)
-                except queue.Empty:
-                    current_item = None
+                if deferred_item is not None:
+                    current_item = deferred_item
+                    deferred_item = None
+                else:
+                    try:
+                        current_item = self._queue.get(timeout=self._idle_flush_interval)
+                    except queue.Empty:
+                        current_item = None
+                if current_item is None:
                     if pending_since_flush:
                         self._flush_handle(journal_handle)
                         pending_since_flush = 0
@@ -395,9 +435,33 @@ class JournalPersistenceWorker:
                     current_item = None
                     break
 
+                logical_records = 1
+                if (
+                    isinstance(current_item, dict)
+                    and current_item.get("op") == "batch"
+                ):
+                    mutations = list(current_item.get("mutations") or [])
+                    while logical_records < 32:
+                        try:
+                            next_item = self._queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        if (
+                            isinstance(next_item, dict)
+                            and next_item.get("op") == "batch"
+                        ):
+                            mutations.extend(next_item.get("mutations") or [])
+                            logical_records += 1
+                            continue
+                        deferred_item = next_item
+                        break
+                    current_item = {"op": "batch", "mutations": mutations}
                 self._write_record(journal_handle, current_item)
-                pending_since_flush += 1
-                records_since_snapshot += 1
+                with self._state_lock:
+                    self._physical_records_written += 1
+                    self._coalesced_batch_count += max(0, logical_records - 1)
+                pending_since_flush += logical_records
+                records_since_snapshot += logical_records
                 current_item = None
                 if pending_since_flush >= self._flush_every_records:
                     self._flush_handle(journal_handle)
@@ -410,6 +474,8 @@ class JournalPersistenceWorker:
                 self._last_error = repr(exc)
             if isinstance(current_item, (_FlushCommand, _StopCommand)):
                 current_item.done.set()
+            if isinstance(deferred_item, (_FlushCommand, _StopCommand)):
+                deferred_item.done.set()
             while True:
                 try:
                     queued_item = self._queue.get_nowait()
@@ -437,7 +503,13 @@ class JournalPersistenceWorker:
     def _write_snapshot_and_rotate(self, journal_handle):
         snapshot_started_at = time.perf_counter()
         capture_started_at = snapshot_started_at
-        state = self._snapshot_provider()
+        capture = self._snapshot_provider()
+        if isinstance(capture, SnapshotCapture):
+            state = capture.state
+            self._snapshot_lock_wait_metric.observe(capture.lock_wait_ms)
+            self._snapshot_copy_metric.observe(capture.copy_ms)
+        else:
+            state = capture
         capture_finished_at = time.perf_counter()
         snapshot_payload = {
             "version": self._SNAPSHOT_VERSION,
@@ -575,13 +647,15 @@ class RuntimeStateEngine:
                 },
             }
 
-    def export_snapshot_payload(self) -> dict[str, Any]:
+    def export_snapshot_payload(self) -> SnapshotCapture:
+        capture_started_at = time.perf_counter()
         with self._lock:
+            lock_acquired_at = time.perf_counter()
             # Message/context payloads are copy-on-write after insertion. Only
             # freeze the top-level containers while holding the state lock;
             # recursive pickle serialization belongs to the writer thread and
             # must not stall inbound event-loop mutations.
-            return {
+            state = {
                 "message_window_size": self._message_window_size,
                 "counters": dict(self._counters),
                 "forward": {
@@ -594,7 +668,6 @@ class RuntimeStateEngine:
                 },
                 "message_order": list(self._message_order),
                 "messages_by_source": dict(self._messages_by_source),
-                "messages_by_surrogate": dict(self._messages_by_surrogate),
                 "latest_by_context_sender": dict(self._latest_by_context_sender),
                 "context_sender_message_order": {
                     key: list(value)
@@ -603,8 +676,13 @@ class RuntimeStateEngine:
                 "private_room_by_user_source": dict(self._private_room_by_user_source),
                 "private_room_by_user_surrogate": dict(self._private_room_by_user_surrogate),
                 "context_room_by_source": dict(self._context_room_by_source),
-                "context_room_by_surrogate": dict(self._context_room_by_surrogate),
             }
+            copy_finished_at = time.perf_counter()
+        return SnapshotCapture(
+            state=state,
+            lock_wait_ms=(lock_acquired_at - capture_started_at) * 1000.0,
+            copy_ms=(copy_finished_at - lock_acquired_at) * 1000.0,
+        )
 
     def load_snapshot_payload(self, payload: dict[str, Any]) -> None:
         if not isinstance(payload, dict):
@@ -953,7 +1031,10 @@ class RuntimeStateEngine:
                 existing_timestamp = int(existing.get("timestamp") or 0)
                 if existing_timestamp > int(timestamp):
                     return False
-            normalized_entry = deepcopy(entry)
+            # Context entries are normalized to scalar fields by both public
+            # bind paths. A shallow copy preserves the ownership boundary
+            # without paying recursive deepcopy cost for every message.
+            normalized_entry = dict(entry)
             self._context_room_by_source[str(normalized_entry["context_source_id"])] = normalized_entry
             self._context_room_by_surrogate[str(normalized_entry["context_surrogate_id"])] = normalized_entry
         return True
@@ -961,12 +1042,12 @@ class RuntimeStateEngine:
     def get_context_room_by_source(self, context_source_id: str) -> dict[str, Any] | None:
         with self._lock:
             entry = self._context_room_by_source.get(str(context_source_id))
-            return deepcopy(entry) if isinstance(entry, dict) else None
+            return dict(entry) if isinstance(entry, dict) else None
 
     def get_context_room_by_surrogate(self, context_surrogate_id: int | str) -> dict[str, Any] | None:
         with self._lock:
             entry = self._context_room_by_surrogate.get(str(context_surrogate_id))
-            return deepcopy(entry) if isinstance(entry, dict) else None
+            return dict(entry) if isinstance(entry, dict) else None
 
     def _apply_record(self, record: dict[str, Any], *, persist: bool) -> None:
         if not isinstance(record, dict):

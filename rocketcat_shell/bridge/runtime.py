@@ -20,7 +20,7 @@ from .hot_storage import RuntimeHotStoreBundle, build_runtime_hot_stores
 from .id_map import DurableIdMap
 from .media_publication import MediaPublicationService
 from .onebot_actions import OneBotActionHandler
-from .onebot_client import OneBotReverseWsClient
+from .transports import OneBotTransport, create_transport
 from .paths import resolve_plugin_data_dir
 from .perf import maybe_trace, perf_enabled, perf_stage
 from .rocketchat_client import RocketChatClient
@@ -74,7 +74,7 @@ class BridgeRuntime:
         self.inbound_translator: InboundTranslator | None = None
         self.outbound_translator: OutboundMessageTranslator | None = None
         self.action_handler: OneBotActionHandler | None = None
-        self.onebot: OneBotReverseWsClient | None = None
+        self.onebot: OneBotTransport | None = None
         self.identity_registry: UserIdentityRegistry | None = None
         self.identity_database_path: Path | None = None
         self._plugin_runtime_context: PluginExecutionContext | None = None
@@ -115,6 +115,8 @@ class BridgeRuntime:
                 "status": "connecting",
                 "server_url": self.config.server_url,
                 "onebot_ws_url": self.config.onebot_ws_url,
+                "onebot_transport_type": self.config.transport_type,
+                "onebot_transport_label": self.config.transport_label,
                 "onebot_self_id": self.config.onebot_self_id,
                 "max_reconnect_attempts": self.config.max_reconnect_attempts,
             }
@@ -219,6 +221,8 @@ class BridgeRuntime:
                     "status": "running",
                     "server_url": self.config.server_url,
                     "onebot_ws_url": self.config.onebot_ws_url,
+                    "onebot_transport_type": self.config.transport_type,
+                    "onebot_transport_label": self.config.transport_label,
                     "onebot_self_id": self.config.onebot_self_id,
                     "max_reconnect_attempts": self.config.max_reconnect_attempts,
                     "start_reason": reason,
@@ -334,6 +338,15 @@ class BridgeRuntime:
             "server_version": server_version,
             "compatibility_status": compatibility_status,
             "onebot_self_id": self.config.onebot_self_id,
+            "onebot_transport_type": self.config.transport_type,
+            "onebot_transport_label": self.config.transport_label,
+            "onebot_transport_status": (
+                self.onebot.build_diagnostic_snapshot().get(
+                    "onebot_transport_status", "未启动"
+                )
+                if self.onebot is not None
+                else "未启动"
+            ),
             "server_display_name": server_display_name,
             "server_avatar_url": server_avatar_url,
             "is_main_bot": False,
@@ -562,9 +575,9 @@ class BridgeRuntime:
                 outbound=self.outbound_translator,
                 plugin_action_dispatcher=self._dispatch_plugin_action,
             )
-            self.onebot = OneBotReverseWsClient(
+            self.onebot = create_transport(
                 self.config,
-                action_handler=self.action_handler.handle,
+                self.action_handler.handle,
             )
             await self.rocketchat.start_realtime()
             await self.onebot.start()
@@ -746,6 +759,8 @@ class BridgeRuntime:
                     "status": "connecting",
                     "server_url": self.config.server_url,
                     "onebot_ws_url": self.config.onebot_ws_url,
+                    "onebot_transport_type": self.config.transport_type,
+                    "onebot_transport_label": self.config.transport_label,
                     "onebot_self_id": self.config.onebot_self_id,
                     "max_reconnect_attempts": self.config.max_reconnect_attempts,
                     "restart_reason": reason,

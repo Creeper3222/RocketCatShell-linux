@@ -46,6 +46,16 @@ def _flush_and_close_media_file(temporary: Any) -> None:
     temporary.close()
 
 
+def _write_and_hash_media_chunk(
+    temporary: Any,
+    digest: Any,
+    chunk: bytes,
+) -> int:
+    digest.update(chunk)
+    temporary.write(chunk)
+    return len(chunk)
+
+
 class MediaCacheCoordinator:
     _registry: dict[str, "MediaCacheCoordinator"] = {}
     _registry_lock = threading.Lock()
@@ -1168,7 +1178,11 @@ class RocketChatMediaBridge:
                     )
                     return None
                 loop = asyncio.get_running_loop()
+                encrypted_batch = bytearray()
                 async for chunk in resp.content.iter_chunked(64 * 1024):
+                    encrypted_batch.extend(chunk)
+                    if len(encrypted_batch) < 512 * 1024:
+                        continue
                     plaintext_size = await loop.run_in_executor(
                         CRYPTO_EXECUTOR,
                         _decrypt_and_write_media_chunk,
@@ -1176,8 +1190,9 @@ class RocketChatMediaBridge:
                         digest,
                         temporary,
                         signature,
-                        chunk,
+                        bytes(encrypted_batch),
                     )
+                    encrypted_batch.clear()
                     if not plaintext_size:
                         continue
                     total_plaintext += plaintext_size
@@ -1188,6 +1203,20 @@ class RocketChatMediaBridge:
                             limit=limit,
                             source=media_url,
                         )
+                        return None
+                buffered_plaintext_size = 0
+                if encrypted_batch:
+                    buffered_plaintext_size = await loop.run_in_executor(
+                        CRYPTO_EXECUTOR,
+                        _decrypt_and_write_media_chunk,
+                        decryptor,
+                        digest,
+                        temporary,
+                        signature,
+                        bytes(encrypted_batch),
+                    )
+                    total_plaintext += buffered_plaintext_size
+                    if limit and total_plaintext > limit:
                         return None
                 final_plaintext_size = await loop.run_in_executor(
                     CRYPTO_EXECUTOR,
@@ -2230,6 +2259,9 @@ class RocketChatMediaBridge:
                 tmp_path = tmp.name
                 try:
                     downloaded = 0
+                    digest = hashlib.sha256()
+                    buffered = bytearray()
+                    loop = asyncio.get_running_loop()
                     async for chunk in resp.content.iter_chunked(64 * 1024):
                         downloaded += len(chunk)
                         if downloaded > limit:
@@ -2242,10 +2274,33 @@ class RocketChatMediaBridge:
                             tmp.close()
                             os.unlink(tmp_path)
                             return None
-                        tmp.write(chunk)
-                    tmp.close()
-                    digest = await asyncio.to_thread(self._hash_file, tmp_path)
-                    target = self._media_temp_dir / f"remote_{digest}{self._safe_media_suffix(suffix)}"
+                        buffered.extend(chunk)
+                        if len(buffered) < 1024 * 1024:
+                            continue
+                        await loop.run_in_executor(
+                            CRYPTO_EXECUTOR,
+                            _write_and_hash_media_chunk,
+                            tmp,
+                            digest,
+                            bytes(buffered),
+                        )
+                        buffered.clear()
+                    if buffered:
+                        await loop.run_in_executor(
+                            CRYPTO_EXECUTOR,
+                            _write_and_hash_media_chunk,
+                            tmp,
+                            digest,
+                            bytes(buffered),
+                        )
+                    await loop.run_in_executor(
+                        CRYPTO_EXECUTOR,
+                        _flush_and_close_media_file,
+                        tmp,
+                    )
+                    target = self._media_temp_dir / (
+                        f"remote_{digest.hexdigest()}{self._safe_media_suffix(suffix)}"
+                    )
                     try:
                         Path(tmp_path).replace(target)
                     except FileExistsError:

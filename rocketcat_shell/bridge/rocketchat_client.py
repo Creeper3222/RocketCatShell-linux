@@ -32,6 +32,7 @@ from .rocketchat_e2ee import RocketChatE2EEManager
 
 MessageCallback = Callable[[dict[str, Any]], Awaitable[None]]
 FailureCallback = Callable[[str, int, str], Awaitable[None]]
+INBOUND_WORKER_IDLE_SECONDS = 60.0
 
 
 class RocketChatClient:
@@ -79,7 +80,8 @@ class RocketChatClient:
         self._method_call_id = 0
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._inbound_queues: list[asyncio.Queue[tuple[dict[str, Any], float]]] = []
-        self._inbound_workers: set[asyncio.Task[Any]] = set()
+        self._inbound_workers: dict[int, asyncio.Task[Any]] = {}
+        self._inbound_queue_depth = 0
         self._inbound_metrics = RuntimeMetrics()
         self._last_inbound_overload_warning_at = 0.0
         self._subscribed_rooms: set[str] = set()
@@ -296,7 +298,7 @@ class RocketChatClient:
             auth_state = "partial"
         else:
             auth_state = "disconnected"
-        queue_depth = sum(queue_obj.qsize() for queue_obj in self._inbound_queues)
+        queue_depth = self._inbound_queue_depth
         queue_capacity = len(self._inbound_queues) * self._INBOUND_QUEUE_MAX_SIZE
         oldest_wait_ms = 0.0
         now = time.perf_counter()
@@ -340,7 +342,8 @@ class RocketChatClient:
             "method_transport": self._method_transport,
             "method_rest_fallbacks": self._method_rest_fallbacks,
             "local_media_base_url": self.media.local_media_base_url,
-            "inbound_worker_count": self._inbound_worker_count,
+            "inbound_worker_count": len(self._inbound_workers),
+            "inbound_worker_limit": self._inbound_worker_count,
             "inbound_queue_depth": queue_depth,
             "inbound_queue_capacity": queue_capacity,
             "user_cache_entries": len(self._user_cache),
@@ -568,22 +571,35 @@ class RocketChatClient:
             self._background_tasks.clear()
 
     def _start_inbound_workers(self) -> None:
-        if self._inbound_workers:
+        if self._inbound_queues:
             return
         self._inbound_queues = [
             asyncio.Queue(maxsize=self._INBOUND_QUEUE_MAX_SIZE)
             for _ in range(self._inbound_worker_count)
         ]
-        for index in range(self._inbound_worker_count):
-            task = asyncio.create_task(
-                self._inbound_worker_loop(self._inbound_queues[index]),
-                name=f"RocketChatInboundWorker:{index + 1}",
-            )
-            self._inbound_workers.add(task)
-            task.add_done_callback(self._on_inbound_worker_done)
 
-    def _on_inbound_worker_done(self, task: asyncio.Task[Any]) -> None:
-        self._inbound_workers.discard(task)
+    def _ensure_inbound_worker(self, bucket: int) -> None:
+        existing = self._inbound_workers.get(bucket)
+        if existing is not None and not existing.done():
+            return
+        if bucket < 0 or bucket >= len(self._inbound_queues):
+            return
+        task = asyncio.create_task(
+            self._inbound_worker_loop(bucket, self._inbound_queues[bucket]),
+            name=f"RocketChatInboundWorker:{bucket + 1}",
+        )
+        self._inbound_workers[bucket] = task
+        task.add_done_callback(
+            lambda completed, worker_bucket=bucket: self._on_inbound_worker_done(
+                worker_bucket, completed
+            )
+        )
+
+    def _on_inbound_worker_done(
+        self, bucket: int, task: asyncio.Task[Any]
+    ) -> None:
+        if self._inbound_workers.get(bucket) is task:
+            self._inbound_workers.pop(bucket, None)
         if task.cancelled():
             return
         try:
@@ -596,9 +612,15 @@ class RocketChatClient:
                 self.config.bot_id or self.config.display_name or "unknown",
                 error,
             )
+        if (
+            self._running
+            and bucket < len(self._inbound_queues)
+            and not self._inbound_queues[bucket].empty()
+        ):
+            self._ensure_inbound_worker(bucket)
 
     async def _stop_inbound_workers(self) -> None:
-        workers = list(self._inbound_workers)
+        workers = list(self._inbound_workers.values())
         self._inbound_workers.clear()
         for task in workers:
             if not task.done():
@@ -606,6 +628,7 @@ class RocketChatClient:
         if workers:
             await asyncio.gather(*workers, return_exceptions=True)
         self._inbound_queues = []
+        self._inbound_queue_depth = 0
 
     async def _drain_inbound_queue(self, *, timeout: float = 10.0) -> None:
         if not self._inbound_queues:
@@ -627,10 +650,7 @@ class RocketChatClient:
             self._inbound_metrics.increment("overload_dropped")
             return
         room_id = str(raw_msg.get("rid") or "")
-        bucket = int.from_bytes(
-            hashlib.blake2b(room_id.encode("utf-8"), digest_size=2).digest(),
-            "big",
-        ) % len(self._inbound_queues)
+        bucket = hash(room_id) % len(self._inbound_queues)
         queue_obj = self._inbound_queues[bucket]
         try:
             queue_obj.put_nowait((raw_msg, time.perf_counter()))
@@ -644,23 +664,32 @@ class RocketChatClient:
                     "bot=%s | dropped_total=%s | depth=%s | capacity=%s",
                     self.config.bot_id or self.config.display_name or "unknown",
                     dropped,
-                    sum(item.qsize() for item in self._inbound_queues),
+                    self._inbound_queue_depth,
                     len(self._inbound_queues) * self._INBOUND_QUEUE_MAX_SIZE,
                 )
             return
+        self._inbound_queue_depth += 1
         self._inbound_metrics.increment("accepted")
         self._inbound_metrics.set_gauge(
             "queue_depth",
-            sum(item.qsize() for item in self._inbound_queues),
+            self._inbound_queue_depth,
             high_water=True,
         )
+        self._ensure_inbound_worker(bucket)
 
     async def _inbound_worker_loop(
         self,
+        _bucket: int,
         queue_obj: asyncio.Queue[tuple[dict[str, Any], float]],
     ) -> None:
         while True:
-            raw_msg, queued_at = await queue_obj.get()
+            try:
+                raw_msg, queued_at = await asyncio.wait_for(
+                    queue_obj.get(), timeout=INBOUND_WORKER_IDLE_SECONDS
+                )
+            except asyncio.TimeoutError:
+                return
+            self._inbound_queue_depth = max(0, self._inbound_queue_depth - 1)
             started_at = time.perf_counter()
             self._inbound_metrics.observe("queue_wait_ms", (started_at - queued_at) * 1000.0)
             try:
@@ -2040,6 +2069,8 @@ class RocketChatClient:
                 continue
             if isinstance(value, (dict, list)):
                 value = self._stable_hash_json(value)
+            elif key in {"msg", "text"} and isinstance(value, str) and len(value) > 64:
+                value = f"{len(value)}:{hash(value)}"
             parts.append(f"{key}={value}")
         for key in ("attachments", "files", "urls", "mentions"):
             value = raw_msg.get(key)

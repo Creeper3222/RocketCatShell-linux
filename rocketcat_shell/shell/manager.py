@@ -14,6 +14,12 @@ from ..bridge.hot_storage import build_runtime_hot_stores
 from ..bridge.id_map import DurableIdMap
 from ..bridge.media_publication import MediaPublicationService
 from ..bridge.runtime import BridgeRuntime
+from ..bridge.transports import (
+    TransportValidationError,
+    get_transport_spec,
+    normalize_transport,
+    transport_catalog,
+)
 from ..bridge.user_identity import UserIdentityRegistry
 from ..diagnostics import build_runtime_diagnostic_item, collect_cached_host_diagnostics_with_meta
 from ..layout import ProjectLayout
@@ -36,11 +42,18 @@ class CardOrderConflictError(ValueError):
     """Raised when a saved order no longer matches the current entity set."""
 
 
+class BotTransportTypeConflictError(ValueError):
+    """Raised when an existing bot attempts to change its transport type."""
+
+
 class ShellManager:
     def __init__(self, layout: ProjectLayout):
         self.layout = layout
         self.settings: ShellSettings | None = None
-        self.registry = BotRegistry(layout.bot_registry_path)
+        self.registry = BotRegistry(
+            layout.bot_registry_path,
+            layout.onebot_transports_path,
+        )
         self.plugin_manager = RocketCatPluginManager(layout)
         self.media_publication = MediaPublicationService()
         self.updates = UpdateService(layout.project_root, layout.project_root)
@@ -62,7 +75,8 @@ class ShellManager:
         self.settings = load_or_create_shell_settings(self.layout.shell_settings_path)
         self.bots = self.registry.load(defaults=self.settings)
 
-        self.registry.save(self.bots)
+        if self.registry.loaded_transport_state_valid:
+            self.registry.save(self.bots)
         if start_runtimes:
             await self._reconcile_runtimes("shell initialize")
 
@@ -115,7 +129,11 @@ class ShellManager:
             "bot_count": len(self.bots),
             "enabled_bot_count": sum(1 for bot in self.bots if bot.enabled),
             "active_runtime_count": sum(1 for runtime in self.runtimes.values() if runtime.started),
-            "plugin_count": len(self.plugin_manager.list_plugins()),
+            "plugin_count": (
+                self.plugin_manager.cached_plugin_count()
+                if compact
+                else len(self.plugin_manager.list_plugins())
+            ),
             "plugin_global_instance_count": plugin_diagnostics["global_instance_count"],
             "plugin_runtime_binding_count": plugin_diagnostics["runtime_binding_count"],
             "user_identity_algorithm": "sha256-linear-v1",
@@ -333,7 +351,11 @@ class ShellManager:
         if candidate_message_index_max_entries <= 0:
             raise ValueError("配置导入失败，最大消息映射窗口条数必须是正整数")
 
-        candidate_bots = self._build_import_bots(raw_bots, defaults=settings)
+        candidate_bots = self._build_import_bots(
+            raw_bots,
+            defaults=settings,
+            webui_port=candidate_port,
+        )
         candidate_plugin_configs = self.plugin_manager.normalize_import_configs(
             self._normalize_import_plugin_configs(raw_plugin_configs)
         )
@@ -546,7 +568,7 @@ class ShellManager:
 
     async def get_webui_state(self, *, compact: bool = False) -> dict[str, Any]:
         settings = self._require_settings()
-        items = await self.list_bots()
+        items = [] if compact else await self.list_bots()
         actual_port = self._webui_actual_port or settings.webui_port
         host = self._webui_host or settings.webui_host
         enabled_count = sum(1 for bot in self.bots if bot.enabled)
@@ -643,6 +665,18 @@ class ShellManager:
                     message_index_max_entries=settings.message_index_max_entries,
                 )
                 item["onebot_self_id"] = self._read_persisted_self_id(bot.bot_id) or None
+            item.setdefault("onebot_transport_type", bot.onebot_transport_type)
+            try:
+                item.setdefault(
+                    "onebot_transport_label",
+                    get_transport_spec(bot.onebot_transport_type).label,
+                )
+            except TransportValidationError:
+                item.setdefault("onebot_transport_label", bot.onebot_transport_type)
+            item.setdefault(
+                "onebot_transport_status",
+                "已停用" if not bot.enabled else "等待启动",
+            )
             items.append(item)
 
         items.sort(
@@ -703,9 +737,18 @@ class ShellManager:
             },
         }
 
-    async def list_bots(self) -> list[dict[str, Any]]:
+    async def list_bots(self, *, compact: bool = False) -> list[dict[str, Any]]:
         async with self._lock:
-            return [self._serialize_bot(bot, mask_secrets=False) for bot in self.bots]
+            serializer = self._serialize_bot_compact if compact else self._serialize_bot
+            return [serializer(bot, mask_secrets=False) for bot in self.bots]
+
+    async def get_bot(self, bot_id: str) -> dict[str, Any]:
+        async with self._lock:
+            bot = self._get_bot_or_raise(bot_id)
+            return self._serialize_bot(bot, mask_secrets=False)
+
+    def get_onebot_transport_catalog(self) -> list[dict[str, Any]]:
+        return transport_catalog(self._require_settings())
 
     async def create_bot(self, payload: dict[str, Any]) -> dict[str, Any]:
         async with self._lock:
@@ -1004,9 +1047,28 @@ class ShellManager:
             payload["password"] = "***" if payload.get("password") else ""
             payload["e2ee_password"] = "***" if payload.get("e2ee_password") else ""
         payload["validation_errors"] = bot.validate()
+        try:
+            spec = get_transport_spec(bot.onebot_transport_type)
+            payload["onebot_transport_label"] = spec.label
+            payload["onebot_transport_card_fields"] = [
+                item.to_public_mapping() for item in spec.card_fields
+            ]
+        except TransportValidationError as exc:
+            payload["onebot_transport_label"] = bot.onebot_transport_type
+            payload["onebot_transport_card_fields"] = []
+            payload["validation_errors"].append(str(exc))
         payload["data_dir"] = str(self.layout.bots_dir / bot.bot_id)
         runtime = self.runtimes.get(bot.bot_id)
         payload["runtime_active"] = bool(runtime and runtime.started)
+        if runtime is not None and runtime.onebot is not None:
+            transport_snapshot = runtime.onebot.build_diagnostic_snapshot()
+            payload["onebot_transport_status"] = transport_snapshot.get(
+                "onebot_transport_status", "运行中"
+            )
+        else:
+            payload["onebot_transport_status"] = (
+                "已停用" if not bot.enabled else "等待连接"
+            )
         payload["onebot_self_id"] = (
             int(runtime.config.onebot_self_id)
             if runtime is not None and runtime.config.onebot_self_id > 0
@@ -1014,6 +1076,66 @@ class ShellManager:
         )
         payload["user_mapping_ready"] = bool(payload["onebot_self_id"])
         return payload
+
+    def _serialize_bot_compact(
+        self,
+        bot: BotRecord,
+        *,
+        mask_secrets: bool = False,
+    ) -> dict[str, Any]:
+        """Serialize only fields used by cards and fallback summaries."""
+        del mask_secrets
+        validation_errors = bot.validate()
+        try:
+            spec = get_transport_spec(bot.onebot_transport_type)
+            transport_label = spec.label
+            card_fields = [item.to_public_mapping() for item in spec.card_fields]
+        except TransportValidationError as exc:
+            transport_label = bot.onebot_transport_type
+            card_fields = []
+            validation_errors.append(str(exc))
+
+        card_setting_keys = {
+            str(item.get("key") or "")
+            for item in card_fields
+            if str(item.get("key") or "")
+        }
+        transport_settings = {
+            key: bot.onebot_transport_settings.get(key)
+            for key in card_setting_keys
+        }
+        runtime = self.runtimes.get(bot.bot_id)
+        onebot_self_id = (
+            int(runtime.config.onebot_self_id)
+            if runtime is not None and runtime.config.onebot_self_id > 0
+            else self._read_persisted_self_id(bot.bot_id)
+        )
+        if runtime is not None and runtime.onebot is not None:
+            transport_status = runtime.onebot.build_diagnostic_snapshot().get(
+                "onebot_transport_status",
+                "运行中",
+            )
+        else:
+            transport_status = "已停用" if not bot.enabled else "等待连接"
+        return {
+            "id": bot.bot_id,
+            "name": bot.name,
+            "enabled": bot.enabled,
+            "server_url": bot.server_url,
+            "username": bot.username,
+            "onebot_transport": {
+                "type": bot.onebot_transport_type,
+                "settings": transport_settings,
+            },
+            "onebot_transport_type": bot.onebot_transport_type,
+            "onebot_transport_label": transport_label,
+            "onebot_transport_card_fields": card_fields,
+            "onebot_transport_status": transport_status,
+            "runtime_active": bool(runtime and runtime.started),
+            "onebot_self_id": onebot_self_id,
+            "user_mapping_ready": bool(onebot_self_id),
+            "validation_errors": validation_errors,
+        }
 
     def _serialize_shell_settings(self, settings: ShellSettings, *, mask_secrets: bool) -> dict[str, Any]:
         payload = asdict(settings)
@@ -1041,7 +1163,39 @@ class ShellManager:
             if merged.get("e2ee_password") == "***":
                 merged["e2ee_password"] = existing.e2ee_password
 
+        incoming_transport = payload.get("onebot_transport")
+        if existing is not None and isinstance(incoming_transport, dict):
+            incoming_type = str(
+                incoming_transport.get("type") or existing.onebot_transport_type
+            ).strip().lower()
+            if incoming_type != existing.onebot_transport_type:
+                raise BotTransportTypeConflictError(
+                    "OneBot 网络类型创建后不可修改；请新建 Bot 以使用其他类型"
+                )
+
+        legacy_transport_payload: dict[str, Any] | None
+        if isinstance(incoming_transport, dict):
+            raw_transport = incoming_transport
+            legacy_transport_payload = None
+        elif existing is not None:
+            raw_transport = existing.onebot_transport_mapping()
+            legacy_transport_payload = payload
+        else:
+            raw_transport = None
+            legacy_transport_payload = merged
+
+        try:
+            normalized_transport = normalize_transport(
+                raw_transport,
+                shell_defaults=settings,
+                for_create=existing is None,
+                legacy_payload=legacy_transport_payload,
+            )
+        except TransportValidationError as exc:
+            raise ValueError(str(exc)) from exc
+
         bot = BotRecord.from_mapping(merged, defaults=settings)
+        bot.apply_onebot_transport(normalized_transport)
         if not bot.bot_id:
             bot.bot_id = self._generate_bot_id()
         if not bot.name:
@@ -1050,12 +1204,102 @@ class ShellManager:
 
     def _validate_bot(self, candidate: BotRecord, *, exclude_bot_id: str | None) -> list[str]:
         errors = candidate.validate()
+        try:
+            normalized = normalize_transport(
+                candidate.onebot_transport_mapping(),
+                shell_defaults=self._require_settings(),
+            )
+            candidate.apply_onebot_transport(normalized)
+        except TransportValidationError as exc:
+            errors.append(str(exc))
         for bot in self.bots:
             if bot.bot_id == exclude_bot_id:
                 continue
             if bot.bot_id == candidate.bot_id:
                 errors.append(f"bot_id {candidate.bot_id} 已存在")
+        errors.extend(
+            self._validate_transport_listener_conflicts(
+                candidate,
+                bots=self.bots,
+                exclude_bot_id=exclude_bot_id,
+            )
+        )
         return errors
+
+    def _validate_transport_listener_conflicts(
+        self,
+        candidate: BotRecord,
+        *,
+        bots: list[BotRecord],
+        exclude_bot_id: str | None,
+        webui_host: str | None = None,
+        webui_port: int | None = None,
+    ) -> list[str]:
+        endpoint = self._transport_listener_endpoint(candidate)
+        if endpoint is None:
+            return []
+        candidate_host, candidate_port = endpoint
+        errors: list[str] = []
+        for other in bots:
+            if other.bot_id == exclude_bot_id or other.bot_id == candidate.bot_id:
+                continue
+            other_endpoint = self._transport_listener_endpoint(other)
+            if other_endpoint is None:
+                continue
+            other_host, other_port = other_endpoint
+            if candidate_port == other_port and self._listener_hosts_overlap(
+                candidate_host, other_host
+            ):
+                errors.append(
+                    f"OneBot 监听端口 {candidate_port} 与 Bot {other.name or other.bot_id} 冲突"
+                )
+        settings = self._require_settings()
+        resolved_webui_port = int(
+            webui_port or self._webui_actual_port or settings.webui_port
+        )
+        resolved_webui_host = str(
+            webui_host or self._webui_host or settings.webui_host or "127.0.0.1"
+        )
+        if candidate_port == resolved_webui_port and self._listener_hosts_overlap(
+            candidate_host, resolved_webui_host
+        ):
+            errors.append(f"OneBot 监听端口 {candidate_port} 与 WebUI 冲突")
+        return errors
+
+    @staticmethod
+    def _transport_listener_endpoint(bot: BotRecord) -> tuple[str, int] | None:
+        if not bot.enabled:
+            return None
+        try:
+            spec = get_transport_spec(bot.onebot_transport_type)
+        except TransportValidationError:
+            return None
+        if not spec.server:
+            return None
+        settings = bot.onebot_transport_settings
+        try:
+            return str(settings.get("host") or "127.0.0.1"), int(
+                settings.get("port")
+            )
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _listener_hosts_overlap(first: str, second: str) -> bool:
+        def normalize(value: str) -> str:
+            normalized = str(value or "").strip().lower().strip("[]")
+            if normalized in {"localhost", "::1"}:
+                return "127.0.0.1"
+            return normalized
+
+        first_normalized = normalize(first)
+        second_normalized = normalize(second)
+        wildcards = {"", "0.0.0.0", "::", "*"}
+        return (
+            first_normalized in wildcards
+            or second_normalized in wildcards
+            or first_normalized == second_normalized
+        )
 
     def _persist_after_bot_change_locked(self) -> None:
         self._persist_shell_settings()
@@ -1232,6 +1476,10 @@ class ShellManager:
                 return summary
 
         username = str(bot.username or "").strip()
+        try:
+            transport_label = get_transport_spec(bot.onebot_transport_type).label
+        except TransportValidationError:
+            transport_label = bot.onebot_transport_type
         return {
             "bot_id": bot.bot_id,
             "client_name": bot.name or bot.bot_id,
@@ -1244,6 +1492,9 @@ class ShellManager:
             "server_version": "unknown",
             "compatibility_status": "unknown",
             "onebot_self_id": self._read_persisted_self_id(bot.bot_id),
+            "onebot_transport_type": bot.onebot_transport_type,
+            "onebot_transport_label": transport_label,
+            "onebot_transport_status": "等待连接",
             "server_display_name": "",
             "server_avatar_url": "",
             "is_main_bot": False,
@@ -1555,6 +1806,7 @@ class ShellManager:
         raw_bots: list[Any],
         *,
         defaults: ShellSettings,
+        webui_port: int,
     ) -> list[BotRecord]:
         candidate_bots: list[BotRecord] = []
         seen_bot_ids: set[str] = set()
@@ -1563,6 +1815,23 @@ class ShellManager:
                 raise ValueError(f"配置导入失败，第 {index + 1} 个 bot 配置不是对象")
 
             candidate = BotRecord.from_mapping(raw_item, defaults=defaults)
+            tagged_transport = (
+                raw_item.get("onebot_transport")
+                if isinstance(raw_item.get("onebot_transport"), dict)
+                else None
+            )
+            try:
+                candidate.apply_onebot_transport(
+                    normalize_transport(
+                        tagged_transport,
+                        shell_defaults=defaults,
+                        legacy_payload=None if tagged_transport is not None else raw_item,
+                    )
+                )
+            except TransportValidationError as exc:
+                raise ValueError(
+                    f"配置导入失败，bot {candidate.name or candidate.bot_id or index + 1}: {exc}"
+                ) from exc
             errors = candidate.validate()
             if candidate.bot_id in seen_bot_ids:
                 errors.append(f"bot_id {candidate.bot_id} 重复")
@@ -1573,6 +1842,18 @@ class ShellManager:
 
             seen_bot_ids.add(candidate.bot_id)
             candidate_bots.append(candidate)
+
+        for candidate in candidate_bots:
+            conflicts = self._validate_transport_listener_conflicts(
+                candidate,
+                bots=candidate_bots,
+                exclude_bot_id=candidate.bot_id,
+                webui_port=webui_port,
+            )
+            if conflicts:
+                raise ValueError(
+                    f"配置导入失败，bot {candidate.name or candidate.bot_id}: {'；'.join(conflicts)}"
+                )
 
         return candidate_bots
 

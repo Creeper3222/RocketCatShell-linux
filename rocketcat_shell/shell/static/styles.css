@@ -5037,7 +5037,11 @@ body.sidebar-collapsed .sidebar {
   border-radius: var(--radius-sm);
   color: var(--text-secondary);
   opacity: 1;
-  transition: transform var(--motion-fast) var(--ease-out);
+  transition:
+    transform var(--motion-fast) var(--ease-out),
+    background-color var(--motion-fast) var(--ease-out),
+    border-color var(--motion-fast) var(--ease-out),
+    color var(--motion-fast) var(--ease-out);
 }
 
 .nav-item.ghost {
@@ -5213,7 +5217,9 @@ body[data-input-modality="pointer"] .terminal-tab-close:active:not(:disabled) {
 .status-card,
 .form-section,
 .diagnostics-meter-card,
+.diagnostics-card,
 .basic-info-card,
+.bot-card,
 .plugin-card,
 .version-management-card,
 .terminal-panel {
@@ -5221,6 +5227,20 @@ body[data-input-modality="pointer"] .terminal-tab-close:active:not(:disabled) {
   background: var(--surface);
   box-shadow: var(--shadow-sm);
   backdrop-filter: none;
+}
+
+.bot-card,
+.basic-info-card,
+.diagnostics-card,
+.plugin-card {
+  transition:
+    transform var(--motion-standard) var(--ease-out),
+    border-color var(--motion-fast) var(--ease-out);
+}
+
+body.card-order-drag-active [data-card-order-id],
+[data-card-order-id].is-card-order-dragging {
+  transition: none;
 }
 
 .panel-shell {
@@ -5852,7 +5872,6 @@ dialog.file-image-viewer[open] {
 }
 
 @media (hover: hover) and (pointer: fine) {
-  .nav-item:hover:not(:disabled),
   .sidebar-logout:hover:not(:disabled),
   .action-button:hover:not(:disabled),
   .action-chip:hover:not(:disabled),
@@ -5867,10 +5886,34 @@ dialog.file-image-viewer[open] {
     transform: none;
   }
 
-  .nav-item:hover:not(:disabled),
   .sidebar-logout:hover:not(:disabled) {
     background: rgba(var(--accent-rgb), 0.06);
     color: var(--accent-text);
+  }
+
+  body[data-input-modality="pointer"] .nav-item:hover:not(:disabled) {
+    transform: translateX(2px);
+  }
+
+  body[data-input-modality="pointer"] .nav-item:hover:not(:disabled):not(.active):not([aria-current="page"]) {
+    border-color: rgba(var(--accent-rgb), 0.14);
+    background-color: rgba(var(--accent-rgb), 0.06);
+    color: var(--accent-text);
+  }
+
+  body[data-input-modality="pointer"] .nav-item:is(.active, [aria-current="page"]):hover:not(:disabled) {
+    border-color: rgba(var(--accent-rgb), 0.24);
+    background-color: rgba(var(--accent-rgb), 0.12);
+  }
+
+  body[data-input-modality="pointer"]:not(.card-order-drag-active) :is(
+    .bot-card,
+    .basic-info-card,
+    .diagnostics-card,
+    .plugin-card
+  ):hover:not(.is-card-order-dragging):not(.is-card-order-keyboard-selected):not([aria-disabled="true"]) {
+    border-color: rgba(var(--accent-rgb), 0.32);
+    transform: translateY(-2px);
   }
 
   .action-button:hover:not(:disabled),
@@ -6293,6 +6336,35 @@ dialog.file-image-viewer[open] {
     scroll-behavior: auto;
   }
 
+  .nav-item {
+    transition:
+      background-color var(--motion-fast) var(--ease-out),
+      border-color var(--motion-fast) var(--ease-out),
+      color var(--motion-fast) var(--ease-out) !important;
+  }
+
+  .bot-card,
+  .basic-info-card,
+  .diagnostics-card,
+  .plugin-card {
+    transition: border-color var(--motion-fast) var(--ease-out) !important;
+  }
+
+  body.card-order-drag-active [data-card-order-id],
+  [data-card-order-id].is-card-order-dragging {
+    transition: none !important;
+  }
+
+  body[data-input-modality="pointer"] .nav-item:hover:not(:disabled),
+  body[data-input-modality="pointer"]:not(.card-order-drag-active) :is(
+    .bot-card,
+    .basic-info-card,
+    .diagnostics-card,
+    .plugin-card
+  ):hover:not(.is-card-order-dragging):not(.is-card-order-keyboard-selected):not([aria-disabled="true"]) {
+    transform: none !important;
+  }
+
   .sidebar,
   .navigation-scrim,
   .toast-notification,
@@ -6409,6 +6481,16 @@ dialog.file-image-viewer[open] {
     border-color: var(--border-strong);
   }
 
+  body[data-input-modality="pointer"] .nav-item:hover:not(:disabled),
+  body[data-input-modality="pointer"]:not(.card-order-drag-active) :is(
+    .bot-card,
+    .basic-info-card,
+    .diagnostics-card,
+    .plugin-card
+  ):hover:not(.is-card-order-dragging):not(.is-card-order-keyboard-selected):not([aria-disabled="true"]) {
+    border-color: var(--accent-text);
+  }
+
   .navigation-scrim,
   dialog.modal::backdrop,
   dialog.file-image-viewer::backdrop,
@@ -6424,5 +6506,204 @@ dialog.file-image-viewer[open] {
 
   .settings-message-index-section::before {
     display: none;
+  }
+}
+
+/* OneBot transport catalog: one registry drives creation, filtering and forms. */
+.create-transport-shell {
+  position: relative;
+}
+
+.create-transport-menu {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 10px);
+  right: 0;
+  width: min(390px, calc(100vw - 32px));
+  padding: 8px;
+  border: 1px solid rgba(var(--border-strong-rgb), 0.8);
+  border-radius: var(--radius-md);
+  background: rgba(255, 249, 252, 0.94);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: blur(18px);
+}
+
+.create-transport-option {
+  width: 100%;
+  min-height: 58px;
+  padding: 10px 12px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background-color var(--motion-fast) var(--ease-out),
+    border-color var(--motion-fast) var(--ease-out);
+}
+
+.create-transport-option strong,
+.create-transport-option span {
+  display: block;
+}
+
+.create-transport-option strong {
+  font-size: 14px;
+}
+
+.create-transport-option span {
+  margin-top: 3px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.create-transport-option:focus-visible {
+  border-color: var(--accent-text);
+  outline: 3px solid rgba(var(--accent-rgb), 0.18);
+  outline-offset: 1px;
+  background: rgba(var(--accent-rgb), 0.07);
+}
+
+.transport-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: var(--space-5);
+}
+
+.transport-filter {
+  min-height: 40px;
+  padding: 8px 13px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  transition:
+    background-color var(--motion-fast) var(--ease-out),
+    border-color var(--motion-fast) var(--ease-out),
+    color var(--motion-fast) var(--ease-out);
+}
+
+.transport-filter.active,
+.transport-filter[aria-pressed="true"] {
+  border-color: rgba(var(--accent-rgb), 0.28);
+  background: rgba(var(--accent-rgb), 0.1);
+  color: var(--accent-text);
+}
+
+.transport-filter:focus-visible {
+  outline: 3px solid rgba(var(--accent-rgb), 0.2);
+  outline-offset: 2px;
+}
+
+.form-section-heading-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: var(--space-5);
+}
+
+.form-section-heading-row h3 {
+  margin-bottom: 0;
+}
+
+.form-section-heading-row .settings-helper {
+  max-width: 680px;
+  margin-bottom: 0;
+}
+
+.transport-type-badge {
+  flex: 0 0 auto;
+  padding: 7px 11px;
+  border: 1px solid rgba(var(--accent-rgb), 0.2);
+  border-radius: 999px;
+  background: rgba(var(--accent-rgb), 0.08);
+  color: var(--accent-text);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.transport-field-grid {
+  align-items: stretch;
+}
+
+.transport-boolean-field {
+  min-height: 64px;
+}
+
+.transport-value-field small,
+.transport-boolean-field small {
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.transport-identity-grid {
+  margin-top: var(--space-4);
+}
+
+.transport-card-line code,
+.transport-card-line strong {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .create-transport-option:hover,
+  .transport-filter:hover:not(.active) {
+    border-color: rgba(var(--accent-rgb), 0.18);
+    background: rgba(var(--accent-rgb), 0.06);
+    color: var(--accent-text);
+  }
+}
+
+@media (max-width: 720px) {
+  .create-transport-menu {
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    left: auto;
+    width: min(390px, calc(100vw - 32px));
+    max-height: min(440px, calc(100dvh - 160px - env(safe-area-inset-top)));
+    overflow-y: auto;
+  }
+
+  .transport-filter-bar {
+    gap: 6px;
+  }
+
+  .transport-filter {
+    min-height: 44px;
+    padding-inline: 12px;
+  }
+
+  .form-section-heading-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .transport-type-badge {
+    align-self: flex-start;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .create-transport-menu {
+    background: #fffafb;
+    backdrop-filter: none;
+  }
+}
+
+@media (prefers-contrast: more) {
+  .create-transport-menu,
+  .create-transport-option,
+  .transport-filter,
+  .transport-type-badge {
+    border-color: var(--border-strong);
   }
 }

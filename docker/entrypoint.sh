@@ -8,7 +8,7 @@ BUILTIN_PLUGINS_DIR="/opt/rocketcat/builtin_plugins"
 EXAMPLES_DIR="/opt/rocketcat/examples"
 FROZEN_UPDATE_HELPER="/opt/rocketcat/update_helper.py"
 UPDATE_DIR="$APP_DIR/data/update"
-IMAGE_VERSION="${ROCKETCAT_IMAGE_VERSION:-v0.2.2}"
+IMAGE_VERSION="${ROCKETCAT_IMAGE_VERSION:-v0.2.3}"
 
 mkdir -p \
     "$CONFIG_DIR/plugins_config" \
@@ -78,7 +78,7 @@ from pathlib import Path
 builtin_root = Path("/opt/rocketcat/builtin_plugins")
 plugins_root = Path("/app/data/plugins")
 runtime_path = Path("/app/data/update/runtime.json")
-image_version = os.environ.get("ROCKETCAT_IMAGE_VERSION", "v0.2.2")
+image_version = os.environ.get("ROCKETCAT_IMAGE_VERSION", "v0.2.3")
 
 runtime_version = image_version
 if runtime_path.is_file() and not runtime_path.is_symlink():

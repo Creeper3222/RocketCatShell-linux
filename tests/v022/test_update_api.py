@@ -9,6 +9,7 @@ import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 
+from rocketcat_shell import __version__
 from rocketcat_shell.shell.webui import ShellWebUI
 from rocketcat_shell.shell.manager import CardOrderConflictError
 from rocketcat_shell.update_manifest import UpdatePackageError
@@ -196,14 +197,14 @@ class UpdateApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(
             starting,
-            {"status": "starting", "product": "RocketCatShell", "version": "v0.2.2"},
+            {"status": "starting", "product": "RocketCatShell", "version": __version__},
         )
         self.webui.mark_application_ready()
         status, payload, _ = await self._request("/api/health")
         self.assertEqual(status, 200)
         self.assertEqual(
             payload,
-            {"status": "ok", "product": "RocketCatShell", "version": "v0.2.2"},
+            {"status": "ok", "product": "RocketCatShell", "version": __version__},
         )
         status, _, _ = await self._request("/api/updates/status")
         self.assertEqual(status, 401)

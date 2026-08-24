@@ -235,6 +235,10 @@ class RocketCatPluginManager:
             items.append(item)
         return items
 
+    def cached_plugin_count(self) -> int:
+        """Return the last reconciled count without touching the filesystem."""
+        return len(self._plugins)
+
     def export_configuration_configs(self) -> dict[str, dict[str, Any]]:
         """Return complete schema-normalized configs for every installed plugin."""
         self.refresh()

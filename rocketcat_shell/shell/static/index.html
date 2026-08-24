@@ -4,10 +4,10 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>RocketCat Shell</title>
-    <link rel="icon" type="image/png" href="/static/logo.png?v=20260814linux0221" />
-    <link rel="apple-touch-icon" href="/static/logo.png?v=20260814linux0221" />
+    <link rel="icon" type="image/png" href="/static/logo.png?v=20260824linux0231" />
+    <link rel="apple-touch-icon" href="/static/logo.png?v=20260824linux0231" />
     <link rel="stylesheet" href="/static/vendor/xterm/xterm.css?v=20260615diagicons1" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260814linux0221" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260824linux0231" />
   </head>
   <body>
     <div class="shell-layout">
@@ -19,7 +19,7 @@
         </button>
         <div class="mobile-brand">
           <span class="brand-avatar brand-avatar-mobile" aria-hidden="true">
-            <img src="/static/logo.png?v=20260814linux0221" alt="" />
+            <img src="/static/logo.png?v=20260824linux0231" alt="" />
           </span>
           <div>
             <strong>RocketCat</strong>
@@ -38,7 +38,7 @@
         </div>
         <div class="brand-mark">
           <span class="brand-avatar brand-avatar-sidebar" aria-hidden="true">
-            <img src="/static/logo.png?v=20260814linux0221" alt="" />
+            <img src="/static/logo.png?v=20260824linux0231" alt="" />
           </span>
           <div>
             <p class="brand-title">RocketCat</p>
@@ -146,7 +146,7 @@
             <span id="sidebarRuntimeText">正在读取运行状态</span>
           </div>
           <div class="sidebar-meta">
-            <span id="sidebarVersion">v0.2.2</span>
+            <span id="sidebarVersion">v0.2.3</span>
             <button id="logoutButton" class="sidebar-logout" type="button">退出登录</button>
           </div>
         </footer>
@@ -161,7 +161,10 @@
             </div>
             <div class="header-actions">
               <button id="refreshButton" class="action-button subtle" type="button">刷新</button>
-              <button id="createButton" class="action-button primary" type="button">新建 Bot</button>
+              <div class="create-transport-shell">
+                <button id="createButton" class="action-button primary" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="createTransportMenu">新建</button>
+                <div id="createTransportMenu" class="create-transport-menu hidden" role="menu" aria-label="选择 OneBot 网络类型"></div>
+              </div>
             </div>
           </header>
 
@@ -192,8 +195,10 @@
               <span id="botListSummary" class="count-badge">0 个 Bot</span>
             </div>
 
+            <div id="transportFilterBar" class="transport-filter-bar" role="toolbar" aria-label="按 OneBot 网络类型筛选"></div>
+
             <div id="emptyState" class="empty-state hidden">
-              <p>当前还没有 bot。点击右上角“新建 Bot”开始添加。</p>
+              <p>当前还没有 bot。点击右上角“新建”开始添加。</p>
             </div>
 
             <div id="botGrid" class="bot-grid" data-card-order-grid data-card-order-scope="bots" data-card-order-page="network"></div>
@@ -946,17 +951,17 @@
             </div>
           </section>
 
-          <section class="form-section">
-            <h3>OneBot 反向 WS</h3>
-            <div class="field-grid two-columns">
-              <label class="field-block span-two">
-                <span>OneBot reverse WS 地址</span>
-                <input name="onebot_ws_url" type="text" placeholder="ws://127.0.0.1:6200/ws/" />
-              </label>
-              <label class="field-block">
-                <span>OneBot Access Token</span>
-                <input name="onebot_access_token" type="text" autocomplete="off" />
-              </label>
+          <section class="form-section onebot-transport-section">
+            <div class="form-section-heading-row">
+              <div>
+                <h3>OneBot 网络</h3>
+                <p id="botTransportDescription" class="settings-helper settings-helper-compact"></p>
+              </div>
+              <span id="botTransportTypeBadge" class="transport-type-badge">Websocket客户端</span>
+            </div>
+            <div id="botTransportFields" class="field-grid two-columns transport-field-grid"></div>
+            <p class="settings-helper settings-helper-compact transport-docker-hint">Docker 中使用服务器类型时，请将监听 Host 设为 0.0.0.0，并使用 Compose 映射的 3000（HTTP / SSE）或 3001（WebSocket）端口；客户端连接宿主机服务请使用 host.docker.internal。</p>
+            <div class="field-grid two-columns transport-identity-grid">
               <div class="field-block identity-review-field">
                 <span>User 映射</span>
                 <button id="openUserMappingsButton" class="action-button primary" type="button">
@@ -978,7 +983,7 @@
                 <span>Rocket.Chat 最大连续重连次数</span>
                 <input name="max_reconnect_attempts" type="number" min="0" step="1" />
               </label>
-              <p class="settings-helper settings-helper-compact span-two">仅作用于 Rocket.Chat 连接。OneBot 上游未连接时 Bot 会保持启用，并以独立的 5 秒间隔在后台持续等待；离线期间的新事件不会积压或延后重放。</p>
+              <p class="settings-helper settings-helper-compact span-two">仅作用于 Rocket.Chat 连接。OneBot 上游未连接时 Bot 会保持启用；服务端监听失败时同样保持启用，并由所选传输独立等待或报告错误；不会消耗 Rocket.Chat 重连次数。</p>
               <label class="field-block">
                 <span>远程媒体大小上限(字节)</span>
                 <input name="remote_media_max_size" type="number" min="0" step="1" />
@@ -991,16 +996,6 @@
                 <label class="field-switch">
                   <span>子频道会话隔离</span>
                   <input name="enable_subchannel_session_isolation" type="checkbox" />
-                  <i></i>
-                </label>
-                <label class="field-switch">
-                  <span>忽略机器人自己的消息</span>
-                  <input name="skip_own_messages" type="checkbox" />
-                  <i></i>
-                </label>
-                <label class="field-switch">
-                  <span>调试日志</span>
-                  <input name="debug" type="checkbox" />
                   <i></i>
                 </label>
                 <label class="field-switch">
@@ -1412,6 +1407,6 @@
 
     <script src="/static/vendor/xterm/xterm.js?v=20260615diagicons1"></script>
     <script src="/static/vendor/xterm/addon-fit.js?v=20260615diagicons1"></script>
-    <script src="/static/app.js?v=20260814linux0221"></script>
+    <script src="/static/app.js?v=20260824linux0231"></script>
   </body>
 </html>

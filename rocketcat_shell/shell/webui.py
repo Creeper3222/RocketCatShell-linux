@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 import contextlib
-import io
+import hashlib
 import inspect
 import json
 import logging
@@ -15,6 +15,7 @@ import signal
 import socket
 import struct
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -31,6 +32,9 @@ from fastapi import Body, FastAPI, HTTPException, Query, Request, UploadFile, We
 from fastapi import File as FastAPIFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ..__init__ import __version__
 from ..logger import logger, register_log_sink, unregister_log_sink
@@ -46,7 +50,7 @@ from ..bridge.user_identity import (
     UserIdentityError,
     UserIdentityRevisionError,
 )
-from .manager import CardOrderConflictError
+from .manager import BotTransportTypeConflictError, CardOrderConflictError
 
 try:
     import fcntl
@@ -65,8 +69,15 @@ _FILE_UPLOAD_CHUNK_BYTES = 1024 * 1024
 _FILE_UPLOAD_LIMIT_BYTES = 100 * 1024 * 1024
 _FILE_UPLOAD_MAX_FILES = 20
 _FILE_EDIT_LIMIT_BYTES = 1024 * 1024
+_FILE_DOWNLOAD_MIN_FREE_BYTES = 256 * 1024 * 1024
+_FILE_DOWNLOAD_STALE_SECONDS = 24 * 60 * 60
+_FILE_DOWNLOAD_SPACE_FACTOR = 1.05
 _PLUGIN_DASHBOARD_UPLOAD_LIMIT_BYTES = 20 * 1024 * 1024
 _TERMINAL_BUFFER_LIMIT_CHARS = 200_000
+_TERMINAL_OUTPUT_BATCH_CHARS = 16 * 1024
+_TERMINAL_OUTPUT_BATCH_SECONDS = 0.016
+_TERMINAL_CLIENT_QUEUE_FRAMES = 64
+_TERMINAL_CLIENT_QUEUE_BYTES = 1024 * 1024
 _TERMINAL_DEFAULT_COLS = 80
 _TERMINAL_DEFAULT_ROWS = 24
 _UPDATE_PORT_RETRY_SECONDS = 10.0
@@ -267,6 +278,52 @@ class BridgeLogHandler(logging.Handler):
             self.handleError(record)
 
 
+class _WebUICacheAuthMiddleware:
+    """Pure ASGI auth/cache layer for the high-frequency control plane."""
+
+    def __init__(self, app: ASGIApp, *, owner: "ShellWebUI") -> None:
+        self.app = app
+        self.owner = owner
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        path = str(scope.get("path") or "/")
+        if (
+            self.owner._auth_required
+            and path.startswith("/api/")
+            and path not in {"/api/health", "/api/login"}
+        ):
+            request = Request(scope, receive=receive)
+            if not await self.owner._is_request_authenticated(request):
+                response = JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content={"detail": "请先登录管理 WebUI"},
+                )
+                await response(scope, receive, send)
+                return
+
+        async def send_with_cache_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                if path == "/" or (path.startswith("/static/") and path.endswith(".html")):
+                    headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+                    headers["Pragma"] = "no-cache"
+                    headers["Expires"] = "0"
+                elif path.startswith("/static/"):
+                    query = parse_qs(
+                        bytes(scope.get("query_string") or b"").decode("latin-1")
+                    )
+                    if str((query.get("v") or [""])[0]).strip():
+                        headers["Cache-Control"] = "public, max-age=31536000, immutable"
+                    else:
+                        headers["Cache-Control"] = "public, max-age=0, must-revalidate"
+            await send(message)
+
+        await self.app(scope, receive, send_with_cache_headers)
+
+
 class ShellWebUI:
     def __init__(self, manager: Any, *, host: str, port: int, access_password: str = ""):
         self.manager = manager
@@ -289,6 +346,12 @@ class ShellWebUI:
         self._log_buffer = BridgeLogBuffer(max_entries=2000)
         self._log_handler = BridgeLogHandler(self._log_buffer)
         self._file_root = Path(self.manager.layout.project_root).resolve()
+        layout_temp_dir = getattr(
+            self.manager.layout,
+            "temp_dir",
+            self._file_root / "data" / "temp",
+        )
+        self._file_download_temp_dir = Path(layout_temp_dir) / "downloads"
         self._terminal_lock = asyncio.Lock()
         self._terminal_create_lock = asyncio.Lock()
         self._terminal_sessions: dict[str, dict[str, Any]] = {}
@@ -307,11 +370,16 @@ class ShellWebUI:
             int(raw_terminal_idle_timeout if raw_terminal_idle_timeout is not None else 0),
         )
         self._terminal_cleanup_task: asyncio.Task[Any] | None = None
+        self._diagnostics_cache_lock = asyncio.Lock()
+        self._diagnostics_cache_payload: dict[str, Any] | None = None
+        self._diagnostics_cache_at = 0.0
+        self._diagnostics_inflight: asyncio.Task[dict[str, Any]] | None = None
         self._update_switch_lock = asyncio.Lock()
         self._configuration_transaction_lock = asyncio.Lock()
         self._update_shutdown_task: asyncio.Task[Any] | None = None
         self._application_ready = False
         self._app = FastAPI(title="RocketCat Shell", version=__version__)
+        self._app.add_middleware(_WebUICacheAuthMiddleware, owner=self)
         self._static_dir = Path(__file__).resolve().parent / "static"
         self._login_file = self._static_dir / "login.html"
         self._setup_routes()
@@ -341,31 +409,6 @@ class ShellWebUI:
             self._failed_attempts.clear()
 
     def _setup_routes(self) -> None:
-        @self._app.middleware("http")
-        async def _disable_cache(request: Request, call_next):
-            path = request.url.path or "/"
-            if self._auth_required and path.startswith("/api/") and path not in {
-                "/api/health",
-                "/api/login",
-            }:
-                if not await self._is_request_authenticated(request):
-                    return JSONResponse(
-                        status_code=status.HTTP_401_UNAUTHORIZED,
-                        content={"detail": "请先登录管理 WebUI"},
-                    )
-
-            response = await call_next(request)
-            if path == "/" or (path.startswith("/static/") and path.endswith(".html")):
-                response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-                response.headers["Pragma"] = "no-cache"
-                response.headers["Expires"] = "0"
-            elif path.startswith("/static/"):
-                if str(request.query_params.get("v") or "").strip():
-                    response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
-                else:
-                    response.headers["Cache-Control"] = "public, max-age=0, must-revalidate"
-            return response
-
         self._app.mount(
             "/static",
             StaticFiles(directory=str(self._static_dir)),
@@ -460,7 +503,17 @@ class ShellWebUI:
         self._app.add_api_route("/api/files/download", self._handle_download_file_item, methods=["GET"])
         self._app.add_api_route("/api/files/download", self._handle_download_file_items, methods=["POST"])
         self._app.add_api_route("/api/bots", self._handle_list_bots, methods=["GET"])
+        self._app.add_api_route(
+            "/api/onebot/transports",
+            self._handle_onebot_transports,
+            methods=["GET"],
+        )
         self._app.add_api_route("/api/bots", self._handle_create_bot, methods=["POST"])
+        self._app.add_api_route(
+            "/api/bots/{bot_id}",
+            self._handle_get_bot,
+            methods=["GET"],
+        )
         self._app.add_api_route(
             "/api/bots/{bot_id}",
             self._handle_update_bot,
@@ -864,10 +917,26 @@ class ShellWebUI:
             return
         loop.call_soon_threadsafe(asyncio.create_task, coro)
 
-    def _trim_terminal_buffer(self, value: str) -> str:
-        if len(value) <= _TERMINAL_BUFFER_LIMIT_CHARS:
-            return value
-        return value[-_TERMINAL_BUFFER_LIMIT_CHARS:]
+    @staticmethod
+    def _append_terminal_history(session: dict[str, Any], value: str) -> None:
+        chunks: deque[str] = session["buffer_chunks"]
+        chunks.append(value)
+        session["buffer_chars"] += len(value)
+        overflow = session["buffer_chars"] - _TERMINAL_BUFFER_LIMIT_CHARS
+        while overflow > 0 and chunks:
+            first = chunks[0]
+            if len(first) <= overflow:
+                chunks.popleft()
+                session["buffer_chars"] -= len(first)
+                overflow -= len(first)
+                continue
+            chunks[0] = first[overflow:]
+            session["buffer_chars"] -= overflow
+            overflow = 0
+
+    @staticmethod
+    def _terminal_history_text(session: dict[str, Any]) -> str:
+        return "".join(session.get("buffer_chunks") or ())
 
     def _serialize_terminal_session(self, session: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -914,8 +983,16 @@ class ShellWebUI:
             "cwd": str(self._file_root),
             "cols": cols,
             "rows": rows,
-            "buffer": "",
-            "sockets": set(),
+            "buffer_chunks": deque(),
+            "buffer_chars": 0,
+            "pending_output": [],
+            "pending_output_chars": 0,
+            "thread_output_lock": threading.Lock(),
+            "thread_pending_output": [],
+            "thread_output_scheduled": False,
+            "output_flush_handle": None,
+            "output_flush_scheduled": False,
+            "sockets": {},
             "closing": False,
             "seen_output": False,
             "loop": loop,
@@ -985,9 +1062,10 @@ class ShellWebUI:
                     if not payload:
                         break
                     data = payload.decode("utf-8", errors="replace")
-                    self._schedule_terminal_coroutine(
+                    self._queue_terminal_output_from_thread(
                         loop,
-                        self._broadcast_terminal_output(terminal_id, data),
+                        terminal_id,
+                        data,
                     )
                     continue
                 if process.poll() is not None:
@@ -1004,6 +1082,102 @@ class ShellWebUI:
                 self._finish_terminal_session(terminal_id, exit_code),
             )
 
+    def _queue_terminal_output(self, terminal_id: str, data: str) -> None:
+        if not data:
+            return
+        session = self._terminal_sessions.get(terminal_id)
+        if not session or session.get("closing"):
+            return
+        pending: list[str] = session["pending_output"]
+        pending.append(data)
+        session["pending_output_chars"] += len(data)
+        handle: asyncio.TimerHandle | None = session.get("output_flush_handle")
+        if session["pending_output_chars"] >= _TERMINAL_OUTPUT_BATCH_CHARS:
+            if session.get("output_flush_scheduled"):
+                return
+            if handle is not None:
+                handle.cancel()
+                session["output_flush_handle"] = None
+            session["output_flush_scheduled"] = True
+            asyncio.create_task(
+                self._flush_terminal_output(terminal_id),
+                name=f"RocketCatTerminalFlush:{terminal_id[:8]}",
+            )
+            return
+        if handle is None:
+            loop = asyncio.get_running_loop()
+            session["output_flush_scheduled"] = True
+            session["output_flush_handle"] = loop.call_later(
+                _TERMINAL_OUTPUT_BATCH_SECONDS,
+                lambda: asyncio.create_task(
+                    self._flush_terminal_output(terminal_id),
+                    name=f"RocketCatTerminalFlush:{terminal_id[:8]}",
+                ),
+            )
+
+    def _queue_terminal_output_from_thread(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        terminal_id: str,
+        data: str,
+    ) -> None:
+        if not data:
+            return
+        session = self._terminal_sessions.get(terminal_id)
+        if not session or session.get("closing"):
+            return
+        output_lock: threading.Lock = session["thread_output_lock"]
+        with output_lock:
+            if session.get("closing"):
+                return
+            session["thread_pending_output"].append(data)
+            if session.get("thread_output_scheduled"):
+                return
+            session["thread_output_scheduled"] = True
+        loop.call_soon_threadsafe(self._drain_terminal_thread_output, terminal_id)
+
+    def _drain_terminal_thread_output(self, terminal_id: str) -> None:
+        session = self._terminal_sessions.get(terminal_id)
+        if not session:
+            return
+        output_lock: threading.Lock = session["thread_output_lock"]
+        with output_lock:
+            pending = session["thread_pending_output"]
+            data = "".join(pending)
+            pending.clear()
+            session["thread_output_scheduled"] = False
+        self._queue_terminal_output(terminal_id, data)
+
+    @staticmethod
+    def _seal_terminal_thread_output(session: dict[str, Any]) -> None:
+        output_lock: threading.Lock = session["thread_output_lock"]
+        with output_lock:
+            pending = session["thread_pending_output"]
+            if pending:
+                data = "".join(pending)
+                pending.clear()
+                session["pending_output"].append(data)
+                session["pending_output_chars"] += len(data)
+            session["thread_output_scheduled"] = False
+
+    async def _flush_terminal_output(self, terminal_id: str) -> None:
+        async with self._terminal_lock:
+            session = self._terminal_sessions.get(terminal_id)
+            if not session:
+                return
+            handle: asyncio.TimerHandle | None = session.get("output_flush_handle")
+            if handle is not None:
+                handle.cancel()
+                session["output_flush_handle"] = None
+            session["output_flush_scheduled"] = False
+            pending = session.get("pending_output") or []
+            if not pending:
+                session["pending_output_chars"] = 0
+                return
+            data = "".join(pending)
+            pending.clear()
+            session["pending_output_chars"] = 0
+        await self._broadcast_terminal_output(terminal_id, data)
     async def _broadcast_terminal_output(self, terminal_id: str, data: str) -> None:
         if not data:
             return
@@ -1017,24 +1191,134 @@ class ShellWebUI:
                 session["seen_output"] = True
             if not data:
                 return
-            session["buffer"] = self._trim_terminal_buffer(str(session.get("buffer") or "") + data)
+            self._append_terminal_history(session, data)
             session["last_access"] = time.time()
-            sockets = list(session.get("sockets") or [])
+            clients = list((session.get("sockets") or {}).items())
 
-        failed_sockets = []
         message = {"type": "output", "data": data}
-        for websocket in sockets:
-            try:
-                await websocket.send_json(message)
-            except Exception:
-                failed_sockets.append(websocket)
+        message_bytes = len(data.encode("utf-8", errors="replace"))
+        slow_clients: list[WebSocket] = []
+        for websocket, client in clients:
+            queue_obj: asyncio.Queue[Any] = client["queue"]
+            if (
+                queue_obj.full()
+                or int(client.get("queued_bytes") or 0) + message_bytes
+                > _TERMINAL_CLIENT_QUEUE_BYTES
+            ):
+                slow_clients.append(websocket)
+                continue
+            client["queued_bytes"] = int(client.get("queued_bytes") or 0) + message_bytes
+            queue_obj.put_nowait((message, message_bytes))
 
-        if failed_sockets:
+        for websocket in slow_clients:
+            asyncio.create_task(
+                self._remove_terminal_client(
+                    terminal_id,
+                    websocket,
+                    close_code=1013,
+                ),
+                name=f"RocketCatTerminalSlowClient:{terminal_id[:8]}",
+            )
+
+    async def _terminal_client_sender(
+        self,
+        terminal_id: str,
+        websocket: WebSocket,
+        client: dict[str, Any],
+    ) -> None:
+        queue_obj: asyncio.Queue[Any] = client["queue"]
+        failed = False
+        try:
+            while True:
+                message, message_bytes = await queue_obj.get()
+                client["queued_bytes"] = max(
+                    0,
+                    int(client.get("queued_bytes") or 0) - int(message_bytes),
+                )
+                try:
+                    await websocket.send_json(message)
+                finally:
+                    queue_obj.task_done()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            failed = True
+        finally:
             async with self._terminal_lock:
                 session = self._terminal_sessions.get(terminal_id)
-                if session:
-                    for websocket in failed_sockets:
-                        session["sockets"].discard(websocket)
+                if session and session.get("sockets", {}).get(websocket) is client:
+                    session["sockets"].pop(websocket, None)
+            if failed:
+                with contextlib.suppress(Exception):
+                    await websocket.close(code=1011)
+
+    async def _remove_terminal_client(
+        self,
+        terminal_id: str,
+        websocket: WebSocket,
+        *,
+        close_code: int = 1000,
+    ) -> None:
+        async with self._terminal_lock:
+            session = self._terminal_sessions.get(terminal_id)
+            client = (
+                session.get("sockets", {}).pop(websocket, None)
+                if session
+                else None
+            )
+        if client is not None:
+            sender_task: asyncio.Task[Any] | None = client.get("sender_task")
+            if (
+                sender_task is not None
+                and sender_task is not asyncio.current_task()
+                and not sender_task.done()
+            ):
+                sender_task.cancel()
+                await asyncio.gather(sender_task, return_exceptions=True)
+        with contextlib.suppress(Exception):
+            await websocket.close(code=close_code)
+
+    async def _close_terminal_clients(
+        self,
+        clients: list[tuple[WebSocket, dict[str, Any]]],
+        *,
+        final_message: dict[str, Any] | None = None,
+    ) -> None:
+        if final_message is not None and clients:
+            async def drain(client: dict[str, Any]) -> None:
+                with contextlib.suppress(asyncio.TimeoutError):
+                    async with asyncio.timeout(1.0):
+                        await client["queue"].join()
+
+            await asyncio.gather(
+                *(drain(client) for _websocket, client in clients),
+                return_exceptions=True,
+            )
+        for _websocket, client in clients:
+            sender_task: asyncio.Task[Any] | None = client.get("sender_task")
+            if sender_task is not None and not sender_task.done():
+                sender_task.cancel()
+        sender_tasks = [
+            client.get("sender_task")
+            for _websocket, client in clients
+            if client.get("sender_task") is not None
+        ]
+        if sender_tasks:
+            await asyncio.gather(*sender_tasks, return_exceptions=True)
+
+        async def finish(websocket: WebSocket) -> None:
+            if final_message is not None:
+                with contextlib.suppress(Exception):
+                    async with asyncio.timeout(1.0):
+                        await websocket.send_json(final_message)
+            with contextlib.suppress(Exception):
+                await websocket.close()
+
+        if clients:
+            await asyncio.gather(
+                *(finish(websocket) for websocket, _client in clients),
+                return_exceptions=True,
+            )
 
     async def _write_terminal_input(self, terminal_id: str, data: str) -> None:
         async with self._terminal_lock:
@@ -1069,15 +1353,24 @@ class ShellWebUI:
 
     async def _finish_terminal_session(self, terminal_id: str, exit_code: int | None) -> None:
         async with self._terminal_lock:
+            session = self._terminal_sessions.get(terminal_id)
+            if session:
+                session["closing"] = True
+                self._seal_terminal_thread_output(session)
+        await self._flush_terminal_output(terminal_id)
+        async with self._terminal_lock:
             session = self._terminal_sessions.pop(terminal_id, None)
             self._terminal_order = [item for item in self._terminal_order if item != terminal_id]
             if not session:
                 return
-            sockets = list(session.get("sockets") or [])
+            clients = list((session.get("sockets") or {}).items())
             session["sockets"].clear()
             master_fd: int | None = session.get("pty_fd")
             stop_event: threading.Event | None = session.get("pty_stop")
+            flush_handle: asyncio.TimerHandle | None = session.get("output_flush_handle")
 
+        if flush_handle is not None:
+            flush_handle.cancel()
         if stop_event:
             stop_event.set()
         if master_fd is not None:
@@ -1090,13 +1383,16 @@ class ShellWebUI:
             "exit_code": exit_code,
             "id": terminal_id,
         }
-        for websocket in sockets:
-            with contextlib.suppress(Exception):
-                await websocket.send_json(message)
-            with contextlib.suppress(Exception):
-                await websocket.close()
+        await self._close_terminal_clients(clients, final_message=message)
 
     async def _close_terminal_session(self, terminal_id: str) -> bool:
+        async with self._terminal_lock:
+            session = self._terminal_sessions.get(terminal_id)
+            if not session:
+                return False
+            session["closing"] = True
+            self._seal_terminal_thread_output(session)
+        await self._flush_terminal_output(terminal_id)
         async with self._terminal_lock:
             session = self._terminal_sessions.pop(terminal_id, None)
             self._terminal_order = [item for item in self._terminal_order if item != terminal_id]
@@ -1106,10 +1402,13 @@ class ShellWebUI:
             process: subprocess.Popen[bytes] | None = session.get("process")
             master_fd: int | None = session.get("pty_fd")
             stop_event: threading.Event | None = session.get("pty_stop")
-            sockets = list(session.get("sockets") or [])
+            clients = list((session.get("sockets") or {}).items())
             session["sockets"].clear()
+            flush_handle: asyncio.TimerHandle | None = session.get("output_flush_handle")
             reader_thread: threading.Thread | None = session.get("reader_thread")
 
+        if flush_handle is not None:
+            flush_handle.cancel()
         if stop_event:
             stop_event.set()
         if master_fd is not None:
@@ -1131,9 +1430,7 @@ class ShellWebUI:
             with contextlib.suppress(Exception):
                 await asyncio.to_thread(reader_thread.join, 1.0)
 
-        for websocket in sockets:
-            with contextlib.suppress(Exception):
-                await websocket.close()
+        await self._close_terminal_clients(clients)
         return True
 
     async def _close_all_terminal_sessions(self) -> None:
@@ -1216,18 +1513,29 @@ class ShellWebUI:
                 return
 
         await websocket.accept()
-        buffered_output = ""
         async with self._terminal_lock:
             session = self._terminal_sessions.get(terminal_id)
             if not session:
                 await websocket.close(code=1008)
                 return
-            session["sockets"].add(websocket)
+            buffered_output = self._terminal_history_text(session)
+            client: dict[str, Any] = {
+                "queue": asyncio.Queue(maxsize=_TERMINAL_CLIENT_QUEUE_FRAMES),
+                "queued_bytes": 0,
+                "sender_task": None,
+            }
+            if buffered_output:
+                buffered_bytes = len(buffered_output.encode("utf-8", errors="replace"))
+                client["queue"].put_nowait(
+                    ({"type": "output", "data": buffered_output}, buffered_bytes)
+                )
+                client["queued_bytes"] = buffered_bytes
+            client["sender_task"] = asyncio.create_task(
+                self._terminal_client_sender(terminal_id, websocket, client),
+                name=f"RocketCatTerminalSender:{terminal_id[:8]}",
+            )
+            session["sockets"][websocket] = client
             session["last_access"] = time.time()
-            buffered_output = str(session.get("buffer") or "")
-
-        if buffered_output:
-            await websocket.send_json({"type": "output", "data": buffered_output})
 
         try:
             while True:
@@ -1250,10 +1558,7 @@ class ShellWebUI:
         except WebSocketDisconnect:
             pass
         finally:
-            async with self._terminal_lock:
-                session = self._terminal_sessions.get(terminal_id)
-                if session:
-                    session["sockets"].discard(websocket)
+            await self._remove_terminal_client(terminal_id, websocket)
 
     def _attach_log_handler(self) -> None:
         register_log_sink(self._log_handler)
@@ -1491,7 +1796,25 @@ class ShellWebUI:
             if self._update_shutdown_task is current_task:
                 self._update_shutdown_task = None
 
-    async def _handle_diagnostics(self) -> dict[str, Any]:
+    @staticmethod
+    def _etag_response(request: Request, payload: dict[str, Any]) -> Response:
+        content = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        etag = f'"{hashlib.sha256(content).hexdigest()}"'
+        headers = {"ETag": etag, "Cache-Control": "private, no-cache"}
+        if request.headers.get("if-none-match") == etag:
+            return Response(status_code=304, headers=headers)
+        return Response(
+            content=content,
+            media_type="application/json",
+            headers=headers,
+        )
+
+    async def _build_diagnostics_payload(self) -> dict[str, Any]:
         payload = await self.manager.get_diagnostics_state()
         async with self._terminal_lock:
             terminal_count = len(self._terminal_sessions)
@@ -1504,6 +1827,41 @@ class ShellWebUI:
             },
         }
         return payload
+
+    async def _diagnostics_payload(self, *, refresh: bool) -> dict[str, Any]:
+        now = time.monotonic()
+        async with self._diagnostics_cache_lock:
+            if (
+                not refresh
+                and self._diagnostics_cache_payload is not None
+                and now - self._diagnostics_cache_at < 1.0
+            ):
+                return self._diagnostics_cache_payload
+            task = self._diagnostics_inflight
+            if task is None or task.done():
+                task = asyncio.create_task(
+                    self._build_diagnostics_payload(),
+                    name="RocketCatDiagnosticsSnapshot",
+                )
+                self._diagnostics_inflight = task
+        try:
+            payload = await asyncio.shield(task)
+        finally:
+            async with self._diagnostics_cache_lock:
+                if self._diagnostics_inflight is task and task.done():
+                    self._diagnostics_inflight = None
+        async with self._diagnostics_cache_lock:
+            self._diagnostics_cache_payload = payload
+            self._diagnostics_cache_at = time.monotonic()
+        return payload
+
+    async def _handle_diagnostics(
+        self,
+        request: Request,
+        refresh: bool = Query(default=False),
+    ) -> Response:
+        payload = await self._diagnostics_payload(refresh=refresh)
+        return self._etag_response(request, payload)
 
     async def _handle_basic_info(self) -> dict[str, Any]:
         return await self.manager.get_basic_info_state()
@@ -1677,6 +2035,24 @@ class ShellWebUI:
             items.append(self._serialize_file_item(child, stat_result=stat_result))
         return items
 
+    @staticmethod
+    def _read_file_preview_sync(target_path: Path) -> tuple[os.stat_result, bytes, bool]:
+        stat_result = target_path.stat()
+        with target_path.open("rb") as handle:
+            preview_bytes = handle.read(_FILE_PREVIEW_LIMIT_BYTES)
+            has_more = bool(handle.read(1))
+        return stat_result, preview_bytes, has_more
+
+    @staticmethod
+    def _write_file_atomic_sync(
+        target_path: Path,
+        temp_path: Path,
+        encoded_content: bytes,
+    ) -> os.stat_result:
+        temp_path.write_bytes(encoded_content)
+        temp_path.replace(target_path)
+        return target_path.stat()
+
     async def _handle_read_file(
         self,
         request: Request,
@@ -1689,7 +2065,6 @@ class ShellWebUI:
         if not target_path.is_file():
             raise HTTPException(status_code=400, detail="目标路径不是文件")
 
-        stat_result = target_path.stat()
         if self._is_sensitive_file_manager_path(target_path):
             await self._verify_file_manager_password(
                 request,
@@ -1700,9 +2075,10 @@ class ShellWebUI:
             raise HTTPException(status_code=415, detail="当前阶段仅支持文本文件预览")
 
         try:
-            with target_path.open("rb") as handle:
-                preview_bytes = handle.read(_FILE_PREVIEW_LIMIT_BYTES)
-                has_more = bool(handle.read(1))
+            stat_result, preview_bytes, has_more = await asyncio.to_thread(
+                self._read_file_preview_sync,
+                target_path,
+            )
         except OSError as exc:
             logger.warning("[RocketCatShell] 文件管理读取文件失败: path=%s err=%r", target_path, exc)
             raise HTTPException(status_code=500, detail="读取文件失败") from exc
@@ -1743,12 +2119,12 @@ class ShellWebUI:
         if self._is_protected_file_manager_path(target_path):
             raise HTTPException(status_code=403, detail="RocketCatShell 核心源码和内置插件源码只允许查看，不能修改")
 
-        stat_result = target_path.stat()
+        stat_result = await asyncio.to_thread(target_path.stat)
         if not self._can_edit_file_manager_path(target_path, stat_result=stat_result, truncated=False):
             raise HTTPException(status_code=415, detail="当前文件不支持在线编辑")
 
         try:
-            existing_bytes = target_path.read_bytes()
+            existing_bytes = await asyncio.to_thread(target_path.read_bytes)
         except OSError as exc:
             logger.warning("[RocketCatShell] 文件管理读取待保存文件失败: path=%s err=%r", target_path, exc)
             raise HTTPException(status_code=500, detail="读取文件失败") from exc
@@ -1778,9 +2154,12 @@ class ShellWebUI:
 
         temp_path = target_path.with_name(f".{target_path.name}.{uuid.uuid4().hex}.tmp")
         try:
-            temp_path.write_bytes(encoded_content)
-            temp_path.replace(target_path)
-            stat_result = target_path.stat()
+            stat_result = await asyncio.to_thread(
+                self._write_file_atomic_sync,
+                target_path,
+                temp_path,
+                encoded_content,
+            )
         except OSError as exc:
             try:
                 temp_path.unlink(missing_ok=True)
@@ -1887,8 +2266,11 @@ class ShellWebUI:
                 ):
                     raise HTTPException(status_code=403, detail="上传路径不能越过 RocketCatShell 根目录")
                 destination_path = self._deduplicate_upload_path(requested_path)
-                await self._write_uploaded_file(upload, destination_path)
-                stat_result = destination_path.stat()
+                stat_result = await asyncio.to_thread(
+                    self._write_uploaded_file_sync,
+                    upload.file,
+                    destination_path,
+                )
             except HTTPException:
                 raise
             except OSError as exc:
@@ -2080,7 +2462,7 @@ class ShellWebUI:
             )
 
         try:
-            content = await asyncio.to_thread(
+            archive_path, _archive_size = await asyncio.to_thread(
                 self._build_file_manager_zip,
                 [target_path],
             )
@@ -2088,13 +2470,11 @@ class ShellWebUI:
             logger.warning("[RocketCatShell] 文件管理目录下载打包失败: path=%s err=%r", target_path, exc)
             raise HTTPException(status_code=500, detail="下载打包失败") from exc
 
-        return Response(
-            content=content,
+        return FileResponse(
+            archive_path,
+            filename=f"{target_path.name}.zip",
             media_type="application/zip",
-            headers={
-                "Content-Disposition": f'attachment; filename="{target_path.name}.zip"',
-                "Content-Length": str(len(content)),
-            },
+            background=BackgroundTask(archive_path.unlink, missing_ok=True),
         )
 
     async def _handle_download_file_items(
@@ -2113,7 +2493,7 @@ class ShellWebUI:
             raise HTTPException(status_code=400, detail="请选择要下载的项目")
 
         try:
-            content = await asyncio.to_thread(
+            archive_path, _archive_size = await asyncio.to_thread(
                 self._build_file_manager_zip,
                 target_paths,
             )
@@ -2121,13 +2501,11 @@ class ShellWebUI:
             logger.warning("[RocketCatShell] 文件管理下载打包失败: err=%r", exc)
             raise HTTPException(status_code=500, detail="下载打包失败") from exc
 
-        return Response(
-            content=content,
+        return FileResponse(
+            archive_path,
+            filename="files.zip",
             media_type="application/zip",
-            headers={
-                "Content-Disposition": 'attachment; filename="files.zip"',
-                "Content-Length": str(len(content)),
-            },
+            background=BackgroundTask(archive_path.unlink, missing_ok=True),
         )
 
     def _resolve_file_manager_path(self, raw_path: str) -> Path:
@@ -2183,6 +2561,7 @@ class ShellWebUI:
         target_path: Path,
         archive_name: str,
         written_names: set[str],
+        space_state: dict[str, int],
     ) -> None:
         safe_archive_name = str(archive_name or target_path.name).replace("\\", "/").strip("/")
         if not safe_archive_name or safe_archive_name.startswith("../") or "/../" in safe_archive_name:
@@ -2205,30 +2584,96 @@ class ShellWebUI:
                     target_path=child,
                     archive_name=f"{safe_archive_name}/{child.name}",
                     written_names=written_names,
+                    space_state=space_state,
                 )
             return
 
         if safe_archive_name in written_names:
             return
+        try:
+            source_size = max(0, int(target_path.stat().st_size))
+        except OSError:
+            source_size = 0
+        self._ensure_file_download_space(
+            max(0, space_state["estimated_bytes"] - space_state["processed_bytes"])
+        )
         zip_handle.write(target_path, safe_archive_name)
         written_names.add(safe_archive_name)
+        space_state["processed_bytes"] += source_size
 
-    def _build_file_manager_zip(self, target_paths: list[Path]) -> bytes:
-        archive_buffer = io.BytesIO()
-        with zipfile.ZipFile(
-            archive_buffer,
-            mode="w",
-            compression=zipfile.ZIP_DEFLATED,
-        ) as zip_handle:
-            written_names: set[str] = set()
-            for target_path in target_paths:
-                self._write_file_manager_zip_entry(
-                    zip_handle,
-                    target_path=target_path,
-                    archive_name=target_path.name,
-                    written_names=written_names,
-                )
-        return archive_buffer.getvalue()
+    def _estimate_file_manager_zip_bytes(self, target_paths: list[Path]) -> int:
+        estimated = 0
+        pending = list(target_paths)
+        while pending:
+            target_path = pending.pop()
+            if target_path.is_dir() and not target_path.is_symlink():
+                try:
+                    pending.extend(target_path.iterdir())
+                except OSError:
+                    continue
+                continue
+            try:
+                estimated += max(0, int(target_path.stat().st_size))
+            except OSError:
+                continue
+        return estimated
+
+    def _ensure_file_download_space(self, remaining_source_bytes: int) -> None:
+        required = _FILE_DOWNLOAD_MIN_FREE_BYTES + int(
+            max(0, remaining_source_bytes) * _FILE_DOWNLOAD_SPACE_FACTOR
+        )
+        free_bytes = int(shutil.disk_usage(self._file_download_temp_dir).free)
+        if free_bytes < required:
+            raise OSError(
+                "insufficient disk space for download archive: "
+                f"free={free_bytes} required={required}"
+            )
+
+    def _cleanup_stale_file_downloads(self) -> None:
+        self._file_download_temp_dir.mkdir(parents=True, exist_ok=True)
+        cutoff = time.time() - _FILE_DOWNLOAD_STALE_SECONDS
+        for path in self._file_download_temp_dir.glob("rocketcat-download-*.zip"):
+            try:
+                if path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                continue
+
+    def _build_file_manager_zip(self, target_paths: list[Path]) -> tuple[Path, int]:
+        self._cleanup_stale_file_downloads()
+        estimated_bytes = self._estimate_file_manager_zip_bytes(target_paths)
+        self._ensure_file_download_space(estimated_bytes)
+        temporary = tempfile.NamedTemporaryFile(
+            prefix="rocketcat-download-",
+            suffix=".zip",
+            dir=self._file_download_temp_dir,
+            delete=False,
+        )
+        archive_path = Path(temporary.name)
+        temporary.close()
+        try:
+            with zipfile.ZipFile(
+                archive_path,
+                mode="w",
+                compression=zipfile.ZIP_DEFLATED,
+            ) as zip_handle:
+                written_names: set[str] = set()
+                space_state = {
+                    "estimated_bytes": estimated_bytes,
+                    "processed_bytes": 0,
+                }
+                for target_path in target_paths:
+                    self._write_file_manager_zip_entry(
+                        zip_handle,
+                        target_path=target_path,
+                        archive_name=target_path.name,
+                        written_names=written_names,
+                        space_state=space_state,
+                    )
+            return archive_path, int(archive_path.stat().st_size)
+        except Exception:
+            archive_path.unlink(missing_ok=True)
+            raise
 
     def _join_file_manager_relative_path(self, base_path: str, child_path: str) -> str:
         normalized_base = str(base_path or "").strip().strip("/").replace("\\", "/")
@@ -2267,12 +2712,13 @@ class ShellWebUI:
                 return candidate
         raise HTTPException(status_code=409, detail="无法生成不冲突的上传文件名")
 
-    async def _write_uploaded_file(self, upload: UploadFile, destination_path: Path) -> None:
+    @staticmethod
+    def _write_uploaded_file_sync(upload_file: Any, destination_path: Path) -> os.stat_result:
         bytes_written = 0
         try:
             with destination_path.open("wb") as handle:
                 while True:
-                    chunk = await upload.read(_FILE_UPLOAD_CHUNK_BYTES)
+                    chunk = upload_file.read(_FILE_UPLOAD_CHUNK_BYTES)
                     if not chunk:
                         break
                     bytes_written += len(chunk)
@@ -2282,6 +2728,7 @@ class ShellWebUI:
                             detail=f"单个文件不能超过 {_FILE_UPLOAD_LIMIT_BYTES // (1024 * 1024)} MiB",
                         )
                     handle.write(chunk)
+            return destination_path.stat()
         except HTTPException:
             try:
                 destination_path.unlink(missing_ok=True)
@@ -2398,8 +2845,24 @@ class ShellWebUI:
         control_count = sum(1 for byte in payload if byte < 32 and byte not in allowed_controls)
         return control_count / max(1, len(payload)) > 0.08
 
-    async def _handle_list_bots(self) -> dict[str, Any]:
-        return {"items": await self.manager.list_bots()}
+    async def _handle_list_bots(
+        self,
+        request: Request,
+        compact: bool = Query(default=False),
+    ) -> Response:
+        payload = {"items": await self.manager.list_bots(compact=compact)}
+        if compact:
+            return self._etag_response(request, payload)
+        return JSONResponse(content=payload)
+
+    async def _handle_get_bot(self, bot_id: str) -> dict[str, Any]:
+        try:
+            return {"item": await self.manager.get_bot(bot_id)}
+        except KeyError:
+            raise HTTPException(status_code=404, detail="找不到目标 bot")
+
+    async def _handle_onebot_transports(self) -> dict[str, Any]:
+        return {"items": self.manager.get_onebot_transport_catalog()}
 
     async def _handle_create_bot(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -2416,6 +2879,8 @@ class ShellWebUI:
             updated = await self.manager.update_bot(bot_id, payload)
         except KeyError:
             raise HTTPException(status_code=404, detail="找不到目标 bot")
+        except BotTransportTypeConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:

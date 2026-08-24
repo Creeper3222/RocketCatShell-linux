@@ -1,6 +1,6 @@
 # RocketCatShell
 
-[![Platform](https://img.shields.io/badge/Platform-OneBot%20v11%20Reverse%20WS-pink)](#)
+[![Platform](https://img.shields.io/badge/Platform-OneBot%20v11%20Multi--Transport-pink)](#)
 [![Runtime](https://img.shields.io/badge/Python-%3E%3D3.11-blue)](#环境要求)
 
 将 [Rocket.Chat](https://rocket.chat) 通过桥接方式接入 OneBot v11 生态的独立客户端。它继承了插件版 [RocketCat](https://github.com/Creeper3222/astrbot_plugin_rocketchat_onebot_bridge) 已经验证过的桥接核心、独立 WebUI 和管理能力，但已经不再依附于 AstrBot 插件宿主，而是作为一个可以独立运行、独立配置、独立扩展的本地控制台存在。
@@ -9,160 +9,13 @@
 
 这个 live 目录对应 RocketCatShell 的 Linux / Docker 版：平台中立功能与 Windows 版保持同代，同时保留容器初始化、外部持久挂载、内置插件安全播种、Linux PTY、容器诊断和应用层事务更新等 Linux 专属实现。Rocket.Chat 媒体通过 RocketCatShell WebUI 端口上的令牌 HTTP URL 统一上报，不要求与 AstrBot 共享目录。
 
-当前发布版本为 `v0.2.2`，完整版本变化与迁移记录见 [CHANGELOG.md](CHANGELOG.md)。
+当前发布版本为 `v0.2.3`，完整版本变化与迁移记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 这意味着：
 
 - RocketCatShell 自己拥有 `config/`、`data/`、`logs/` 目录边界。
 - RocketCatShell 自己提供本地 WebUI、登录认证、Bot 管理、插件管理、项目根目录内文件管理和系统终端。
-- RocketCatShell 仍然可以作为 OneBot reverse WebSocket 客户端与 AstrBot 协同，但不再依赖 AstrBot 插件宿主才能运行。
-
----
-
-## v0.2.1（全局插件实例与内置 Dashboard）
-
-- 每个启用插件现在只创建一个全局实例；多个 Bot 仅保留轻量 runtime binding，降低多 Bot 部署中的插件内存、后台任务与初始化开销。
-- 插件可在 `pages/<page_name>/index.html` 提供管理页面。WebUI 仅为拥有页面的插件显示 Dashboard 图标，并在 RocketCatShell 原有 5751 端口内全屏打开，不需要额外暴露容器端口。
-- Dashboard 页面运行在无 `allow-same-origin` 的受限 iframe 中，通过 `window.RocketCatPluginDashboard` Bridge 使用父 WebUI 的认证链路访问插件 API、上传下载与 SSE。
-- 插件可在全局 `on_initialize()` 中通过 `PluginContext.register_dashboard_api()` 和 `register_dashboard_sse()` 注册控制面接口；关闭、禁用、卸载或重载时会撤销页面令牌并终止 SSE。
-- `on_load(runtime)` 与 `on_unload(runtime)` 继续表示单个 Bot runtime 的绑定和解绑；新增 `on_terminate()` 负责全局插件最终清理。
-- 插件重载采用原子切换：候选实例初始化或任一 runtime 绑定失败时继续保留旧实例。
-- 内置指令与 I Am Thinking 适配器的可变状态均按 runtime 隔离，避免不同 Bot 使用相同房间或消息 ID 时互相影响。
-- 纯 Dashboard 插件只需提供 `pages/<page_name>/index.html` 等静态页面即可，不必实现 `main.py` 或处理任何 Bot 消息。
-- Docker Hub 按 `v0.2.1-amd64`、`v0.2.1-arm64`、双架构 `v0.2.1` 和与其同 digest 的 `latest` 发布。
-
----
-
-## v0.2.0（性能、效率与资源治理）
-
-- 消息窗口分配不再在每条消息上复制完整映射；只有窗口变化、手动整理或 checkpoint 时才生成完整快照。
-- 用户身份缓存命中直接在事件循环内完成；同一服务器的多个 Bot 共享 SQLite 连接、LRU 缓存与批量 `ensure_mappings`。
-- E2EE 媒体采用流式下载、AES-CTR 解密、SHA-256 计算和原子落盘；`/app/data/temp` 内已缓存文件直接发布 URL。
-- OneBot 出站队列、用户/身份/媒体缓存、文件日志、WebUI 日志和 Linux PTY 终端会话均具有明确上限。
-- Bot 配置采用增量 reconciliation；修改一个 Bot 不再重启所有 Bot，插件配置更新只重建插件 binding。
-- WebUI 新增“性能与资源（高级设置）”与队列、缓存、媒体和重载诊断数据。
-- 默认策略为 `balanced`，普通用户无需调参；旧 `shell.json` 缺少新增字段时自动采用安全默认值，并在保存或导出时补齐。
-- Docker Hub 按 `v0.2.0-amd64`、`v0.2.0-arm64`、双架构 `v0.2.0` 和与其同 digest 的 `latest` 发布。
-
----
-
-## v0.1.9（多引用、用户身份与多架构更新）
-
-`v0.1.9` 将 Windows 版已经实地验证的多引用和用户身份重构迁移到 Linux / Docker，同时保留 Linux PTY 和容器持久化边界。
-
-- 非加密频道仅当当前消息包含两个及以上顶层 `attachments[*].message_link` 时进入多引用模式；正文中普通粘贴的多个消息链接不会被误判。
-- E2EE 频道会额外检查解密正文开头连续的空标签 Markdown 消息链接。仅在 `e2e=done` 且连续命中两条及以上引用时，才按原顺序归一化为多个顶层 OneBot `reply`，并剥离系统引用前缀。
-- 多个 `reply` 会被 AstrBot 分别解析为独立 `Reply.chain`，引用顺序、重复引用、文本、图片以及 `get_msg` 恢复行为均会保留。
-- 用户身份映射改为服务器级 `sha256-linear-v1` 确定性 11 位 ID。映射保存于 `/app/data/user_identity/*.sqlite3`，同服多个 RocketCat bot 共享映射和人工 override。
-- Bot 的 OneBot `self_id` 由登录账号不可变的 Rocket.Chat `userId` 自动生成；Bot 配置不再保存手工填写的 `onebot_self_id`，Shell 配置也不再使用 `next_onebot_self_id`。
-- WebUI 增加醒目的 User 映射入口以及映射搜索、刷新、保存、冲突高亮和删除重建操作。覆盖和删除使用 revision 校验，防止用旧页面覆盖新数据。
-- 哈希冲突会持久化到每个相关 Bot 的 `re_waring.json`，并在对应 Bot 每次加载时重新输出详细 warning。
-- Rocket.Chat 支持范围明确为 `7.10.x–8.5.x`：DDP 继续承担 resume 和订阅，业务 method 优先走 REST；8.x 固定使用 `rooms.media` + `rooms.mediaConfirm`，7.10 仅在现代端点明确不存在时回退旧上传接口。
-- v0.1.9 热修复将 RocketChat → OneBot 的图片、音频和视频统一改为带高强度随机令牌的 HTTP URL；AstrBot 使用标准下载链路把媒体自动缓存到自身 `data/temp`，无需挂载 AstrBot 专属共享目录。普通频道、E2EE、多引用、多参考图和历史 `get_msg` 使用同一链路；E2EE 解密图片会按文件签名纠正 `.jpg/.png/.gif/.webp` 扩展名。
-- RocketCatShell 自身的解密媒体与下载临时文件统一保存到 `/app/data/temp`，所有 Bot 共用该目录，便于管理员查看和手动清理；旧的 `data/bots/_shared_media` 与 `data/bots/<bot>/media_cache` 不再使用。
-- 媒体接口复用 WebUI 端口 `/_rocketcat/media/{bot_id}/{token}/{filename}`，令牌失效或文件不存在时返回 404，并设置 `no-store` 与 `nosniff`。宿主机 AstrBot 会自动收到 `127.0.0.1` URL，同网络 Docker AstrBot 默认使用 `rocketcatshell` 服务名；特殊网络可用 `ROCKETCAT_UPSTREAM_MEDIA_BASE_URL` 覆盖。
-- WebUI 已移除 Base64 媒体传输开关。旧 `shell.json` 和旧导入配置中的字段会被兼容忽略并在重新保存后清理；AstrBot → RocketChat 的协议级 `base64://` 上传以及历史 Base64 缓存解码能力继续保留。
-- 新增独立持久化挂载 `/app/data/user_identity`。升级前必须备份 `config/`、`data/bots/` 和 AstrBot 管理员配置，再运行 `tools/migrate_user_identity.py` 迁移旧 ID。
-- Docker Hub 从本版本开始同时发布 `linux/amd64` 与 `linux/arm64`，固定版本标签为 `v0.1.9`，稳定滚动标签为 `latest`。
-
-升级后，旧版实验性 forward 缓存会自然淘汰；message、room、thread 和 context 等非用户映射继续从原 runtime snapshot / journal 恢复。用户映射必须完成一次 v0.1.8 → v0.1.9 迁移，避免 AstrBot 管理员 ID 和私聊绑定突然变化。
-
----
-
-## v0.1.8（系统终端与媒体上传策略更新）
-
-`v0.1.8` 将 Windows live 已验证的 NapCat 风格 WebUI 终端迁移到 Docker / Linux 版，并针对容器环境使用 Linux PTY 实现，避免引入 Windows 专用的 `pywinpty` 依赖。
-- 新增 `系统终端` WebUI 页面，支持新建多个终端、切换终端、关闭终端、拖动终端标签排序，以及在 xterm 区域内直接输入命令。
-- Docker / Linux 版终端后端使用容器内 PTY，会话默认工作目录为 `/app`；shell 优先使用有效的 `$SHELL`，否则回退 `/bin/sh`，支持交互式程序、方向键历史、选择复制和窗口尺寸同步。
-- WebUI 左上角新增侧边栏展开 / 收起按钮；`基础信息` 与 `运行诊断` 页会直接展示当前 RocketCatShell 版本，运行诊断页 CPU / 内存图标也与 NapCat 风格对齐。
-- Bot 设置里的 `远程媒体大小上限(字节)` 现在同时约束远端媒体下载和媒体上传，默认仍为 `20971520`；上传或下载超过限制时会写入 error 日志，日志会包含 Bot、房间、文件名、实际大小和限制值等信息。
-- 普通房间媒体上传优先使用 Rocket.Chat 8.0.0+ 的 `rooms.media/:rid` + `rooms.mediaConfirm/:rid/:fileId`，失败时回退旧版 `rooms.upload/:rid`；每个 Bot 会独立记忆当前最适上传端点，并在服务器升级或接口变化后支持反向 fallback。
-- 本版本最初沿用旧媒体共享方式；该方式已由 v0.1.9 的统一令牌 HTTP 媒体上报取代。
-- `requirements.txt` 新增 `websockets`，用于 WebUI 终端 WebSocket；Linux / Docker 版不包含 Windows 专用 `pywinpty`。
-
-升级到 `v0.1.8` 不需要迁移现有配置或运行时数据；更新源码后重新构建镜像即可。如果浏览器已经打开旧版 WebUI，刷新页面以获取最新静态资源。
-
----
-## v0.1.7（内置文件管理更新）
-
-`v0.1.7` 的首要目标是把类似 NapCat 的内置文件管理能力迁移到 Docker / Linux 版，方便容器环境下直接在 WebUI 内浏览和管理 RocketCatShell 文件。文件管理根目录固定为容器内项目根 `/app`，只能访问 `/app` 内的相对路径；宿主机文件只有通过 `docker-compose.yml` 挂载到 `/app/...` 后才会出现在文件管理中。
-
-- 新增 `文件管理` WebUI 页面，支持目录进入 / 返回、刷新、文件预览、图片全屏查看、文本编辑保存、新建文件或目录、上传、重命名、移动、删除和打包下载。
-- 新增文件 API：`GET /api/files`、`POST /api/files/read`、`POST /api/files/write`、`POST /api/files/create`、`POST /api/files/upload`、`POST /api/files/delete`、`POST /api/files/move`、`POST /api/files/rename`、`GET /api/files/preview`、`GET /api/files/download` 和 `POST /api/files/download`。
-- 文件管理 API 只接受 `/app` 内相对路径，拒绝 `..`、系统绝对路径、Windows 盘符路径和符号链接解析后的越界目标；媒体令牌接口只发布 RocketCatShell 已验证并缓存的文件，不放宽文件管理边界。
-- Docker 包装层和核心源码默认只读保护，包括 `rocketcat_shell/`、`tools/`、`docker/`、两个内置插件源码目录，以及 `requirements.txt`、`Dockerfile`、`docker-compose.yml`、`.dockerignore`、`.env.example`、`launcher.sh` 等发布与启动文件。
-- 用户挂载或创建在非保护目录中的文件仍可按规则管理。例如外部挂载到 `/app/data/plugins` 的非内置插件、`/app/data/plugin_data`、`/app/data/temp`、`/app/data/bots` 与 `/app/data/resource` 中的普通文件可浏览、上传、移动、删除或编辑。
-- 对明确的敏感持久化数据文件增加二次鉴权，包括 `config/shell.json`、`config/bots.json`、`config/plugins_config/*.json` 和 `data/bots/**/runtime_state.json`。鉴权密码复用 WebUI 登录认证 / 文件管理鉴权密码，密码只通过请求体提交；鉴权文件保存前会再次提示修改风险。
-- 文件列表图标按常见类型细分：目录、普通文件、`.txt`、`.json/.py/.md`、`.pdf`、`.doc/.docx` 使用不同图标；PDF 类型栏单独显示为 `PDF文件`。
-- `requirements.txt` 新增 `python-multipart`，用于 WebUI 上传文件接口。
-
-升级到 `v0.1.7` 不需要迁移 `v0.1.6` 的配置目录或运行时数据；Docker / Linux 版在更新源码后重新构建镜像即可。如果浏览器已经打开旧版 WebUI，刷新页面以获取最新静态资源。
-
----
-
-## v0.1.6（诊断可观测性与性能收口更新）
-
-`v0.1.6` 建立在 `v0.1.5` 的内置指令、Shell 插件系统和独立 WebUI 管理面之上。这一版不再继续增加新的大块宿主能力，而是把这套独立 Shell 更像“可发布软件”地收口：一方面补上更直观、更低延迟的运行诊断与状态可观测性，另一方面把入站翻译热路径和 benchmark 工具一起推进到更贴近真实负载的状态，方便后续继续做针对性优化。
-
-- `/api/diagnostics` 的主机快照采集现在改为短 TTL 缓存，避免每次请求都重新执行一次固定 CPU 采样等待；内置 `#system` 指令也复用同一套缓存逻辑，页面刷新、轮询和房间内诊断命令不再重复触发整段采样开销。
-- 运行诊断已从“网络配置”页拆分为独立导航页，并新增主机快照缓存状态、快照年龄、TTL 等元数据展示。WebUI 现在可以直接区分当前是缓存命中、实时采样还是采样失败，而不是只看到一份静态诊断结果。
-- 运行诊断页的主机 CPU / 内存摘要已升级为更直观的环形指示器视图，并补充系统总占用与 Shell 进程占用的双层视觉表达，配合在线 Bot / Snapshot / Journal 汇总，更适合长时间运行时做快速巡检。
-- OneBot reverse WebSocket 客户端现在会显式放宽 `aiohttp` 的入站消息大小上限，并在断链日志里补充 `close_code`。这修复了 AstrBot 侧较大的 `base64://` 图片动作在进入 RocketCatShell 前就触发 reverse WS 断开的问题；Docker / Linux 版在启用 Base64 兼容传输或接收较大的本地图片动作时，也不再被默认 `4 MiB` 帧限制提前截断。
-- Docker 版这里展示和 `#system` 返回的仍然是当前容器运行环境；容器外宿主机路径可见性不受诊断页面影响，媒体上报由 v0.1.9 的令牌 HTTP 接口独立处理。
-- 入站翻译热路径继续做了针对性优化：引用上下文任务只在确实可能存在引用时才构建；回复来源解析结果复用，避免重复扫描正文；纯文本引用不再误走 quoted media 提取；消息注册表 entry 复制路径改为面向 JSON-like 结构的轻量 clone；媒体描述提取改为单次遍历并为扁平 attachment 场景增加快速路径，继续压低高频图片 / 引用 / 混合消息场景下的固定开销。
-- 开发者源码工具 [tools/benchmark_inbound_translate.py](https://github.com/Creeper3222/RocketCatShell-linux/blob/main/tools/benchmark_inbound_translate.py) 现在支持 `--profile realistic`，可直接带入更接近真实环境的 room info / quote fetch / media delay，并新增 `quote_image`、`media_mix` 场景，避免只靠零延迟微基准得到过于理想化的结论。该工具不包含在最小运行 ZIP 或 Docker 镜像中。
-
-升级到 `v0.1.6` 不需要迁移 `v0.1.5` 的配置目录、热存储 snapshot / journal 或本地插件数据；Docker / Linux 版在更新源码后重新构建镜像即可。如果浏览器已经打开旧版 WebUI，刷新页面以获取最新静态资源。
-
----
-
-## v0.1.5（内置指令与运维增强更新）
-
-`v0.1.5` 建立在 `v0.1.4` 的独立 Shell、热存储 runtime 和本地插件系统之上，重点不再是继续压热路径性能，而是补齐一层更适合日常使用与正式发布的本地控制能力，并补上 Rocket.Chat 新旧上传接口并存时期的兼容缺口。
-
-- 新增本地内置指令插件 `rocketcat_plugin_built_in_command`。它通过 Shell 插件系统直接拦截 Rocket.Chat 入站精确纯文本指令，目前实现 `#rocketcat` 与 `#system` 两条命令，不再要求上游 AstrBot 侧参与处理。
-- `#rocketcat` 用于返回当前桥接 Bot 的基础信息：包括客户端显示名、登录账号、显示昵称、OneBot self_id、连接状态和 Rocket.Chat 服务器地址，并追加发送 bot 头像与服务器 branding 头像，方便在房间内快速确认“当前是谁、连的是哪台、状态是否正常”。
-- 媒体上传链路新增 plain upload 端点自适应：继续兼容旧版 Rocket.Chat 的 `rooms.upload/:rid`，并可在 `8.0.0+` 环境下自动回退到 `rooms.media/:rid`，修复 `#rocketcat` 中 bot 头像与 server branding 在 Rocket.Chat 8.0.1 等新服上退化为纯文本的问题。
-- Rocket.Chat 8.x 的 `rooms.media/:rid` 不再像旧 `rooms.upload/:rid` 那样直接完成发图消息创建，因此 plain 媒体上传现在会在上传成功后继续调用 `rooms.mediaConfirm/:rid/:fileId`，真正把图片或文件发进房间，并恢复后续消息映射链路；同时对同服远端媒体会自动补 `rc_uid/rc_token` 登录态并按响应 `Content-Type` 选择正确后缀，修复 `#rocketcat` 与 WebUI 基础信息页拿不到 bot 头像、或把默认 SVG 头像误当作 PNG 上传后显示损坏的问题。
-- `#rocketcat` 的插件直发媒体链路现在会在不需要 OneBot 映射时跳过 5 秒自回显等待，并把内置指令自回显抑制从一次性 `source_id` 扩展为短 TTL 的 `source_id + 房间/正文签名` 匹配，修复新旧服混跑时加密房间第二段回复超时和旧服非加密房间重复回显的问题。
-- `#system` 用于返回当前 RocketCatShell 进程所在环境的系统快照：包括版本号、Python 版本、主机名、系统信息、CPU 型号 / 核心数 / 主频 / 系统占用 / Shell 进程占用，以及内存总量 / 已用 / 可用 / 当前进程占用。Docker 版这里反映的是当前容器运行环境；该命令依赖新增运行依赖 `psutil`。
-- `rocketcat_plugin_adapt_iamthinking` 不再只做 reaction 映射。现在它可以在继续兼容 `set_msg_emoji_like` 的同时，把“思考中 / 已完成”阶段独立映射为 Rocket.Chat typing 指示器；reaction 与 typing 在插件设置页可分别开关，长时间思考还会自动续期 typing 心跳。
-- Shell 启动层新增单实例锁：同一项目目录下的第二个 RocketCatShell 会在 runtime 初始化之前直接退出，不再像旧行为那样因为 WebUI 端口回退而悄悄拉起第二份 runtime，从根源上避免重复订阅和重复上报。
-
-升级到 `v0.1.5` 不需要迁移 `v0.1.4` 的配置目录或 runtime 数据；Docker / Linux 版在更新源码后重新构建镜像，或直接运行 `launcher.sh` 时，会按 `requirements.txt` 自动检查并补装包括 `psutil` 在内的新增依赖。
-
----
-
-## v0.1.4（性能优化更新）
-
-`v0.1.4` 建立在 `v0.1.3` 的 memory-authoritative runtime 之上，目标不是改变桥接语义、Docker 挂载模型或目录布局，而是继续压低热路径延迟、内存峰值和 WebUI 空闲开销。
-
-- P0 热路径优化：热存储减少重复深拷贝，source / surrogate message 索引共享同一 entry；入站消息注册表改为紧凑字段存储，需要 hydrate 时再重建 OneBot 事件；Rocket.Chat 入站 DDP 消息改为按房间分片队列处理，同房间保持 FIFO，不同房间可并行。
-- P0 去重优化：入站重复消息签名改为轻量字段签名，并对附件、文件、URL、mentions 等大结构使用稳定哈希，降低重复 update 判断成本。
-- P1 JSON / 连接优化：新增统一 JSON codec，优先使用 `orjson`；HTTP session 使用连接池、DNS TTL 和 keepalive；WebSocket 发送统一走预序列化字符串，减少 aiohttp 默认 JSON 路径开销。
-- P1 媒体优化：普通远端媒体下载改为边下载边写临时文件；E2EE 媒体上传改为原文件分块读取、CTR 分块加密到临时密文文件，再以文件流上传；Base64 媒体增加大小预判和严格解码。
-- P1 插件 action 优化：插件可声明 `handled_actions`，运行时按 action 精确分发，未声明的旧插件继续作为 fallback，减少 OneBot action 广播式试探。
-- P2 WebUI / 插件控制面优化：插件列表和详情增加目录签名缓存，未变化时不再反复扫目录和解析配置；基础信息页 Rocket.Chat server branding 增加 TTL 缓存；猫猫日志从 1 秒短轮询改为长轮询，空闲时显著减少 WebUI 请求和 JSON 响应。
-
-升级到 `v0.1.4` 不需要迁移 `v0.1.3` 的 runtime 数据；Docker / Linux 版需要在更新源码后重新构建镜像或重新安装依赖，才能吃满 `orjson` 快路径收益。
-
----
-
-## v0.1.3（破坏性更新）
-
-`v0.1.3` 对 RocketCatShell 的运行态、持久化模型、WebUI 管理边界和插件承载方式做了重构级调整。
-
-- 本次更新不承诺兼容 `v0.1.2` 及更早版本的旧配置文件、旧运行态持久化数据、旧目录结构，以及“依附 AstrBot 插件宿主”的部署方式。
-- 升级到 `v0.1.3` 前，请先自行备份旧版本目录，再按当前 README 描述的独立 Shell 目录重新部署或迁移。
-
-- 桥接运行态已切换为以内存为权威的热存储：ID 映射、消息注册表、私聊房间映射和群上下文绑定都会在热路径常驻内存，不再依赖旧版 JSON 逐条读写。
-- 持久化改为单写入后台 worker：运行态会以 `runtime.snapshot.bin` + `runtime.journal.bin` 的组合落盘，启动时先载入快照再回放 journal，用于恢复最近状态而不是拖慢收发热路径。
-- 入站翻译链路新增批量提交与更细粒度的热路径优化：房间信息查询、引用构建、提及提取、媒体描述提取都会尽量复用结果，降低图片 / 引用 / 提及混合消息的处理成本。
-- 新增房间信息缓存 TTL 配置 `room_info_cache_ttl_seconds`，默认 300 秒，避免同一房间元信息被高频重复拉取。
-- 支持可选性能追踪：可通过环境变量 `ROCKETCAT_PERF_TRACE` 或 bot 原始配置 `perf_trace_enabled` 打开，记录 `translate` / `emit_event` 以及入站 `room_lookup`、`mapping_alloc`、`quote_contexts`、`message_store`、`batch_commit` 等阶段耗时。
-- 猫猫日志现在也会捕获 `RocketCatPerf` 性能追踪日志，并提供左上角 `Perf` 开关用于独立过滤这类日志。
-- 新增开发者源码工具 [tools/benchmark_inbound_translate.py](https://github.com/Creeper3222/RocketCatShell-linux/blob/main/tools/benchmark_inbound_translate.py)，可在本地对比 control / rebuild 两条入站翻译路径的延迟差异；该工具不包含在最小运行 ZIP 或 Docker 镜像中。
-- message 索引策略改为固定窗口：只保留最近 N 条 message 映射，超出窗口时裁剪最旧映射，WebUI 的“重建索引”只做窗口整理与关联消息缓存重建，不再保留旧版 reset / compact 语义。
+- RocketCatShell 提供 `HTTP服务器`、`HTTP客户端`、`HTTP SSE服务器`、`Websocket服务器`、`Websocket客户端` 五种独立 OneBot v11 传输；与 AstrBot 协同时可继续使用默认的 `Websocket客户端`。
 
 ---
 
@@ -193,6 +46,8 @@ docker run --rm \
 - WebUI 文件管理边界是容器内 `/app`，宿主机目录只有通过 compose 挂载到 `/app/config`、`/app/data/...`、`/app/logs` 等路径后才可见。媒体发布接口仅通过不可预测令牌读取 `/app/data/temp` 中的 RocketCatShell 自身缓存，不需要也不会映射 AstrBot 的 `data/temp`。
 - 当 OneBot 地址是 `host.docker.internal`、`localhost` 或回环地址时，媒体 URL 自动使用 `http://127.0.0.1:<WebUI端口>`；当 OneBot 指向其它 Docker 服务时，默认使用 `http://rocketcatshell:<WebUI端口>`。自定义服务名可设置 `ROCKETCAT_DOCKER_SERVICE_NAME`，远程代理或特殊网络可直接设置 `ROCKETCAT_UPSTREAM_MEDIA_BASE_URL`。
 - 官方镜像自 `v0.1.9` 起同时支持 `linux/amd64` 和 `linux/arm64`；Docker 会根据宿主机架构自动选择对应 manifest。
+- Compose 默认仅把 HTTP / SSE 服务端的 `3000` 和 WebSocket 服务端的 `3001` 发布到宿主机 `127.0.0.1`。容器内创建服务端类型时，监听 Host 必须填写 `0.0.0.0` 且端口要与 Compose 映射一致；客户端访问宿主机服务应使用 `host.docker.internal`。
+- `config/onebot_transports.json` 位于持久化 `config/` 挂载中。v0.2.2 及更早版本的旧平面 WebSocket 配置会自动迁移为正式 `Websocket客户端`，并继续写入旧版可读取的兼容投影。
 
 ---
 
@@ -205,9 +60,9 @@ Rocket.Chat Server
 		v
 RocketCatShell
 		^
-		|  OneBot v11 Reverse WebSocket Client
+		|  OneBot v11 HTTP / SSE / WebSocket
 		v
-OneBot v11 Consumer
+OneBot v11 Peer
 		^
 		|  plugins / providers / event pipeline
 		v
@@ -216,9 +71,8 @@ AstrBot or other compatible OneBot-side workflow
 
 声明：
 
-- RocketCatShell 当前仍然围绕 OneBot v11 reverse WebSocket 语义工作。
-- 目前已经适配 [AstrBot](https://github.com/AstrBotDevs/AstrBot)，其它onebot v11语义后续再考虑实现
-- 如果你的上游是 AstrBot，那么可以继续直接复用 AstrBot 自带的 aiocqhttp / OneBot v11 接入链路。
+- RocketCatShell 围绕 OneBot v11 语义工作，并把五种网络类型拆分为互不耦合的传输模块。
+- 当前已适配 [AstrBot](https://github.com/AstrBotDevs/AstrBot)；如果对端是 AstrBot，可继续复用其 aiocqhttp / OneBot v11 链路并使用 `Websocket客户端`。
 - RocketCatShell 当前不是一个通用的 Rocket.Chat 官方平台适配器，而是一套 OneBot 语义桥接器。
 
 ---
@@ -471,7 +325,7 @@ class Plugin(RocketCatPlugin):
 | Python | `>= 3.11` |
 | 运行依赖 | `aiohttp`, `cryptography`, `fastapi`, `orjson`, `psutil`, `python-multipart`, `uvicorn`, `websockets`；其中 `websockets` 为 WebUI 系统终端和实时通道提供 Uvicorn WebSocket 后端 |
 | Rocket.Chat | 需要可用的 REST API、DDP/WebSocket 和 E2EE 接口（如使用加密功能） |
-| OneBot 上游 | 需要可用的 OneBot v11 reverse WebSocket 服务 |
+| OneBot 对端 | 需要支持所选 HTTP、SSE 或 WebSocket 模式的 OneBot v11 实现；纯 HTTP服务器 action 模式可以不建立事件订阅 |
 
 ---
 
@@ -588,9 +442,9 @@ RocketCatShell 在第一次安装、还没有保存过任何配置时，会自�
 
 ## 快速开始
 
-### 1. 准备 OneBot v11 reverse WebSocket 上游
+### 1. 准备 OneBot v11 对端
 
-如果你的上游是 [AstrBot](https://github.com/AstrBotDevs/AstrBot)，可以先在 AstrBot 中创建内置 OneBot v11 平台：
+如果你的对端是 [AstrBot](https://github.com/AstrBotDevs/AstrBot)，最直接的方式是在 AstrBot 中创建内置 OneBot v11 平台，并让 RocketCatShell 使用 `Websocket客户端`：
 
 1. 打开 `机器人`
 2. 点击 `+ 创建机器人`
@@ -610,6 +464,8 @@ ws://host.docker.internal:6200/ws/
 ```
 
 RocketCatShell 会把 RocketChat 媒体上报为令牌 HTTP URL。宿主机 AstrBot 会通过发布到 `127.0.0.1:5751` 的 WebUI 端口下载，并按自身标准链路缓存到 `AstrBot/data/temp`；无需配置共享路径。若 AstrBot 与 RocketCatShell 位于同一 Docker 网络，确保 RocketCatShell 的服务名可解析；默认服务名为 `rocketcatshell`。
+
+使用 HTTP / SSE / WebSocket 服务端类型时，容器内监听 Host 必须设为 `0.0.0.0`。默认 Compose 将 HTTP / SSE 的容器端口 `3000` 与 WebSocket 的容器端口 `3001` 映射到宿主机同名端口，并且只绑定 `127.0.0.1`；需要调整时修改 `.env` 中对应的 `ROCKETCAT_ONEBOT_*` 变量。客户端类型访问宿主机服务时不要填写容器内的 `127.0.0.1`，应使用 `host.docker.internal`。
 
 特殊网络、反向代理或远程 AstrBot 可在 `.env` 中显式覆盖：
 
@@ -639,23 +495,37 @@ http://127.0.0.1:5751/
 <p align="center">
   <img src="https://github.com/user-attachments/assets/611a6601-0af6-4ebf-ac3c-e301a03631eb" width="100%" />
 </p>
-在 `网络配置` 页点击 `新建 Bot`，为该 Bot 填写：
+在 `网络配置` 页点击 `新建`，选择一种网络类型，然后为该 Bot 填写：
 
 - Rocket.Chat 服务器地址
 - Rocket.Chat 用户名
 - Rocket.Chat 密码
 - 按需填写 E2EE 密钥密码
-- OneBot reverse WS 地址
-- OneBot Access Token
+- 所选传输的 Host / Port 或 URL
+- 所选传输的消息格式、Token、心跳、重连及其它可用选项
 
 高级设置中还可以进一步设置：
 
-- 重连延迟
-- 最大连续重连次数
+- Rocket.Chat 重连延迟
+- Rocket.Chat 最大连续重连次数
 - 子频道会话隔离
 - 远端媒体大小上限
-- 忽略机器人自己的消息
-- 调试日志
+
+“上报自身消息”和“调试日志”属于 OneBot 传输设置，仅在对应类型提供时显示。Rocket.Chat 的两项重连设置只约束聊天服务器侧；OneBot 监听、投递或对端连接失败不会消耗这些次数，也不会自动停用 Bot。
+
+### 五种 OneBot 网络类型
+
+每个 Bot 只绑定一种网络类型，创建后不能直接切换类型。五类传输共享 OneBot action、消息编解码和有界队列基础设施，但各自拥有独立的启动、停止、监听、投递、心跳与诊断生命周期。
+
+| 类型 | RocketCat 角色与端点 | 主要配置 |
+|------|----------------------|----------|
+| `HTTP服务器` | 监听 OneBot HTTP action API；纯 HTTP 模式不主动推送事件，可选同端口 WebSocket。 | Host、Port、CORS、WebSocket、Array / String、Token。 |
+| `HTTP客户端` | 把事件 POST 到目标 URL，携带 `X-Self-ID`；配置 Token 时附加 `X-Signature: sha1=...`。 | URL、自身消息、Array / String、HMAC Token。 |
+| `HTTP SSE服务器` | 提供 HTTP action API，并在 `/_events` 提供有序 SSE 事件流；可选同端口 WebSocket。 | Host、Port、CORS、WebSocket、自身消息、格式、Token。 |
+| `Websocket服务器` | 监听 WebSocket；`/api` 只处理 action，其它路径同时接收 action 和事件。 | Host、Port、自身消息、格式、心跳、Token。 |
+| `Websocket客户端` | 主动连接 OneBot WebSocket 对端，接收 action 并推送事件；断线后按自身间隔持续等待。 | URL、自身消息、格式、重连、心跳、Token。 |
+
+服务端 Token 同时接受 `Authorization: Bearer <token>` 和 `access_token` query。HTTP 客户端响应中的 `reply` 会复用现有 `send_msg` 链路执行；尚未实现的删除、踢人、禁言和审批快速操作只记录明确的 `1404`。`Array` 传输 OneBot segment 数组，`String` 使用正确转义的 CQ 码。
 
 ### 4. 如需导入已有配置
 <p align="center">
@@ -682,10 +552,10 @@ http://127.0.0.1:5751/
 | `message_index_max_entries` | 最大消息映射窗口条数，默认 `1000`；超出后会清理最早映射，并在达到重置阈值后自动重排当前窗口。 |
 | `log_level` | 日志级别，默认 `INFO`。 |
 | `auto_open_browser` | 启动后是否自动打开浏览器。 |
-| `default_onebot_ws_url` | 新建 Bot 时使用的默认 OneBot reverse WS 地址。 |
-| `default_onebot_access_token` | 新建 Bot 时使用的默认 OneBot Access Token。 |
-| `default_reconnect_delay` | 默认重连延迟。 |
-| `default_max_reconnect_attempts` | 默认最大连续重连次数。 |
+| `default_onebot_ws_url` | 新建 `Websocket客户端` 时使用的默认 URL；保留该字段以兼容 v0.2.1 / v0.2.2。 |
+| `default_onebot_access_token` | 新建 `Websocket客户端` 时使用的默认 Token；其它服务端 / HTTP 类型会生成独立的随机 16 位 Token。 |
+| `default_reconnect_delay` | 默认 Rocket.Chat 重连延迟；不作用于 OneBot 对端。 |
+| `default_max_reconnect_attempts` | 默认 Rocket.Chat 最大连续重连次数；不作用于 OneBot 对端。 |
 | `default_enable_subchannel_session_isolation` | 默认是否开启子频道会话隔离。 |
 | `default_remote_media_max_size` | 默认远端媒体上传 / 下载大小上限。 |
 | `default_skip_own_messages` | 默认是否忽略机器人自己的消息。 |
@@ -731,9 +601,25 @@ ROCKETCAT_TERMINAL_MAX_SESSIONS=6
 ROCKETCAT_TERMINAL_IDLE_TIMEOUT_SECONDS=0
 ```
 
-### 单个 Bot 配置
+### 单个 Bot 与 OneBot 传输配置
 
-`config/bots.json` 中每个 Bot 主要包含：
+`config/bots.json` 保存 Rocket.Chat Bot 主记录与旧版兼容投影；`config/onebot_transports.json` 以 Bot ID 保存格式版本为 `1` 的规范化 OneBot tagged union：
+
+```json
+{
+  "format_version": 1,
+  "transports": {
+    "bot_id": {
+      "type": "websocket-client",
+      "settings": {}
+    }
+  }
+}
+```
+
+v0.2.1 / v0.2.2 的平面 `onebot_ws_url`、Token、`skip_own_messages` 和 Debug 会自动迁移为 `Websocket客户端`，并补齐 Array 格式、5000ms 重连与 30000ms 心跳。回退 v0.2.2 后仍可使用旧界面修改 WebSocket URL、Token、Debug 与自身消息开关；再次升级时这些旧版修改会覆盖对应共享字段，而 v0.2.3 专属的消息格式、重连和心跳设置继续从独立传输配置恢复。非 WebSocket 客户端会在 `bots.json` 写入不可连接的安全占位地址，防止回退旧版时误连默认对端；独立传输配置不会被旧版改写。
+
+Bot 主记录主要包含：
 
 | 配置项 | 说明 |
 |--------|------|
@@ -744,10 +630,12 @@ ROCKETCAT_TERMINAL_IDLE_TIMEOUT_SECONDS=0
 | `username` | Rocket.Chat 用户名。 |
 | `password` | Rocket.Chat 密码。 |
 | `e2ee_password` | E2EE 私钥密码。 |
-| `onebot_ws_url` | OneBot reverse WebSocket 地址。 |
-| `onebot_access_token` | OneBot reverse WebSocket Token。 |
-| `reconnect_delay` | 断线重连等待秒数。 |
-| `max_reconnect_attempts` | 最大重连次数；`0` 表示不限次数。 |
+| `onebot_ws_url` | `Websocket客户端` 的兼容 URL 投影；其它类型写入不可连接的安全占位值。 |
+| `onebot_access_token` | `Websocket客户端` 的兼容 Token 投影。 |
+| `onebot_transport` | API 与配置导出使用的规范化 `{type, settings}`；类型创建后不可修改。 |
+| `OneBot self_id` | 不由用户配置；根据 Rocket.Chat Bot 的不可变 userId 自动建立 `sha256-linear-v1` 映射。 |
+| `reconnect_delay` | Rocket.Chat 断线重连等待秒数；不控制任何 OneBot 传输。 |
+| `max_reconnect_attempts` | Rocket.Chat 最大连续重连次数；`0` 表示不限次数，不控制任何 OneBot 传输。 |
 | `enable_subchannel_session_isolation` | 是否按子频道隔离上下文。 |
 | `remote_media_max_size` | 当前 Bot 的远端媒体上传 / 下载大小上限。 |
 | `room_info_cache_ttl_seconds` | 房间信息缓存 TTL，单位秒，默认 `300`。 |
@@ -765,6 +653,7 @@ RocketCatShell 当前的正式目录语义如下：
 config/
 	shell.json
 	bots.json
+	onebot_transports.json
 	plugins_config/
 
 data/
@@ -794,7 +683,7 @@ logs/
 
 ## 已知限制
 
-- 当前仍然围绕 OneBot v11 reverse WebSocket 工作，不是官方 Rocket.Chat 平台适配器。
+- 当前提供五类 OneBot v11 网络传输，但仍是语义桥接器，不是官方 Rocket.Chat 平台适配器。
 - 合并转发消息当前未实现。
 - 系统事件、审计事件、编辑 / 撤回 / 已读等非消息类事件不在这一版的桥接承诺范围内。
 - E2EE 仅覆盖 Rocket.Chat 加密私聊和加密私有群组。

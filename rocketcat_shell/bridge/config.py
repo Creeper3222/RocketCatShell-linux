@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Mapping
 
 
@@ -81,18 +82,86 @@ class BridgeConfig:
     bot_id: str = ""
     display_name: str = ""
     transport_type: str = "websocket-client"
+    transport_label: str = "Websocket客户端"
+    transport_settings: dict[str, Any] = field(default_factory=dict)
+    transport_validation_error: str = ""
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any] | None) -> "BridgeConfig":
         data = dict(payload or {})
+        from .transports import (
+            TransportValidationError,
+            get_transport_spec,
+            normalize_transport,
+        )
+
+        shell_defaults = SimpleNamespace(
+            default_onebot_ws_url=str(
+                data.get("onebot_ws_url", DEFAULT_ONEBOT_WS_URL)
+                or DEFAULT_ONEBOT_WS_URL
+            ),
+            default_onebot_access_token=str(
+                data.get("onebot_access_token", "") or ""
+            ),
+            default_skip_own_messages=_coerce_bool(
+                data.get("skip_own_messages", True)
+            ),
+            default_debug=_coerce_bool(data.get("debug", False)),
+        )
+        transport_error = ""
+        try:
+            transport = normalize_transport(
+                data.get("onebot_transport")
+                if isinstance(data.get("onebot_transport"), Mapping)
+                else None,
+                shell_defaults=shell_defaults,
+                legacy_payload=data,
+            )
+            transport_spec = get_transport_spec(transport["type"])
+            transport_label = transport_spec.label
+        except TransportValidationError as exc:
+            transport_error = str(exc)
+            raw_transport = data.get("onebot_transport")
+            raw_transport = raw_transport if isinstance(raw_transport, Mapping) else {}
+            raw_settings = raw_transport.get("settings")
+            transport = {
+                "type": str(raw_transport.get("type") or "websocket-client"),
+                "settings": dict(raw_settings) if isinstance(raw_settings, Mapping) else {},
+            }
+            transport_label = str(transport["type"])
+        transport_settings = dict(transport.get("settings") or {})
+        transport_type = str(transport.get("type") or "websocket-client")
+        legacy_ws_url = str(
+            data.get("onebot_ws_url", DEFAULT_ONEBOT_WS_URL)
+            or DEFAULT_ONEBOT_WS_URL
+        ).strip()
+        onebot_ws_url = (
+            str(transport_settings.get("url") or legacy_ws_url).strip()
+            if transport_type == "websocket-client"
+            else legacy_ws_url
+        )
+        access_token = str(
+            transport_settings.get("access_token")
+            if "access_token" in transport_settings
+            else data.get("onebot_access_token", "")
+            or ""
+        )
+        skip_own_messages = (
+            not _coerce_bool(transport_settings.get("report_self_message"))
+            if "report_self_message" in transport_settings
+            else _coerce_bool(data.get("skip_own_messages", True))
+        )
+        debug = _coerce_bool(
+            transport_settings.get("debug", data.get("debug", False))
+        )
         return cls(
             enabled=_coerce_bool(data.get("enabled", False)),
             server_url=str(data.get("server_url", DEFAULT_SERVER_URL) or DEFAULT_SERVER_URL).rstrip("/"),
             username=str(data.get("username", "") or ""),
             password=str(data.get("password", "") or ""),
             e2ee_password=str(data.get("e2ee_password", "") or ""),
-            onebot_ws_url=str(data.get("onebot_ws_url", DEFAULT_ONEBOT_WS_URL) or DEFAULT_ONEBOT_WS_URL).strip(),
-            onebot_access_token=str(data.get("onebot_access_token", "") or ""),
+            onebot_ws_url=onebot_ws_url,
+            onebot_access_token=access_token,
             onebot_self_id=0,
             reconnect_delay=_coerce_float(data.get("reconnect_delay", DEFAULT_RECONNECT_DELAY), DEFAULT_RECONNECT_DELAY),
             max_reconnect_attempts=_coerce_int(
@@ -160,11 +229,14 @@ class BridgeConfig:
                     DEFAULT_MEDIA_CACHE_MAX_AGE_HOURS,
                 ),
             ),
-            skip_own_messages=_coerce_bool(data.get("skip_own_messages", True)),
-            debug=_coerce_bool(data.get("debug", False)),
+            skip_own_messages=skip_own_messages,
+            debug=debug,
             bot_id=str(data.get("id") or data.get("bot_id") or "").strip(),
             display_name=str(data.get("name") or data.get("display_name") or "").strip(),
-            transport_type=str(data.get("type") or data.get("transport_type") or "websocket-client").strip() or "websocket-client",
+            transport_type=transport_type,
+            transport_label=transport_label,
+            transport_settings=transport_settings,
+            transport_validation_error=transport_error,
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -192,14 +264,23 @@ class BridgeConfig:
             "id": self.bot_id,
             "name": self.display_name,
             "type": self.transport_type,
+            "onebot_transport": {
+                "type": self.transport_type,
+                "settings": dict(self.transport_settings),
+            },
         }
 
     def validate(self) -> list[str]:
         errors: list[str] = []
+        if self.transport_validation_error:
+            errors.append(self.transport_validation_error)
         if self.enabled:
             if not self.server_url.startswith(("http://", "https://")):
                 errors.append("server_url 必须以 http:// 或 https:// 开头")
-            if not self.onebot_ws_url.startswith(("ws://", "wss://")):
+            if (
+                self.transport_type == "websocket-client"
+                and not self.onebot_ws_url.startswith(("ws://", "wss://"))
+            ):
                 errors.append("onebot_ws_url 必须以 ws:// 或 wss:// 开头")
             if not self.username:
                 errors.append("enabled=true 时 username 不能为空")

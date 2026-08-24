@@ -5,8 +5,8 @@ import inspect
 import unittest
 from unittest.mock import AsyncMock, patch
 
-import rocketcat_shell.bridge.onebot_client as onebot_client_module
 import rocketcat_shell.bridge.rocketchat_client as rocketchat_client_module
+import rocketcat_shell.bridge.transports.websocket_client as websocket_client_module
 from rocketcat_shell.bridge.config import BridgeConfig
 from rocketcat_shell.bridge.onebot_client import (
     OneBotReverseWsClient,
@@ -73,10 +73,10 @@ class ReconnectScopeTests(unittest.IsolatedAsyncioTestCase):
                 client._running = False
 
         with (
-            patch.object(onebot_client_module.asyncio, "sleep", side_effect=controlled_sleep),
-            patch.object(onebot_client_module.logger, "info") as log_info,
-            patch.object(onebot_client_module.logger, "debug") as log_debug,
-            patch.object(onebot_client_module.logger, "warning") as log_warning,
+            patch.object(websocket_client_module.asyncio, "sleep", side_effect=controlled_sleep),
+            patch.object(websocket_client_module.logger, "info") as log_info,
+            patch.object(websocket_client_module.logger, "debug") as log_debug,
+            patch.object(websocket_client_module.logger, "warning") as log_warning,
         ):
             await client._run_forever()
 
@@ -166,8 +166,9 @@ class ReconnectScopeTests(unittest.IsolatedAsyncioTestCase):
             inspect.signature(OneBotReverseWsClient).parameters,
         )
         start_source = inspect.getsource(BridgeRuntime._start_clients)
+        self.assertIn("self.onebot = create_transport(", start_source)
         onebot_constructor = start_source.split(
-            "self.onebot = OneBotReverseWsClient(", 1
+            "self.onebot = create_transport(", 1
         )[1].split("await self.rocketchat.start_realtime()", 1)[0]
         self.assertNotIn("on_reconnect_exhausted", onebot_constructor)
         self.assertIn(

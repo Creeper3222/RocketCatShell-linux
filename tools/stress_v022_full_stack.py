@@ -30,7 +30,10 @@ import aiohttp
 from aiohttp import web
 import psutil
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(
+    os.environ.get("ROCKETCAT_STRESS_SOURCE_ROOT")
+    or Path(__file__).resolve().parents[1]
+).resolve()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -1076,11 +1079,28 @@ async def precondition_bounded_capacity(
         await harness.crypto_task
         harness.crypto_task = None
 
+    # The overload fill allocates queue capacity but can drop before the
+    # 5,000-entry duplicate-signature cache reaches its steady churn size.
+    # Exercise another bounded steady window so formal RSS samples measure
+    # leaks rather than documented one-time cache allocation.
+    harness.current_phase = "capacity_precondition_settle"
+    settle_seconds = min(30.0, max(5.0, requested_seconds))
+    await harness.send_for(
+        rate=base_rate,
+        duration=settle_seconds,
+        mixed=True,
+    )
+    await harness.wait_drained()
+
     result = {
         "seconds": round(time.monotonic() - started, 3),
         "sent": harness.sent - sent_before,
         "received": harness.fake_onebot.received - received_before,
         "ingress_dropped": harness.ingress_dropped() - dropped_before,
+        "signature_cache_entries": [
+            len(runtime.rocketchat._seen_inbound_message_signatures)
+            for runtime in harness.runtimes
+        ],
     }
     harness.fake_onebot.reset_observations()
     harness.sent = 0
@@ -1106,6 +1126,14 @@ async def run_formal(
     if profile == "overload-only":
         names = ["overload"]
         durations = [duration]
+    elif profile == "iterative-5m":
+        # The iterative v0.2.3 gate deliberately keeps exact, comparable
+        # five-minute phase weights.  Fault injection shares the overload
+        # window so recovery and drain still receive their full observation
+        # periods.
+        names = ["warmup", "steady", "mixed", "overload_faults", "recovery", "drain"]
+        weights = [30, 120, 60, 45, 30, 15]
+        durations = [duration * weight / 300.0 for weight in weights]
     else:
         boundaries = [0.0, 0.10, 1 / 3, 8 / 15, 0.70, 13 / 15, 29 / 30, 1.0]
         names = ["warmup", "steady", "mixed", "overload", "faults", "recovery", "drain"]
@@ -1119,6 +1147,8 @@ async def run_formal(
     baseline_task_summary = task_summary()
     baseline_tasks = len(baseline_task_names)
     baseline_handles = process_handles(harness.process)
+    baseline_cpu_times = harness.process.cpu_times()
+    baseline_cpu_seconds = float(baseline_cpu_times.user + baseline_cpu_times.system)
     baseline_state_entries = [
         runtime._hot_store_bundle.state_engine.diagnostic_counts()
         for runtime in harness.runtimes
@@ -1144,10 +1174,15 @@ async def run_formal(
             await harness.send_for(rate=base_rate * 0.70, duration=phase_duration)
         elif name == "mixed":
             await harness.send_for(rate=base_rate * 0.70, duration=phase_duration, mixed=True)
-        elif name == "overload":
+        elif name in {"overload", "overload_faults"}:
             harness.processing_delay = 0.03
             cycle = min(60.0, max(4.0, phase_duration / 4.0))
             deadline = time.monotonic() + phase_duration
+            fault_task = (
+                asyncio.create_task(harness.inject_faults(phase_duration))
+                if name == "overload_faults"
+                else None
+            )
             while time.monotonic() < deadline:
                 burst = min(cycle / 2.0, deadline - time.monotonic())
                 await harness.send_for(rate=base_rate * 1.50, duration=burst, mixed=True)
@@ -1157,6 +1192,8 @@ async def run_formal(
                     await harness.send_for(rate=base_rate * 0.70, duration=recovery, mixed=True)
                 harness.processing_delay = 0.03
             harness.processing_delay = 0.0
+            if fault_task is not None:
+                await fault_task
         elif name == "faults":
             fault_task = asyncio.create_task(harness.inject_faults(phase_duration))
             await harness.send_for(rate=base_rate * 0.55, duration=phase_duration, mixed=True)
@@ -1170,7 +1207,7 @@ async def run_formal(
         try:
             pings = await harness.fake_rc.ping_all()
             harness.samples.ddp_ping_ms.extend(pings)
-            if name == "overload":
+            if name in {"overload", "overload_faults"}:
                 harness.samples.overload_ping_ms.extend(pings)
             await harness.fake_onebot.send_actions()
         except Exception as exc:
@@ -1201,6 +1238,11 @@ async def run_formal(
     end_task_summary = task_summary()
     end_tasks = len(end_task_names)
     end_handles = process_handles(harness.process)
+    end_cpu_times = harness.process.cpu_times()
+    cpu_seconds = max(
+        0.0,
+        float(end_cpu_times.user + end_cpu_times.system) - baseline_cpu_seconds,
+    )
     end_state_entries = [
         runtime._hot_store_bundle.state_engine.diagnostic_counts()
         for runtime in harness.runtimes
@@ -1282,6 +1324,15 @@ async def run_formal(
             },
         },
         "resources": {
+            "cpu_seconds": round(cpu_seconds, 3),
+            "cpu_seconds_per_10000_deliveries": round(
+                cpu_seconds * 10_000.0 / max(1, received),
+                6,
+            ),
+            "delivered_per_second": round(
+                received / max(0.001, time.monotonic() - formal_started),
+                3,
+            ),
             "rss_start_bytes": rss_samples[0][1] if rss_samples else 0,
             "rss_end_bytes": rss_samples[-1][1] if rss_samples else 0,
             "rss_max_bytes": max((sample[1] for sample in rss_samples), default=0),
@@ -1360,7 +1411,13 @@ async def run_formal(
     }
 
 
-def evaluate(result: dict[str, Any], *, strict_duration: bool) -> dict[str, bool]:
+def evaluate(
+    result: dict[str, Any],
+    *,
+    strict_duration: bool,
+    expected_duration: float,
+    profile: str,
+) -> dict[str, bool]:
     formal = result["formal"]
     messages = formal["messages"]
     resources = formal["resources"]
@@ -1370,14 +1427,26 @@ def evaluate(result: dict[str, Any], *, strict_duration: bool) -> dict[str, bool
     thread_tolerance = max(1, math.ceil(resources["threads_baseline"] * 0.05))
     task_tolerance = max(1, math.ceil(resources["tasks_baseline"] * 0.05))
     handle_tolerance = max(2, math.ceil(resources["handles_baseline"] * 0.05))
+    post_idle = result.get("post_idle") or {}
+    iterative_gate = profile == "iterative-5m" and strict_duration
+    retained_rss_slope = float(
+        post_idle.get("rss_retained_slope_mib_per_10min")
+        if iterative_gate and post_idle
+        else resources["rss_slope_mib_per_10min"]
+    )
+    evaluated_task_count = int(post_idle.get("tasks") or resources["tasks_end"])
     checks = {
-        "duration": formal["duration_seconds"] >= (1795 if strict_duration else 1),
+        "duration": formal["duration_seconds"] >= (
+            max(1.0, float(expected_duration) * 0.995)
+            if iterative_gate
+            else (1795 if strict_duration else 1)
+        ),
         "loss_matches_overload_counter": messages["loss"] == messages["ingress_overload_dropped"],
         "zero_duplicates": messages["duplicates"] == 0,
         "same_room_ordered": messages["out_of_order"] == 0,
         "all_events_parseable": messages["unparsed"] == 0,
         "rss_slope": (
-            resources["rss_slope_mib_per_10min"] <= 1.0
+            retained_rss_slope <= 1.0
             if strict_duration
             else resources["rss_end_bytes"] <= resources["rss_max_bytes"]
         ),
@@ -1387,9 +1456,15 @@ def evaluate(result: dict[str, Any], *, strict_duration: bool) -> dict[str, bool
             else resources["threads_end"] <= resources["threads_baseline"] + 4
         ),
         "tasks_recovered": (
-            resources["tasks_end"] <= resources["tasks_baseline"] + task_tolerance
+            evaluated_task_count <= resources["tasks_baseline"] + task_tolerance
             if strict_duration
-            else resources["tasks_end"] <= resources["tasks_baseline"] + 4
+            else evaluated_task_count <= resources["tasks_baseline"] + 4
+        ),
+        "idle_workers_recovered": (
+            int(post_idle.get("action_workers") or 0) == 0
+            and int(post_idle.get("inbound_workers") or 0) == 0
+            if post_idle
+            else True
         ),
         "handles_recovered": (
             resources["handles_end"] <= resources["handles_baseline"] + handle_tolerance
@@ -1437,7 +1512,7 @@ def render_markdown(result: dict[str, Any]) -> str:
         f"- Event loop: p99 {formal['event_loop']['p99']} ms, max {formal['event_loop']['max']} ms",
         f"- GC pauses: p99 {formal['gc']['p99_ms']} ms, max {formal['gc']['max_ms']} ms",
         (
-            f"- RSS sustained slope: {resources['rss_slope_mib_per_10min']} MiB / 10 min; "
+            f"- RSS active-window slope: {resources['rss_slope_mib_per_10min']} MiB / 10 min; "
             f"endpoint growth {resources['rss_endpoint_growth_mib']} MiB; "
             f"high-water growth {resources['rss_high_water_growth_mib']} MiB"
         ),
@@ -1462,6 +1537,16 @@ def render_markdown(result: dict[str, Any]) -> str:
         "## Acceptance checks",
         "",
     ]
+    post_idle = result.get("post_idle") or {}
+    if post_idle:
+        lines.insert(
+            12,
+            (
+                f"- RSS retained after {post_idle['seconds']}s idle: "
+                f"{post_idle.get('rss_retained_growth_mib', 0.0)} MiB; "
+                f"{post_idle.get('rss_retained_slope_mib_per_10min', 0.0)} MiB / 10 min"
+            ),
+        )
     lines.extend(f"- [{'x' if passed else ' '}] {name}" for name, passed in checks.items())
     lines.extend(
         [
@@ -1499,8 +1584,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--duration-seconds", type=float, default=1800)
     parser.add_argument("--calibration-seconds", type=float, default=60)
     parser.add_argument("--precondition-seconds", type=float, default=30)
+    parser.add_argument(
+        "--post-idle-seconds",
+        type=float,
+        default=0,
+        help="Observe on-demand worker retirement after the formal load window.",
+    )
     parser.add_argument("--max-calibration-rate", type=float, default=240)
-    parser.add_argument("--profile", choices=("standard", "overload-only"), default="standard")
+    parser.add_argument(
+        "--fixed-base-rate",
+        type=float,
+        help="Reuse a previously calibrated zero-loss rate for comparable iterative runs.",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=("standard", "overload-only", "iterative-5m"),
+        default="standard",
+    )
     parser.add_argument("--seed", type=int, default=20260811)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--markdown-output", type=Path)
@@ -1550,11 +1650,19 @@ async def async_main() -> int:
                     trace_loop_stalls(args.loop_stall_trace),
                     name="StressLoopStallTrace",
                 )
-            result["calibration"] = await calibrate(
-                harness,
-                args.calibration_seconds,
-                args.max_calibration_rate,
-            )
+            if args.fixed_base_rate is not None:
+                result["calibration"] = {
+                    "seconds": 0.0,
+                    "steps": [],
+                    "zero_loss_rate": max(0.1, float(args.fixed_base_rate)),
+                    "fixed": True,
+                }
+            else:
+                result["calibration"] = await calibrate(
+                    harness,
+                    args.calibration_seconds,
+                    args.max_calibration_rate,
+                )
             result["precondition"] = await precondition_bounded_capacity(
                 harness,
                 base_rate=float(result["calibration"]["zero_loss_rate"]),
@@ -1569,6 +1677,53 @@ async def async_main() -> int:
                 base_rate=float(result["calibration"]["zero_loss_rate"]),
                 profile=args.profile,
             )
+            if args.post_idle_seconds > 0:
+                harness.current_phase = "post_idle"
+                await asyncio.sleep(float(args.post_idle_seconds))
+                diagnostics = [
+                    runtime.build_diagnostic_summary()
+                    for runtime in harness.runtimes
+                ]
+                result["post_idle"] = {
+                    "seconds": float(args.post_idle_seconds),
+                    "rss_bytes": harness.process.memory_info().rss,
+                    "tasks": len(
+                        [task for task in asyncio.all_tasks() if not task.done()]
+                    ),
+                    "threads": harness.process.num_threads(),
+                    "handles": process_handles(harness.process),
+                    "action_workers": sum(
+                        int(
+                            item.get("performance", {})
+                            .get("onebot_actions", {})
+                            .get("workers", 0)
+                        )
+                        for item in diagnostics
+                    ),
+                    "inbound_workers": sum(
+                        int(item.get("inbound_worker_count") or 0)
+                        for item in diagnostics
+                    ),
+                }
+                formal_resources = result["formal"]["resources"]
+                retained_growth_mib = (
+                    result["post_idle"]["rss_bytes"]
+                    - formal_resources["rss_start_bytes"]
+                ) / (1024 * 1024)
+                retained_elapsed_minutes = (
+                    result["formal"]["duration_seconds"]
+                    + float(args.post_idle_seconds)
+                ) / 60.0
+                result["post_idle"]["rss_retained_growth_mib"] = round(
+                    retained_growth_mib,
+                    3,
+                )
+                result["post_idle"]["rss_retained_slope_mib_per_10min"] = round(
+                    retained_growth_mib
+                    / max(0.001, retained_elapsed_minutes)
+                    * 10.0,
+                    3,
+                )
             if trace_start is not None:
                 gc.collect()
                 trace_end = tracemalloc.take_snapshot()
@@ -1607,6 +1762,8 @@ async def async_main() -> int:
         result["acceptance"] = evaluate(
             result,
             strict_duration=not args.non_strict_duration,
+            expected_duration=args.duration_seconds,
+            profile=args.profile,
         )
         result["passed"] = all(result["acceptance"].values())
         args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

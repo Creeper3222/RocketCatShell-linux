@@ -167,13 +167,18 @@ class UpdateDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(
             UpdateService,
             "_request_json",
-            return_value=[github_release("v0.2.3"), github_release("v0.2.2")],
+            return_value=[
+                github_release("v0.2.4"),
+                github_release("v0.2.3"),
+                github_release("v0.2.2"),
+            ],
         ):
             status = await self.service.status()
         self.assertTrue(status["update_available"])
         self.assertEqual(status["minimum_compatible_tag"], "v0.2.2")
-        self.assertEqual(self.service.action_for_tag("v0.2.2"), "reinstall")
-        self.assertEqual(self.service.action_for_tag("v0.2.3"), "update")
+        self.assertEqual(self.service.action_for_tag("v0.2.2"), "rollback")
+        self.assertEqual(self.service.action_for_tag("v0.2.3"), "reinstall")
+        self.assertEqual(self.service.action_for_tag("v0.2.4"), "update")
 
 
 class UpdateTransactionMetadataTests(unittest.TestCase):

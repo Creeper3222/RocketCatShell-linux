@@ -44,6 +44,8 @@ class RollingMetric:
         return {
             "count": count,
             "sample_count": len(samples),
+            "sample_every": 1,
+            "sample_rate": 1.0,
             "mean": round(total / count, 3) if count else 0.0,
             "p50": round(_percentile(samples, 0.50), 3),
             "p95": round(_percentile(samples, 0.95), 3),
@@ -64,47 +66,99 @@ class RollingMetric:
             return float(self._maximum)
 
 
-class RuntimeMetrics:
-    """Small process-local registry that never stores payload or identity data."""
+class EventLoopRollingMetric:
+    """Lock-free metric for values owned by one asyncio event loop.
 
-    def __init__(self, *, sample_capacity: int = 2048) -> None:
+    Counters, totals and the all-time maximum remain exact. Percentiles use a
+    deterministic fixed-rate sample so hot message paths do not acquire two
+    threading locks and retain thousands of values for every observation.
+    """
+
+    def __init__(self, *, capacity: int = 512, sample_every: int = 16) -> None:
+        self._samples: deque[float] = deque(maxlen=max(32, int(capacity)))
+        self._sample_every = max(1, int(sample_every))
+        self._count = 0
+        self._total = 0.0
+        self._maximum = 0.0
+
+    def observe(self, value: float | int) -> None:
+        sample = max(0.0, float(value))
+        self._count += 1
+        self._total += sample
+        self._maximum = max(self._maximum, sample)
+        if (self._count - 1) % self._sample_every == 0:
+            self._samples.append(sample)
+
+    def snapshot(self) -> dict[str, float | int]:
+        samples = list(self._samples)
+        count = self._count
+        return {
+            "count": count,
+            "sample_count": len(samples),
+            "sample_every": self._sample_every,
+            "sample_rate": round(1.0 / self._sample_every, 6),
+            "mean": round(self._total / count, 3) if count else 0.0,
+            "p50": round(_percentile(samples, 0.50), 3),
+            "p95": round(_percentile(samples, 0.95), 3),
+            "p99": round(_percentile(samples, 0.99), 3),
+            "max": round(self._maximum, 3),
+        }
+
+    def reset(self) -> None:
+        self._samples.clear()
+        self._count = 0
+        self._total = 0.0
+        self._maximum = 0.0
+
+    def maximum(self) -> float:
+        return float(self._maximum)
+
+
+class RuntimeMetrics:
+    """Single-event-loop registry that never stores payload or identity data."""
+
+    def __init__(
+        self,
+        *,
+        sample_capacity: int = 512,
+        sample_every: int = 16,
+    ) -> None:
         self._sample_capacity = max(32, int(sample_capacity))
-        self._timings: dict[str, RollingMetric] = {}
+        self._sample_every = max(1, int(sample_every))
+        self._timings: dict[str, EventLoopRollingMetric] = {}
         self._counters: dict[str, int] = {}
         self._gauges: dict[str, float] = {}
         self._high_water: dict[str, float] = {}
-        self._lock = threading.Lock()
 
     def observe(self, name: str, value: float | int) -> None:
         key = str(name)
-        with self._lock:
-            metric = self._timings.get(key)
-            if metric is None:
-                metric = RollingMetric(capacity=self._sample_capacity)
-                self._timings[key] = metric
+        metric = self._timings.get(key)
+        if metric is None:
+            metric = EventLoopRollingMetric(
+                capacity=self._sample_capacity,
+                sample_every=self._sample_every,
+            )
+            self._timings[key] = metric
         metric.observe(value)
 
     def increment(self, name: str, amount: int = 1) -> int:
         key = str(name)
-        with self._lock:
-            value = self._counters.get(key, 0) + int(amount)
-            self._counters[key] = value
-            return value
+        value = self._counters.get(key, 0) + int(amount)
+        self._counters[key] = value
+        return value
 
     def set_gauge(self, name: str, value: float | int, *, high_water: bool = False) -> None:
         key = str(name)
         normalized = float(value)
-        with self._lock:
-            self._gauges[key] = normalized
-            if high_water:
-                self._high_water[key] = max(self._high_water.get(key, normalized), normalized)
+        self._gauges[key] = normalized
+        if high_water:
+            self._high_water[key] = max(self._high_water.get(key, normalized), normalized)
 
     def snapshot(self) -> dict[str, Any]:
-        with self._lock:
-            timings = dict(self._timings)
-            counters = dict(self._counters)
-            gauges = dict(self._gauges)
-            high_water = dict(self._high_water)
+        timings = dict(self._timings)
+        counters = dict(self._counters)
+        gauges = dict(self._gauges)
+        high_water = dict(self._high_water)
         return {
             "timings": {name: metric.snapshot() for name, metric in timings.items()},
             "counters": counters,

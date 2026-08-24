@@ -1,4 +1,4 @@
-ARG BUILD_VERSION=v0.2.2
+ARG BUILD_VERSION=v0.2.3
 ARG BUILD_REVISION=unknown
 ARG CONTAINER_RUNTIME_GENERATION=1
 
@@ -39,7 +39,7 @@ COPY tools/update_helper.py /opt/rocketcat/update_helper.py
 RUN chmod +x /usr/local/bin/rocketcat-entrypoint.sh \
     && mkdir -p /app/config/plugins_config /app/data/temp /app/data/bots /app/data/user_identity /app/data/plugin_data /app/data/update /app/logs
 
-EXPOSE 5751
+EXPOSE 5751 3000 3001
 
 VOLUME ["/app/config", "/app/data/temp", "/app/data/bots", "/app/data/user_identity", "/app/data/plugins", "/app/data/plugin_data", "/app/logs"]
 

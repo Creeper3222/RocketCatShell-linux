@@ -45,6 +45,7 @@ async function gridOrder(page, selector) {
 }
 
 async function cardDragSurfacePoint(card) {
+  await card.scrollIntoViewIfNeeded();
   return card.evaluate((element) => {
     const surface = element.querySelector('[data-card-order-drag-surface]');
     if (!surface) throw new Error('card drag surface is missing');

@@ -99,6 +99,7 @@ async function validateDesktop(browser, errors) {
   assert(modality.keyboard === 'instant' && modality.pointer === 'standard', `modality mismatch: ${JSON.stringify(modality)}`);
 
   await page.locator('#createButton').click();
+  await page.locator('#createTransportMenu [role="menuitem"]').first().click();
   await page.locator('#botForm input[name="name"]').fill('stack depth validation');
   await page.keyboard.press('Escape');
   await page.locator('#confirmModal').waitFor({ state: 'visible' });
@@ -247,6 +248,7 @@ async function validateDrawer(browser, errors) {
   await page.locator('[data-page="network"]').click();
   await waitForDrawer(page, false);
   await page.locator('#createButton').click();
+  await page.locator('#createTransportMenu [role="menuitem"]').first().click();
   await dragMouse(page, { x: 6, y: 220 }, [{ x: 300, y: 220, steps: 8 }]);
   await page.waitForTimeout(100);
   assert(!await page.evaluate(() => state.ui.mobileNavigationOpen), 'open dialog did not block edge drawer gesture');
@@ -376,6 +378,7 @@ async function validateReducedMotion(browser, errors) {
   assert(toastMotion.duration.split(',').every((duration) => duration.trim() === '0.12s'), `reduced toast feedback is not 120ms: ${JSON.stringify(toastMotion)}`);
   assert(toastMotion.transform === 'none', `reduced toast still moves: ${toastMotion.transform}`);
   await page.locator('#createButton').click();
+  await page.locator('#createTransportMenu [role="menuitem"]').first().click();
   const dialogMotion = await page.locator('#botModal').evaluate((dialog) => {
     const panel = dialog.querySelector('.modal-panel');
     return {

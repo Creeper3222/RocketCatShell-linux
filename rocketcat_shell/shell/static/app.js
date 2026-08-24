@@ -5,17 +5,48 @@ const DEFAULT_FORM = {
   username: '',
   password: '',
   e2ee_password: '',
-  onebot_ws_url: '',
-  onebot_access_token: '',
   reconnect_delay: 5.0,
   max_reconnect_attempts: 10,
   enable_subchannel_session_isolation: true,
   remote_media_max_size: 20971520,
   room_info_cache_ttl_seconds: 300.0,
   perf_trace_enabled: false,
-  skip_own_messages: true,
-  debug: false,
 };
+
+const FALLBACK_TRANSPORT_CATALOG = Object.freeze([
+  {
+    type: 'websocket-client',
+    label: 'Websocket客户端',
+    description: 'RocketCat 主动连接 OneBot WebSocket 上游，并接收 action、推送事件。',
+    defaults: {
+      url: 'ws://127.0.0.1:6199/ws/',
+      message_post_format: 'array',
+      report_self_message: false,
+      reconnect_interval_ms: 5000,
+      heartbeat_interval_ms: 30000,
+      access_token: '',
+      debug: false,
+    },
+    fields: [
+      { key: 'url', label: 'Websocket 地址', type: 'url', default: 'ws://127.0.0.1:6199/ws/', required: true, span: 2 },
+      {
+        key: 'message_post_format', label: '消息上报格式', type: 'select', default: 'array', span: 1,
+        options: [{ value: 'array', label: 'Array' }, { value: 'string', label: 'String / CQ码' }],
+      },
+      { key: 'report_self_message', label: '上报自身消息', type: 'boolean', default: false, span: 1 },
+      { key: 'reconnect_interval_ms', label: '重连间隔（毫秒）', type: 'number', default: 5000, min: 100, max: 3600000, step: 100, span: 1 },
+      { key: 'heartbeat_interval_ms', label: '心跳间隔（毫秒）', type: 'number', default: 30000, min: 0, max: 3600000, step: 1000, span: 1 },
+      { key: 'access_token', label: 'Access Token', type: 'password', default: '', span: 2 },
+      { key: 'debug', label: '调试日志', type: 'boolean', default: false, span: 1 },
+    ],
+    card_fields: [
+      { key: 'url', label: 'WS URL', format: 'code' },
+      { key: 'message_post_format', label: '格式', format: 'choice' },
+      { key: 'reconnect_interval_ms', label: '重连', format: 'milliseconds' },
+      { key: 'heartbeat_interval_ms', label: '心跳', format: 'milliseconds' },
+    ],
+  },
+]);
 
 const ROCKETCAT_CONFIG_MARKER_FIELD = 'Is rocketcat config';
 const FILE_IMAGE_EXTENSIONS = new Set(['.bmp', '.gif', '.jpeg', '.jpg', '.png', '.webp']);
@@ -54,6 +85,9 @@ const cardOrderMotionAnimations = new WeakMap();
 let inputModality = 'programmatic';
 
 function setInputModality(modality) {
+  if (inputModality === modality && document.body.dataset.inputModality === modality) {
+    return;
+  }
   inputModality = modality;
   document.body.dataset.inputModality = modality;
 }
@@ -184,6 +218,7 @@ function springTo(element, {
 }
 
 window.addEventListener('pointerdown', () => setInputModality('pointer'), { capture: true, passive: true });
+window.addEventListener('pointermove', () => setInputModality('pointer'), { capture: true, passive: true });
 window.addEventListener('keydown', () => setInputModality('keyboard'), { capture: true });
 setInputModality('programmatic');
 
@@ -210,6 +245,13 @@ const state = {
     pollTimer: null,
     abortController: null,
     renderSignature: '',
+    activeTransportFilter: 'all',
+  },
+  onebotTransports: {
+    items: [],
+    loaded: false,
+    selectedType: 'websocket-client',
+    createMenuOpen: false,
   },
   settings: {
     data: null,
@@ -366,6 +408,8 @@ const elements = {
   logoutButton: document.getElementById('logoutButton'),
   mainContent: document.getElementById('mainContent'),
   botListSummary: document.getElementById('botListSummary'),
+  createTransportMenu: document.getElementById('createTransportMenu'),
+  transportFilterBar: document.getElementById('transportFilterBar'),
   navButtons: Array.from(document.querySelectorAll('[data-page]')),
   sidebarToggleButtons: [],
   networkPage: document.getElementById('networkPage'),
@@ -489,6 +533,9 @@ const elements = {
   modalTitle: document.getElementById('modalTitle'),
   form: document.getElementById('botForm'),
   botFormStatus: document.getElementById('botFormStatus'),
+  botTransportFields: document.getElementById('botTransportFields'),
+  botTransportTypeBadge: document.getElementById('botTransportTypeBadge'),
+  botTransportDescription: document.getElementById('botTransportDescription'),
   settingsForm: document.getElementById('settingsForm'),
   settingsPasswordHelper: document.getElementById('settingsPasswordHelper'),
   settingsWebuiPasswordInput: document.getElementById('settingsWebuiPasswordInput'),
@@ -1238,6 +1285,7 @@ function openDialog(dialog, {
   if (typeof HTMLDialogElement === 'undefined' || !(dialog instanceof HTMLDialogElement)) {
     return;
   }
+  const panel = dialog.querySelector('.modal-panel');
   const pendingClose = dialogCloseTimers.get(dialog);
   if (pendingClose) {
     window.clearTimeout(pendingClose);
@@ -1249,6 +1297,10 @@ function openDialog(dialog, {
     dialog.dataset.blocking = String(Boolean(blocking));
     dialog.showModal();
     dialogStack.push(dialog);
+  }
+  if (panel) {
+    panel.scrollTop = 0;
+    panel.scrollLeft = 0;
   }
   delete dialog.dataset.closing;
   markDialogPristine(dialog);
@@ -1792,18 +1844,25 @@ async function restoreHashRoute({ replaceInvalid = false } = {}) {
   await activatePage(route.page);
 }
 
+const jsonResponseCache = new Map();
+
 async function requestJson(url, options = {}) {
-  const { headers: optionHeaders, ...requestOptions } = options;
+  const { headers: optionHeaders, etagCacheKey = '', ...requestOptions } = options;
   const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData;
+  const cached = etagCacheKey ? jsonResponseCache.get(etagCacheKey) : null;
   const response = await fetch(url, {
     headers: isFormData
       ? { ...(optionHeaders || {}) }
-      : {
+        : {
           'Content-Type': 'application/json',
+          ...(cached?.etag ? { 'If-None-Match': cached.etag } : {}),
           ...(optionHeaders || {}),
         },
     ...requestOptions,
   });
+  if (response.status === 304 && cached) {
+    return cached.payload;
+  }
   const payload = await response.json().catch(() => ({}));
   if (response.status === 401 && !options.skipAuthRedirect) {
     stopLogPolling();
@@ -1820,6 +1879,10 @@ async function requestJson(url, options = {}) {
     const requestError = new Error(message);
     requestError.status = response.status;
     throw requestError;
+  }
+  if (etagCacheKey) {
+    const etag = response.headers.get('ETag') || '';
+    jsonResponseCache.set(etagCacheKey, { etag, payload });
   }
   return payload;
 }
@@ -2324,7 +2387,7 @@ function renderStatus(status) {
     return;
   }
   if (!status.bot_count) {
-    setBanner('当前还没有 bot。点击右上角“新建 Bot”开始添加。');
+    setBanner('当前还没有 bot。点击右上角“新建”开始添加。');
     return;
   }
   if (!status.enabled_bot_count) {
@@ -3434,11 +3497,11 @@ function renderDiagnostics(payload) {
   for (const item of orderedItems) {
     const card = document.createElement('article');
     const tone = getDiagnosticStatusTone(item.status_code);
-    const onebotStatus = item.onebot_connected === true
+    const onebotStatus = item.onebot_transport_status || (item.onebot_connected === true
       ? '已连接'
       : item.onebot_waiting_for_upstream === true
         ? `等待上游 · 每 ${Number(item.onebot_retry_delay_seconds) || 5} 秒重试`
-        : '未连接';
+        : '未连接');
     const disconnectRow = item.last_disconnect_reason
       ? `
         <div class="diagnostics-row">
@@ -3489,11 +3552,15 @@ function renderDiagnostics(payload) {
           <strong>${escapeHtml(item.onebot_self_id || '-')}</strong>
         </div>
         <div class="diagnostics-row">
+          <span>OneBot 网络类型</span>
+          <strong>${escapeHtml(item.onebot_transport_label || getTransportSpec(item.onebot_transport_type).label)}</strong>
+        </div>
+        <div class="diagnostics-row">
           <span>Rocket.Chat 重连失败</span>
           <strong>${escapeHtml(String(item.reconnect_failures ?? 0))}</strong>
         </div>
         <div class="diagnostics-row">
-          <span>OneBot 上游</span>
+          <span>OneBot 上游 / 传输状态</span>
           <strong>${escapeHtml(onebotStatus)}</strong>
         </div>
         <div class="diagnostics-row">
@@ -3614,6 +3681,14 @@ function renderBasicInfo(payload) {
         <div class="basic-meta-row">
           <span>OneBot self_id</span>
           <strong>${escapeHtml(String(item.onebot_self_id || '-'))}</strong>
+        </div>
+        <div class="basic-meta-row">
+          <span>OneBot 网络类型</span>
+          <strong>${escapeHtml(item.onebot_transport_label || getTransportSpec(item.onebot_transport_type).label)}</strong>
+        </div>
+        <div class="basic-meta-row">
+          <span>传输状态</span>
+          <strong>${escapeHtml(item.onebot_transport_status || '等待连接')}</strong>
         </div>
         <div class="basic-meta-row wide">
           <span>Rocket.Chat 服务器</span>
@@ -3984,6 +4059,243 @@ function stopLogPolling() {
   }
 }
 
+function getTransportCatalogItems() {
+  return state.onebotTransports.items.length
+    ? state.onebotTransports.items
+    : Array.from(FALLBACK_TRANSPORT_CATALOG);
+}
+
+function getTransportSpec(typeId = 'websocket-client') {
+  const normalized = String(typeId || 'websocket-client').trim().toLowerCase();
+  return getTransportCatalogItems().find((item) => item.type === normalized)
+    || FALLBACK_TRANSPORT_CATALOG[0];
+}
+
+function transportSettingsForUi(transport, spec) {
+  const source = transport && typeof transport === 'object' ? transport : {};
+  const settings = source.settings && typeof source.settings === 'object'
+    ? source.settings
+    : {};
+  return { ...(spec.defaults || {}), ...settings };
+}
+
+function setCreateTransportMenuOpen(open, { focusFirst = false } = {}) {
+  const resolved = Boolean(open);
+  state.onebotTransports.createMenuOpen = resolved;
+  elements.createButton?.setAttribute('aria-expanded', String(resolved));
+  elements.createTransportMenu?.classList.toggle('hidden', !resolved);
+  if (resolved && focusFirst) {
+    elements.createTransportMenu?.querySelector('[role="menuitem"]')?.focus();
+  }
+}
+
+function renderCreateTransportMenu() {
+  if (!elements.createTransportMenu) {
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  for (const spec of getTransportCatalogItems()) {
+    const button = document.createElement('button');
+    button.className = 'create-transport-option';
+    button.type = 'button';
+    button.setAttribute('role', 'menuitem');
+    button.dataset.transportType = spec.type;
+    button.innerHTML = `
+      <strong>${escapeHtml(spec.label || spec.type)}</strong>
+      <span>${escapeHtml(spec.description || '')}</span>
+    `;
+    fragment.appendChild(button);
+  }
+  elements.createTransportMenu.replaceChildren(fragment);
+}
+
+function renderTransportFilters() {
+  if (!elements.transportFilterBar) {
+    return;
+  }
+  const definitions = [
+    { type: 'all', label: '全部' },
+    ...getTransportCatalogItems().map((spec) => ({ type: spec.type, label: spec.label })),
+  ];
+  if (!definitions.some((item) => item.type === state.network.activeTransportFilter)) {
+    state.network.activeTransportFilter = 'all';
+  }
+  const fragment = document.createDocumentFragment();
+  for (const item of definitions) {
+    const button = document.createElement('button');
+    const active = item.type === state.network.activeTransportFilter;
+    button.className = `transport-filter${active ? ' active' : ''}`;
+    button.type = 'button';
+    button.dataset.transportFilter = item.type;
+    button.setAttribute('aria-pressed', String(active));
+    button.textContent = item.label;
+    fragment.appendChild(button);
+  }
+  elements.transportFilterBar.replaceChildren(fragment);
+}
+
+async function loadTransportCatalog({ silent = false, signal = null } = {}) {
+  try {
+    const payload = await requestJson('/api/onebot/transports', { signal });
+    const items = Array.isArray(payload?.items)
+      ? payload.items.filter((item) => item && typeof item.type === 'string')
+      : [];
+    if (!items.length) {
+      throw new Error('OneBot 网络类型目录为空');
+    }
+    state.onebotTransports.items = items;
+    state.onebotTransports.loaded = true;
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw error;
+    }
+    state.onebotTransports.items = Array.from(FALLBACK_TRANSPORT_CATALOG);
+    state.onebotTransports.loaded = false;
+    if (!silent) {
+      showToast('网络类型目录暂不可用，已回退到 Websocket客户端。', 'error');
+    }
+  }
+  renderCreateTransportMenu();
+  renderTransportFilters();
+}
+
+function formatTransportCardValue(value, format = 'text') {
+  if (format === 'boolean') {
+    return value ? '开启' : '关闭';
+  }
+  if (format === 'milliseconds') {
+    const milliseconds = Number(value) || 0;
+    if (milliseconds === 0) {
+      return '关闭';
+    }
+    return milliseconds >= 1000 && milliseconds % 1000 === 0
+      ? `${milliseconds / 1000} 秒`
+      : `${milliseconds} ms`;
+  }
+  if (format === 'choice') {
+    return String(value || '-').toLowerCase() === 'array' ? 'Array' : 'String';
+  }
+  return value === null || value === undefined || value === '' ? '-' : String(value);
+}
+
+function buildTransportCardRows(bot) {
+  const transport = bot.onebot_transport || {};
+  const spec = getTransportSpec(transport.type || bot.onebot_transport_type);
+  const settings = transportSettingsForUi(transport, spec);
+  const cardFields = Array.isArray(bot.onebot_transport_card_fields)
+    ? bot.onebot_transport_card_fields
+    : (Array.isArray(spec.card_fields) ? spec.card_fields : []);
+  return cardFields.map((field) => {
+    const formatted = formatTransportCardValue(settings[field.key], field.format);
+    const valueMarkup = field.format === 'code'
+      ? `<code>${escapeHtml(formatted)}</code>`
+      : `<strong>${escapeHtml(formatted)}</strong>`;
+    return `
+      <div class="card-line transport-card-line">
+        <span>${escapeHtml(field.label || field.key)}</span>
+        ${valueMarkup}
+      </div>
+    `;
+  }).join('');
+}
+
+function renderBotTransportFields(spec, settings = {}) {
+  if (!elements.botTransportFields) {
+    return;
+  }
+  const values = { ...(spec.defaults || {}), ...(settings || {}) };
+  const fragment = document.createDocumentFragment();
+  for (const field of Array.isArray(spec.fields) ? spec.fields : []) {
+    const fieldValue = field.key in values ? values[field.key] : field.default;
+    const wrapper = document.createElement('label');
+    wrapper.className = field.type === 'boolean'
+      ? 'field-switch transport-boolean-field'
+      : 'field-block transport-value-field';
+    if (Number(field.span) >= 2) {
+      wrapper.classList.add('span-two');
+    }
+    const label = document.createElement('span');
+    label.textContent = field.label || field.key;
+    wrapper.appendChild(label);
+
+    let input;
+    if (field.type === 'select') {
+      input = document.createElement('select');
+      for (const option of Array.isArray(field.options) ? field.options : []) {
+        const optionElement = document.createElement('option');
+        optionElement.value = option.value;
+        optionElement.textContent = option.label || option.value;
+        input.appendChild(optionElement);
+      }
+      input.value = String(fieldValue ?? '');
+    } else {
+      input = document.createElement('input');
+      input.type = field.type === 'boolean'
+        ? 'checkbox'
+        : field.type === 'password'
+          ? 'password'
+          : field.type === 'number'
+            ? 'number'
+            : field.type === 'url'
+              ? 'url'
+              : 'text';
+      if (field.type === 'boolean') {
+        input.checked = Boolean(fieldValue);
+      } else {
+        input.value = fieldValue ?? '';
+      }
+      if (field.type === 'password') {
+        input.autocomplete = 'new-password';
+      }
+    }
+    input.name = `onebot_transport_${field.key}`;
+    input.dataset.transportField = field.key;
+    input.dataset.transportFieldType = field.type || 'text';
+    input.required = Boolean(field.required);
+    if (field.min !== undefined) input.min = String(field.min);
+    if (field.max !== undefined) input.max = String(field.max);
+    if (field.step !== undefined) input.step = String(field.step);
+    wrapper.appendChild(input);
+    if (field.type === 'boolean') {
+      const indicator = document.createElement('i');
+      indicator.setAttribute('aria-hidden', 'true');
+      wrapper.appendChild(indicator);
+    }
+    if (field.help) {
+      const help = document.createElement('small');
+      help.textContent = field.help;
+      wrapper.appendChild(help);
+    }
+    fragment.appendChild(wrapper);
+  }
+  elements.botTransportFields.replaceChildren(fragment);
+  if (elements.botTransportTypeBadge) {
+    elements.botTransportTypeBadge.textContent = spec.label || spec.type;
+  }
+  if (elements.botTransportDescription) {
+    elements.botTransportDescription.textContent = spec.description || '';
+  }
+}
+
+function collectTransportFormData() {
+  const settings = {};
+  for (const field of elements.botTransportFields?.querySelectorAll('[data-transport-field]') || []) {
+    const key = field.dataset.transportField;
+    const type = field.dataset.transportFieldType;
+    if (type === 'boolean') {
+      settings[key] = field.checked;
+    } else if (type === 'number') {
+      settings[key] = field.value === '' ? 0 : Number(field.value);
+    } else {
+      settings[key] = field.value;
+    }
+  }
+  return {
+    type: state.onebotTransports.selectedType,
+    settings,
+  };
+}
+
 function effectiveStatusLabel(bot) {
   if (!bot.enabled) {
     return '已停用';
@@ -3998,19 +4310,39 @@ function renderBots(items) {
   state.bots = items;
   reconcileClientCardOrder('bots', items.map((item) => item.id), { authoritative: true });
   const orderedItems = orderItemsForCards(items, 'bots', (item) => item.id);
-  const renderSignature = JSON.stringify(orderedItems);
+  const visibleItems = state.network.activeTransportFilter === 'all'
+    ? orderedItems
+    : orderedItems.filter((item) => (
+      item.onebot_transport?.type || item.onebot_transport_type || 'websocket-client'
+    ) === state.network.activeTransportFilter);
+  const renderSignature = JSON.stringify({
+    filter: state.network.activeTransportFilter,
+    items: orderedItems,
+  });
   if (state.network.renderSignature === renderSignature) {
     return;
   }
   state.network.renderSignature = renderSignature;
   elements.botGrid.innerHTML = '';
-  elements.emptyState.classList.toggle('hidden', items.length > 0);
+  elements.emptyState.classList.toggle('hidden', visibleItems.length > 0);
+  const emptyMessage = elements.emptyState?.querySelector('p');
+  if (emptyMessage) {
+    emptyMessage.textContent = items.length
+      ? '当前筛选条件下没有 Bot。'
+      : '当前还没有 Bot。点击右上角“新建”开始添加。';
+  }
   if (elements.botListSummary) {
     const enabledCount = items.filter((item) => item.enabled).length;
-    elements.botListSummary.textContent = `${items.length} 个 Bot · ${enabledCount} 个启用`;
+    elements.botListSummary.textContent = visibleItems.length === items.length
+      ? `${items.length} 个 Bot · ${enabledCount} 个启用`
+      : `显示 ${visibleItems.length} / ${items.length} 个 Bot · ${enabledCount} 个启用`;
   }
 
-  for (const bot of orderedItems) {
+  for (const bot of visibleItems) {
+    const transportType = bot.onebot_transport?.type
+      || bot.onebot_transport_type
+      || 'websocket-client';
+    const transportSpec = getTransportSpec(transportType);
     const card = document.createElement('article');
     card.className = 'bot-card';
     configureCardOrderCard(card, 'bots', bot.id, bot.name || bot.id || 'Bot');
@@ -4019,7 +4351,7 @@ function renderBots(items) {
       <div class="bot-card-header">
         <div>
           <span class="card-chip">${escapeHtml(bot.name || '未命名 Bot')}</span>
-          <p class="card-type">WS bot 客户端</p>
+          <p class="card-type">${escapeHtml(bot.onebot_transport_label || transportSpec.label)}</p>
         </div>
         <label class="field-switch compact-switch">
           <span class="visually-hidden">${escapeHtml(bot.enabled ? `停用 ${bot.name || '未命名 Bot'}` : `启用 ${bot.name || '未命名 Bot'}`)}</span>
@@ -4037,10 +4369,7 @@ function renderBots(items) {
           <span>Rocket.Chat</span>
           <code>${escapeHtml(bot.server_url || '-')}</code>
         </div>
-        <div class="card-line">
-          <span>WS URL</span>
-          <code>${escapeHtml(bot.onebot_ws_url || '-')}</code>
-        </div>
+        ${buildTransportCardRows(bot)}
         <div class="card-line">
           <span>用户名</span>
           <strong>${escapeHtml(bot.username || '-')}</strong>
@@ -7198,10 +7527,20 @@ function collectFormData() {
   return payload;
 }
 
-function openModal(bot = null) {
+function openModal(bot = null, transportType = 'websocket-client') {
   state.editingId = bot?.id || null;
+  const resolvedTransportType = bot?.onebot_transport?.type
+    || bot?.onebot_transport_type
+    || transportType
+    || 'websocket-client';
+  const spec = getTransportSpec(resolvedTransportType);
+  state.onebotTransports.selectedType = spec.type;
   elements.modalTitle.textContent = bot ? `编辑 Bot：${bot.name}` : '新建 Bot';
   setFormData(bot || buildCreateDefaults());
+  renderBotTransportFields(
+    spec,
+    bot ? transportSettingsForUi(bot.onebot_transport, spec) : (spec.defaults || {}),
+  );
   setFormResult(elements.botFormStatus);
   if (elements.openUserMappingsButton) {
     const mappingReady = Boolean(bot?.user_mapping_ready);
@@ -7402,9 +7741,16 @@ async function deleteUserMapping(userId, label = '') {
 }
 
 async function loadData({ signal = null } = {}) {
+  const catalogPromise = state.onebotTransports.loaded
+    ? Promise.resolve()
+    : loadTransportCatalog({ silent: true, signal });
   const [status, bots] = await Promise.all([
     requestJson('/api/status?compact=true', { signal }),
-    requestJson('/api/bots', { signal }),
+    requestJson('/api/bots?compact=true', {
+      signal,
+      etagCacheKey: 'bots-compact',
+    }),
+    catalogPromise,
   ]);
   renderStatus(status);
   renderBots(bots.items || []);
@@ -7428,7 +7774,11 @@ async function loadDiagnostics({ forceReload = false, silent = false, signal = n
   }
 
   try {
-    const diagnostics = await requestJson('/api/diagnostics', { signal });
+    const endpoint = forceReload ? '/api/diagnostics?refresh=true' : '/api/diagnostics';
+    const diagnostics = await requestJson(endpoint, {
+      signal,
+      etagCacheKey: 'diagnostics',
+    });
     renderDiagnostics(diagnostics);
   } catch (error) {
     if (isAbortError(error)) {
@@ -7495,6 +7845,7 @@ async function loadBasicInfo({ forceReload = false, silent = false } = {}) {
 
 async function saveBot() {
   const payload = collectFormData();
+  payload.onebot_transport = collectTransportFormData();
   if (!Number.isFinite(payload.room_info_cache_ttl_seconds) || payload.room_info_cache_ttl_seconds < 0) {
     throw new Error('房间信息缓存 TTL 必须是大于等于 0 的数字');
   }
@@ -7658,7 +8009,7 @@ async function toggleBot(botId, enabled) {
   }
   await requestJson(`/api/bots/${botId}`, {
     method: 'PUT',
-    body: JSON.stringify({ ...target, enabled }),
+    body: JSON.stringify({ enabled }),
   });
   showToast(enabled ? 'Bot 已启用' : 'Bot 已停用', 'success');
   await loadData();
@@ -7817,7 +8168,59 @@ elements.confirmModalCloseButton?.addEventListener('click', () => resolveConfirm
 elements.confirmModalCancelButton?.addEventListener('click', () => resolveConfirmation(false));
 elements.confirmModalSubmitButton?.addEventListener('click', () => resolveConfirmation(true));
 
-elements.createButton?.addEventListener('click', () => openModal());
+elements.createButton?.addEventListener('click', (event) => {
+  event.stopPropagation();
+  setCreateTransportMenuOpen(!state.onebotTransports.createMenuOpen, {
+    focusFirst: inputModality === 'keyboard',
+  });
+});
+elements.createTransportMenu?.addEventListener('click', (event) => {
+  const option = event.target.closest('[data-transport-type]');
+  if (!option) {
+    return;
+  }
+  setCreateTransportMenuOpen(false);
+  openModal(null, option.dataset.transportType || 'websocket-client');
+});
+elements.createTransportMenu?.addEventListener('keydown', (event) => {
+  const options = Array.from(elements.createTransportMenu.querySelectorAll('[role="menuitem"]'));
+  const currentIndex = options.indexOf(document.activeElement);
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    setCreateTransportMenuOpen(false);
+    elements.createButton?.focus();
+    return;
+  }
+  if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key) || !options.length) {
+    return;
+  }
+  event.preventDefault();
+  let nextIndex = currentIndex < 0 ? 0 : currentIndex;
+  if (event.key === 'ArrowDown') nextIndex = (nextIndex + 1) % options.length;
+  if (event.key === 'ArrowUp') nextIndex = (nextIndex - 1 + options.length) % options.length;
+  if (event.key === 'Home') nextIndex = 0;
+  if (event.key === 'End') nextIndex = options.length - 1;
+  options[nextIndex]?.focus();
+});
+elements.transportFilterBar?.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-transport-filter]');
+  if (!button) {
+    return;
+  }
+  state.network.activeTransportFilter = button.dataset.transportFilter || 'all';
+  renderTransportFilters();
+  state.network.renderSignature = '';
+  renderBots(state.bots);
+});
+document.addEventListener('pointerdown', (event) => {
+  if (!state.onebotTransports.createMenuOpen) {
+    return;
+  }
+  if (event.target.closest('.create-transport-shell')) {
+    return;
+  }
+  setCreateTransportMenuOpen(false);
+}, { capture: true });
 elements.refreshButton?.addEventListener('click', async () => {
   await runBusy(elements.refreshButton, '刷新中…', async () => {
     await loadData();
@@ -8786,9 +9189,17 @@ elements.botGrid?.addEventListener('click', async (event) => {
   }
   const { id, role } = button.dataset;
   if (role === 'edit') {
-    const target = state.bots.find((bot) => bot.id === id);
-    if (target) {
-      openModal(target);
+    try {
+      const payload = await runBusy(
+        button,
+        null,
+        () => requestJson(`/api/bots/${encodeURIComponent(id)}`),
+      );
+      if (payload?.item) {
+        openModal(payload.item);
+      }
+    } catch (error) {
+      showToast(error.message || '读取 Bot 详情失败', 'error');
     }
     return;
   }
@@ -8884,6 +9295,12 @@ elements.logPerfButton?.addEventListener('click', () => {
 });
 
 window.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && state.onebotTransports.createMenuOpen) {
+    event.preventDefault();
+    setCreateTransportMenuOpen(false);
+    elements.createButton?.focus();
+    return;
+  }
   if (
     event.key === 'Tab'
     && state.ui.mobileNavigationOpen

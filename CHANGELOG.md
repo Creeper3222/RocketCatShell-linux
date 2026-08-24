@@ -6,6 +6,39 @@ RocketCatShell 各版本的功能变更、兼容性调整、问题修复和迁�
 
 ## 未发布
 
+## v0.2.3（五类 OneBot 传输、双向兼容与性能优化）
+
+### 界面与交互
+
+- v0.2.3 第一轮优化侧栏与主要管理卡片的指针反馈：侧栏项目以轻微横移配合状态高亮，网络配置、基础信息、运行诊断和插件管理的主卡片以轻微上移配合品牌色描边；动效仅在精细指针设备启用，并与键盘操作、减弱动效偏好及现有卡片拖拽排序保持隔离。
+- 网络配置新增 `HTTP服务器`、`HTTP客户端`、`HTTP SSE服务器`、`Websocket服务器`、`Websocket客户端` 五种准确类型的新建菜单与筛选栏，主操作文案统一精简为“新建”；Bot 设置、网络卡片、基础信息和运行诊断统一由后端传输目录动态渲染类型字段与状态，类型创建后固定，筛选状态下排序只替换可见 Bot 的全局槽位。
+
+### OneBot 网络传输
+
+- 将原有反向 WebSocket 客户端拆入模块化 `OneBotTransport` 契约和声明式 `TransportSpec` 注册表；五种类型各自拥有独立模块，只组合共享的消息 codec、按需 0～8 Worker / 256 队列 action 调度器、HTTP action 服务与 WebSocket peer 基础组件，新增传输不需要修改 Bot API、BridgeRuntime 或通用 WebUI 渲染器。
+- HTTP服务器支持 GET / POST action、Bearer / query Token、CORS 与可选同端口 WebSocket；HTTP SSE服务器在相同 action 能力上增加 `/_events` 有序事件流；Websocket服务器区分 `/api` action-only 与其它 action + event 路径，并为事件连接发送生命周期和心跳。
+- HTTP客户端以有界队列 POST 事件，携带 `X-Self-ID` 和可选 HMAC-SHA1 `X-Signature`，并执行响应中的 `reply` 快速回复；未实现的删除、踢人、禁言和审批操作明确按 `1404` 记录。Websocket客户端保留原反向连接行为，同时增加可配置重连、心跳、Array / String CQ 格式与标准 OneBot 请求头。
+- 新增 `config/onebot_transports.json` 格式 1，按 Bot ID 保存规范化 `{type, settings}`；v0.2.1 / v0.2.2 平面字段会无损迁移为 Websocket客户端，配置导入 / 导出支持新旧格式，非客户端在旧 `bots.json` 中使用不可连接的安全投影，避免回退旧版后误连默认上游。
+- Websocket客户端补全 v0.2.2 双向兼容：回退旧版后修改的 URL、Token、Debug 与自身消息开关会在再次升级时重新吸收，同时保留 v0.2.3 的消息格式、心跳和重连设置；迁移与协调由传输模块声明，不在注册表写死类型分支。
+- 启用的 OneBot 服务端会在保存前检查 Bot 间及 WebUI 监听冲突；所有 URL、Host、端口、格式、心跳、重连和字段类型在写盘前校验。监听、HTTP 投递或 OneBot 对端失败均独立报告，不消耗 Rocket.Chat 重连次数，也不会自动停用 Bot。
+
+### 性能与稳定性
+
+- 事件循环热路径指标改为无锁精确计数与固定 `1/16` 延迟采样；OneBot Array 事件复用不可变序列化帧，HTTP、SSE 和多个 WebSocket peer 不再重复深拷贝与编码。HTTP 快速回复异步提交，SSE 改为事件驱动关闭与 15 秒 keepalive，慢 peer 使用独立有界队列隔离。
+- OneBot action Worker 与 Rocket.Chat 房间分片 Worker 改为按需创建并在空闲 60 秒后回收到 0；房间路由和队列深度统计移除逐消息队列遍历，同时继续保证同房间严格顺序、满载丢弃最新消息及精确计数。
+- Journal 快照阈值提高至 8192 个逻辑批次，写入线程可按顺序合并最多 32 个连续 mutation batch；快照继续兼容格式 1，并分别记录锁等待、锁内复制、序列化与写入耗时。
+- 媒体下载改为约 1 MiB 分块写入并同步计算摘要，大文件 E2EE 使用约 512 KiB 批次；文件预览、编辑、上传、原子替换和目录 ZIP 构建移出事件循环，目录下载使用磁盘临时文件流式响应并持续执行动态空间保护。
+- 系统终端以 16 KiB / 16 ms 合并输出，使用 200k 字符环形历史和每客户端独立的 64 帧 / 1 MiB 发送队列；PTY 读取线程只保留一个待处理事件循环唤醒，慢客户端会断开并可通过重连恢复近期输出。
+- 高频 WebUI 控制面改用纯 ASGI 鉴权与缓存中间件；Bot 卡片使用 compact 响应和 ETag，完整编辑数据按需读取，诊断使用 1 秒 single-flight 缓存，未变化的数据不再重复传输或重建。
+- 新增固定种子的五分钟迭代压力模式、四 peer 扇出 / 房间路由 / compact Bot 微基准及空闲回收验证；多轮剖析与测试报告写入忽略目录 `data/perf/`，用于比较吞吐、延迟、CPU、RSS、线程、句柄、Task、队列和精确过载丢弃。
+
+### Docker / Linux
+
+- Linux 版三方意图合并 Windows v0.2.3 的平台中立实现，同时保留 Linux PTY、进程组、诊断、受保护路径、PID 1 更新 handoff 与容器可写层恢复链路。
+- Compose 默认新增仅绑定宿主机 `127.0.0.1` 的 `3000`（HTTP / SSE）与 `3001`（WebSocket）映射；容器内服务端需监听 `0.0.0.0`，客户端访问宿主机服务使用 `host.docker.internal`。
+- `config/onebot_transports.json` 纳入现有持久配置挂载；镜像重建、WebUI 同容器更新、回退和重新升级均保留五类传输配置及 v0.2.2 WebSocket 兼容投影。
+
+
 ## v0.2.2（Windows / Docker Linux 版本管理、UI 与性能稳定性）
 
 ### Docker / Linux 发行与容器更新

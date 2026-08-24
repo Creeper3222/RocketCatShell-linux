@@ -65,6 +65,7 @@ SOURCE_ONLY_TOOL_FILES = frozenset(
     {
         "tools/benchmark_inbound_translate.py",
         "tools/build_linux_release.py",
+        "tools/benchmark_v023_hotpaths.py",
         "tools/build_v022_acceptance_report.py",
         "tools/smoke_v022_readonly.py",
         "tools/stress_v020.py",

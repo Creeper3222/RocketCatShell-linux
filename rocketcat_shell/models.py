@@ -276,6 +276,8 @@ class BotRecord:
     perf_trace_enabled: bool
     skip_own_messages: bool
     debug: bool
+    onebot_transport_type: str = "websocket-client"
+    onebot_transport_settings: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(
@@ -285,6 +287,41 @@ class BotRecord:
         defaults: ShellSettings,
     ) -> "BotRecord":
         data = dict(payload or {})
+        transport_payload = data.get("onebot_transport")
+        if isinstance(transport_payload, Mapping):
+            transport_type = str(
+                transport_payload.get("type") or "websocket-client"
+            ).strip().lower()
+            raw_transport_settings = transport_payload.get("settings")
+            transport_settings = (
+                dict(raw_transport_settings)
+                if isinstance(raw_transport_settings, Mapping)
+                else {}
+            )
+        else:
+            transport_type = "websocket-client"
+            transport_settings = {
+                "url": str(
+                    data.get("onebot_ws_url", defaults.default_onebot_ws_url)
+                    or defaults.default_onebot_ws_url
+                ).strip(),
+                "message_post_format": "array",
+                "report_self_message": not _coerce_bool(
+                    data.get("skip_own_messages", defaults.default_skip_own_messages),
+                    defaults.default_skip_own_messages,
+                ),
+                "reconnect_interval_ms": 5000,
+                "access_token": str(
+                    data.get(
+                        "onebot_access_token", defaults.default_onebot_access_token
+                    )
+                    or defaults.default_onebot_access_token
+                ),
+                "debug": _coerce_bool(
+                    data.get("debug", defaults.default_debug), defaults.default_debug
+                ),
+                "heartbeat_interval_ms": 30000,
+            }
         return cls(
             bot_id=str(data.get("id") or data.get("bot_id") or "").strip(),
             name=str(data.get("name") or data.get("display_name") or "").strip(),
@@ -325,9 +362,16 @@ class BotRecord:
                 defaults.default_skip_own_messages,
             ),
             debug=_coerce_bool(data.get("debug", defaults.default_debug), defaults.default_debug),
+            onebot_transport_type=transport_type,
+            onebot_transport_settings=transport_settings,
         )
 
     def to_mapping(self) -> dict[str, Any]:
+        legacy_ws_url = self.onebot_ws_url
+        legacy_access_token = self.onebot_access_token
+        if self.onebot_transport_type != "websocket-client":
+            legacy_ws_url = "ws://127.0.0.1:1/__rocketcat_disabled_transport__"
+            legacy_access_token = ""
         return {
             "id": self.bot_id,
             "name": self.name,
@@ -336,8 +380,8 @@ class BotRecord:
             "username": self.username,
             "password": self.password,
             "e2ee_password": self.e2ee_password,
-            "onebot_ws_url": self.onebot_ws_url,
-            "onebot_access_token": self.onebot_access_token,
+            "onebot_ws_url": legacy_ws_url,
+            "onebot_access_token": legacy_access_token,
             "reconnect_delay": self.reconnect_delay,
             "max_reconnect_attempts": self.max_reconnect_attempts,
             "enable_subchannel_session_isolation": self.enable_subchannel_session_isolation,
@@ -346,7 +390,36 @@ class BotRecord:
             "perf_trace_enabled": self.perf_trace_enabled,
             "skip_own_messages": self.skip_own_messages,
             "debug": self.debug,
+            "onebot_transport": self.onebot_transport_mapping(),
         }
+
+    def onebot_transport_mapping(self) -> dict[str, Any]:
+        return {
+            "type": str(self.onebot_transport_type or "websocket-client"),
+            "settings": dict(self.onebot_transport_settings or {}),
+        }
+
+    def apply_onebot_transport(self, payload: Mapping[str, Any]) -> None:
+        transport_type = str(payload.get("type") or "websocket-client").strip().lower()
+        raw_settings = payload.get("settings")
+        settings = dict(raw_settings) if isinstance(raw_settings, Mapping) else {}
+        self.onebot_transport_type = transport_type
+        self.onebot_transport_settings = settings
+        self.onebot_access_token = str(settings.get("access_token") or "")
+        self.debug = _coerce_bool(settings.get("debug", self.debug), self.debug)
+        if "report_self_message" in settings:
+            self.skip_own_messages = not _coerce_bool(
+                settings.get("report_self_message"), False
+            )
+        if transport_type == "websocket-client":
+            self.onebot_ws_url = str(
+                settings.get("url") or self.onebot_ws_url or DEFAULT_ONEBOT_WS_URL
+            ).strip()
+
+    def to_legacy_mapping(self) -> dict[str, Any]:
+        payload = self.to_mapping()
+        payload.pop("onebot_transport", None)
+        return payload
 
     def validate(self) -> list[str]:
         errors: list[str] = []
@@ -357,7 +430,10 @@ class BotRecord:
         if self.enabled:
             if not self.server_url.startswith(("http://", "https://")):
                 errors.append("enabled bot requires a valid Rocket.Chat server_url")
-            if not self.onebot_ws_url.startswith(("ws://", "wss://")):
+            if (
+                self.onebot_transport_type == "websocket-client"
+                and not self.onebot_ws_url.startswith(("ws://", "wss://"))
+            ):
                 errors.append("enabled bot requires a valid onebot_ws_url")
             if not self.username:
                 errors.append("enabled bot requires username")

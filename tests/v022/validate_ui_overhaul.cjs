@@ -257,6 +257,7 @@ async function validateDesktop(browser, errors) {
   await screenshot(page, '02-network-1440x900.png');
 
   await page.locator('#createButton').click();
+  await page.locator('#createTransportMenu [role="menuitem"]').first().click();
   assert(await page.locator('#botModal').evaluate((dialog) => dialog.open), 'bot dialog did not open natively');
   await page.locator('#botForm input[name="name"]').fill('未保存内容');
   await page.keyboard.press('Escape');
@@ -457,6 +458,7 @@ async function validateMobile(browser, errors) {
 
   await navigate(page, 'network', true);
   await page.locator('[data-role="edit"]').first().click();
+  await page.locator('#botModal').waitFor({ state: 'visible' });
   await page.evaluate(() => {
     const button = document.querySelector('#openUserMappingsButton');
     button.disabled = false;
@@ -479,6 +481,7 @@ async function validateDesktopMappings(browser, errors) {
   collectBrowserDiagnostics(page, errors);
   await login(page);
   await page.locator('[data-role="edit"]').first().click();
+  await page.locator('#botModal').waitFor({ state: 'visible' });
   await page.evaluate(() => {
     const button = document.querySelector('#openUserMappingsButton');
     button.disabled = false;

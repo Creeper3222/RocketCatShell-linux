@@ -1,5 +1,6 @@
-# RocketCatShell v0.2.2 Linux / Docker runtime dependencies.
-# Linux terminal sessions use the standard-library PTY backend.
+# RocketCatShell v0.2.3 runtime dependencies.
+# Linux / Docker uses the standard-library PTY backend; the five OneBot
+# transports use aiohttp and the existing ASGI/WebSocket stack.
 aiohttp>=3.9,<4
 cryptography>=44.0.3
 fastapi>=0.110,<1
