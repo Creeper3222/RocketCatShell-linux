@@ -960,7 +960,7 @@
               <span id="botTransportTypeBadge" class="transport-type-badge">Websocket客户端</span>
             </div>
             <div id="botTransportFields" class="field-grid two-columns transport-field-grid"></div>
-            <p class="settings-helper settings-helper-compact transport-docker-hint">Docker 中使用服务器类型时，请将监听 Host 设为 0.0.0.0，并使用 Compose 映射的 3000（HTTP / SSE）或 3001（WebSocket）端口；客户端连接宿主机服务请使用 host.docker.internal。</p>
+            <p class="settings-helper settings-helper-compact transport-docker-hint">Docker 中使用服务器类型时，请将监听 Host 设为 0.0.0.0；默认 Compose 将容器端口 3000 / 3001 映射到宿主机 16300 / 16301。只使用客户端类型时无需发布这两项端口；客户端连接宿主机服务请使用 host.docker.internal。</p>
             <div class="field-grid two-columns transport-identity-grid">
               <div class="field-block identity-review-field">
                 <span>User 映射</span>

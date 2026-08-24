@@ -20,6 +20,18 @@ from rocketcat_shell import update_manifest
 from rocketcat_shell.updates import UpdateService
 
 
+def test_default_compose_uses_distinct_low_conflict_host_ports() -> None:
+    compose = (PROJECT_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    env_example = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
+
+    assert "${ROCKETCAT_ONEBOT_HTTP_BIND_PORT:-16300}:${ROCKETCAT_ONEBOT_HTTP_PORT:-3000}" in compose
+    assert "${ROCKETCAT_ONEBOT_WS_BIND_PORT:-16301}:${ROCKETCAT_ONEBOT_WS_PORT:-3001}" in compose
+    assert "ROCKETCAT_ONEBOT_HTTP_BIND_PORT=16300" in env_example
+    assert "ROCKETCAT_ONEBOT_WS_BIND_PORT=16301" in env_example
+    assert "127.0.0.1:3000:3000" not in compose
+    assert "127.0.0.1:3001:3001" not in compose
+
+
 def test_linux_release_contract_separates_hot_and_image_paths() -> None:
     assert update_manifest.PLATFORM_NAME == "linux"
     assert update_manifest.PACKAGE_ROOT_DIRECTORY == "RocketCatShell-linux"

@@ -46,7 +46,7 @@ docker run --rm \
 - WebUI 文件管理边界是容器内 `/app`，宿主机目录只有通过 compose 挂载到 `/app/config`、`/app/data/...`、`/app/logs` 等路径后才可见。媒体发布接口仅通过不可预测令牌读取 `/app/data/temp` 中的 RocketCatShell 自身缓存，不需要也不会映射 AstrBot 的 `data/temp`。
 - 当 OneBot 地址是 `host.docker.internal`、`localhost` 或回环地址时，媒体 URL 自动使用 `http://127.0.0.1:<WebUI端口>`；当 OneBot 指向其它 Docker 服务时，默认使用 `http://rocketcatshell:<WebUI端口>`。自定义服务名可设置 `ROCKETCAT_DOCKER_SERVICE_NAME`，远程代理或特殊网络可直接设置 `ROCKETCAT_UPSTREAM_MEDIA_BASE_URL`。
 - 官方镜像自 `v0.1.9` 起同时支持 `linux/amd64` 和 `linux/arm64`；Docker 会根据宿主机架构自动选择对应 manifest。
-- Compose 默认仅把 HTTP / SSE 服务端的 `3000` 和 WebSocket 服务端的 `3001` 发布到宿主机 `127.0.0.1`。容器内创建服务端类型时，监听 Host 必须填写 `0.0.0.0` 且端口要与 Compose 映射一致；客户端访问宿主机服务应使用 `host.docker.internal`。
+- Compose 默认仅把 HTTP / SSE 的容器端口 `3000` 发布到宿主机 `127.0.0.1:16300`，把 WebSocket 的容器端口 `3001` 发布到 `127.0.0.1:16301`，避免占用其它项目常用的宿主端口。容器内创建服务端类型时，监听 Host 必须填写 `0.0.0.0` 且端口要与 Compose 的容器端口一致；只使用客户端类型的部署可以直接删除这两项映射，客户端访问宿主机服务应使用 `host.docker.internal`。
 - `config/onebot_transports.json` 位于持久化 `config/` 挂载中。v0.2.2 及更早版本的旧平面 WebSocket 配置会自动迁移为正式 `Websocket客户端`，并继续写入旧版可读取的兼容投影。
 
 ---
@@ -465,7 +465,7 @@ ws://host.docker.internal:6200/ws/
 
 RocketCatShell 会把 RocketChat 媒体上报为令牌 HTTP URL。宿主机 AstrBot 会通过发布到 `127.0.0.1:5751` 的 WebUI 端口下载，并按自身标准链路缓存到 `AstrBot/data/temp`；无需配置共享路径。若 AstrBot 与 RocketCatShell 位于同一 Docker 网络，确保 RocketCatShell 的服务名可解析；默认服务名为 `rocketcatshell`。
 
-使用 HTTP / SSE / WebSocket 服务端类型时，容器内监听 Host 必须设为 `0.0.0.0`。默认 Compose 将 HTTP / SSE 的容器端口 `3000` 与 WebSocket 的容器端口 `3001` 映射到宿主机同名端口，并且只绑定 `127.0.0.1`；需要调整时修改 `.env` 中对应的 `ROCKETCAT_ONEBOT_*` 变量。客户端类型访问宿主机服务时不要填写容器内的 `127.0.0.1`，应使用 `host.docker.internal`。
+使用 HTTP / SSE / WebSocket 服务端类型时，容器内监听 Host 必须设为 `0.0.0.0`。默认 Compose 将 HTTP / SSE 的容器端口 `3000` 映射到宿主机 `127.0.0.1:16300`，将 WebSocket 的容器端口 `3001` 映射到宿主机 `127.0.0.1:16301`；宿主与容器端口可分别通过 `.env` 中的 `ROCKETCAT_ONEBOT_*_BIND_PORT` 和 `ROCKETCAT_ONEBOT_*_PORT` 调整。只使用客户端类型时可以删除这两项端口映射。客户端类型访问宿主机服务时不要填写容器内的 `127.0.0.1`，应使用 `host.docker.internal`。
 
 特殊网络、反向代理或远程 AstrBot 可在 `.env` 中显式覆盖：
 
