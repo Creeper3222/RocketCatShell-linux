@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from tools.validate_linux_update_compat import UpdateHarness
 
@@ -107,3 +108,30 @@ class LinuxValidationContractTests(unittest.IsolatedAsyncioTestCase):
             await harness.assert_sentinels()
             self.assertEqual(1, len(calls))
             self.assertFalse((root / "data/user_identity/active-runtime.sqlite3").exists())
+
+    async def test_interruption_is_frozen_before_switch_and_restores_clean_helper(self):
+        with tempfile.TemporaryDirectory(prefix="rocketcat-validator-interruption-") as temporary:
+            root = Path(temporary)
+            helper = root / "app/tools/update_helper.py"
+            helper.parent.mkdir(parents=True)
+            original = (Path(__file__).resolve().parents[2] / "tools/update_helper.py").read_bytes()
+            helper.write_bytes(original)
+            harness = object.__new__(UpdateHarness)
+            harness.name = "rocketcat-v024-validation-synthetic"
+            harness.args = SimpleNamespace(target_tag="v0.2.4")
+
+            def synthetic_exec(*args):
+                self.assertEqual(("exec", harness.name, "python", "-c"), args[:4])
+                script = args[4].replace("Path('/app/data/update')", "Path(" + repr(str(root / "app/data/update")) + ")")
+                script = script.replace("Path('/app/tools/update_helper.py')", "Path(" + repr(str(helper)) + ")")
+                subprocess.run([sys.executable, "-c", script], check=True)
+                return ""
+
+            harness.docker = synthetic_exec
+            await harness.inject_failure("interrupt")
+            self.assertEqual(original, (root / "app/data/update/validation-helper-original.py").read_bytes())
+            patched = helper.read_text(encoding="utf-8")
+            compile(patched, str(helper), "exec")
+            self.assertLess(patched.index("write_bytes(Path('/app/data/update/validation-helper-original.py')"),
+                            patched.index("_backup(source_root, backup_root, runtime_path)"))
+            self.assertIn("time.sleep(60)", patched)

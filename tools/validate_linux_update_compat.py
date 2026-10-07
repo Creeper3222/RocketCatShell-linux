@@ -200,6 +200,17 @@ class UpdateHarness:
             path = self.mount_root / mount / "validation-preserved.bin"
             path.write_bytes(f"synthetic-{mount}-{self.args.run_id}\0".encode())
             self.sentinels[str(path.relative_to(self.mount_root))] = sha256(path)
+        user_plugin = self.mount_root / "data/plugins/rocketcat_plugin_validation_probe"
+        user_plugin.mkdir()
+        user_files = {
+            user_plugin / "metadata.yaml": "name: rocketcat_plugin_validation_probe\nversion: v1.0.0\nauthor: synthetic-validation\ndesc: Synthetic persistence probe\n",
+            user_plugin / "main.py": "from rocketcat_shell.plugin_system.base import RocketCatPlugin\nclass Plugin(RocketCatPlugin):\n    pass\n",
+            self.mount_root / "data/plugin_data/rocketcat_plugin_validation_probe/state.json": json.dumps({"marker": "synthetic-user-plugin-state", "run_id": self.args.run_id}),
+        }
+        for path, value in user_files.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(value, encoding="utf-8")
+            self.sentinels[str(path.relative_to(self.mount_root))] = sha256(path)
         db = self.mount_root / "data/user_identity/validation-preserved.sqlite3"
         with contextlib.closing(sqlite3.connect(db)) as connection:
             connection.execute("CREATE TABLE validation_state (marker TEXT PRIMARY KEY, payload TEXT NOT NULL)")
@@ -377,9 +388,35 @@ print(json.dumps({'files':{p.relative_to(r).as_posix():{'size':p.stat().st_size,
             raise RuntimeError("pre-update message mapping disappeared")
         await asyncio.to_thread(self.docker, "exec", self.name, "python", "/app/tools/check_requirements.py", "/app/requirements.txt")
         self.report["checks"].append("Bot, transport, identity, get_msg and dependencies preserved")
+        plugins = await self.api("GET", "/api/plugins")
+        if not any(item.get("id") == "rocketcat_plugin_validation_probe" for item in plugins["items"]):
+            raise RuntimeError("synthetic user plugin was not preserved")
         await self.assert_sentinels()
 
     async def inject_failure(self, mode):
+        if mode == "interrupt":
+            # Install the fault before prepare_switch freezes this synthetic
+            # helper. It restores the source helper before backup, then replaces
+            # one managed file and pauses for an external Docker KILL. Namespace
+            # PID 1 cannot be reliably killed by a peer inside that namespace.
+            # Recovery therefore sees an exact
+            # original backup plus a genuinely partial replacement.
+            code = '''from pathlib import Path
+r=Path('/app/data/update'); r.mkdir(parents=True,exist_ok=True)
+h=Path('/app/tools/update_helper.py'); raw=h.read_text()
+saved=r/'validation-helper-original.py'; saved.write_bytes(h.read_bytes())
+validate='        _validate_candidate(candidate_root, payload)'
+install='        _install(source_root, candidate_root)'
+if raw.count(validate)!=1 or raw.count(install)!=1: raise RuntimeError('unexpected synthetic helper source')
+restore="        (source_root / 'tools/update_helper.py').write_bytes(Path('/app/data/update/validation-helper-original.py').read_bytes())\\n"+validate
+partial="        shutil.copy2(candidate_root / 'rocketcat_shell/__init__.py', source_root / 'rocketcat_shell/__init__.py')\\n"
+partial+="        (transaction_root.parent.parent / 'validation-interrupt-injection.json').write_text(json.dumps({'transaction_id':payload['transaction_id'],'stage':'replacing'}))\\n"
+partial+="        time.sleep(60)\\n"+install
+patched=raw.replace(validate,restore).replace(install,partial)
+compile(patched,str(h),'exec'); h.write_text(patched)
+'''
+            await asyncio.to_thread(self.docker, "exec", self.name, "python", "-c", code)
+            return
         code = '''import hashlib,json,os,signal,time
 from pathlib import Path
 r=Path('/app/data/update/transactions'); r.mkdir(parents=True,exist_ok=True)
@@ -401,13 +438,6 @@ while time.monotonic()<deadline:
    temp=p.with_suffix('.validation.tmp'); temp.write_text(json.dumps(t)); os.replace(temp,p)
    (r.parent/'validation-health-injection.json').write_text(json.dumps({'transaction_id':t['transaction_id'],'stage':stage}))
    raise SystemExit(0)
-  if mode=='interrupt' and stage=='waiting_for_shutdown' and t.get('status')=='prepared':
-   helper=Path(t['helper_path']); raw=helper.read_text(); needle='        _install(source_root, candidate_root)'
-   if raw.count(needle)!=1: raise RuntimeError('unexpected isolated helper installation point')
-   replacement="        shutil.copy2(candidate_root / 'rocketcat_shell/__init__.py', source_root / 'rocketcat_shell/__init__.py')\\n"
-   replacement+="        (transaction_root.parent.parent / 'validation-interrupt-injection.json').write_text(json.dumps({'transaction_id':payload['transaction_id'],'stage':'replacing'}))\\n"
-   replacement+="        os.kill(1, 9)\\n"+needle
-   helper.write_text(raw.replace(needle,replacement)); raise SystemExit(0)
  time.sleep(0.001)
 raise TimeoutError('isolated failure injection did not observe expected transaction stage')
 '''.replace("mode=MODE", "mode=" + repr(mode)).replace("TARGET", repr(self.args.target_tag))
@@ -421,9 +451,17 @@ raise TimeoutError('isolated failure injection did not observe expected transact
         raise RuntimeError("isolated fault watcher did not start")
 
     async def recovery_scenarios(self):
-        for mode in ("health", "interrupt"):
+        for mode in self.args.recovery_modes:
             await self.inject_failure(mode)
-            transaction = await self.switch(self.args.target_tag, expected_status="rolled_back", health_version=self.source_tag)
+            killer = asyncio.create_task(self.kill_partial_replacement()) if mode == "interrupt" else None
+            try:
+                transaction = await self.switch(self.args.target_tag, expected_status="rolled_back", health_version=self.source_tag)
+                if killer is not None:
+                    await killer
+            finally:
+                if killer is not None and not killer.done():
+                    killer.cancel()
+                    await asyncio.gather(killer, return_exceptions=True)
             injection = await asyncio.to_thread(self.docker, "exec", self.name, "python", "-c",
                 f"from pathlib import Path; print(Path('/app/data/update/validation-{mode}-injection.json').read_text())")
             if json.loads(injection)["transaction_id"] != transaction["transaction_id"]:
@@ -442,6 +480,22 @@ raise TimeoutError('isolated failure injection did not observe expected transact
         await self.assert_sentinels()
         await self.onebot.action("get_msg", {"message_id": self.pre_message_id})
         self.report["checks"].append("isolated recreation restores original image version with seven mounts and message mapping preserved")
+
+    async def kill_partial_replacement(self):
+        deadline = time.monotonic() + 240
+        while time.monotonic() < deadline:
+            marker = await asyncio.to_thread(self.docker, "exec", self.name, "python", "-c",
+                "from pathlib import Path; p=Path('/app/data/update/validation-interrupt-injection.json'); print(p.read_text() if p.exists() else '')")
+            if marker:
+                if json.loads(marker).get("stage") != "replacing":
+                    raise RuntimeError("unexpected partial replacement marker")
+                await asyncio.to_thread(self.docker, "kill", "--signal", "KILL", self.name)
+                # Docker treats an explicit CLI KILL as a manual stop. Start the
+                # same isolated container to exercise entrypoint recovery.
+                await asyncio.to_thread(self.docker, "start", self.name)
+                return
+            await asyncio.sleep(0.1)
+        raise TimeoutError("partial replacement did not become ready for external KILL")
 
     async def assert_sentinels(self):
         after = {relative: sha256(self.mount_root / relative) for relative in self.sentinels}
@@ -521,6 +575,7 @@ def parse_args(argv=None):
     parser.add_argument("--run-id", default=datetime.now().strftime("%Y%m%d-%H%M%S"))
     parser.add_argument("--proxy-port", type=int, default=3067)
     parser.add_argument("--recovery-only", action="store_true", help="run intentional health-failure, interruption and recreation scenarios in a separate installation")
+    parser.add_argument("--recovery-modes", nargs="+", choices=("health", "interrupt"), default=["health", "interrupt"], help="fault modes; default covers both, select one only while debugging")
     args = parser.parse_args(argv)
     args.test_root = args.test_root.resolve()
     if not args.test_root.is_dir() or args.test_root.name in {"RocketCatShell", "RocketCatShell-linux", "data", "config"}:
