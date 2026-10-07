@@ -7,7 +7,7 @@
     <link rel="icon" type="image/png" href="/static/logo.png?v=20260824linux0231" />
     <link rel="apple-touch-icon" href="/static/logo.png?v=20260824linux0231" />
     <link rel="stylesheet" href="/static/vendor/xterm/xterm.css?v=20260615diagicons1" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260824linux0231" />
+    <link rel="stylesheet" href="/static/styles.css?v=20261007linux0241" />
   </head>
   <body>
     <div class="shell-layout">
@@ -146,7 +146,7 @@
             <span id="sidebarRuntimeText">正在读取运行状态</span>
           </div>
           <div class="sidebar-meta">
-            <span id="sidebarVersion">v0.2.3</span>
+            <span id="sidebarVersion">v0.2.4</span>
             <button id="logoutButton" class="sidebar-logout" type="button">退出登录</button>
           </div>
         </footer>
@@ -1004,6 +1004,16 @@
                   <i></i>
                 </label>
               </div>
+              <div id="forwardMessagesToThreadSetting" class="span-two hidden">
+                <label class="field-switch">
+                  <span>是否将合并转发消息转为线程回复</span>
+                  <input name="forward_messages_to_thread" type="checkbox" aria-describedby="forwardMessagesToThreadHelp" />
+                  <i aria-hidden="true"></i>
+                </label>
+                <p id="forwardMessagesToThreadHelp" class="settings-helper settings-helper-compact">
+                  开启后，每批合并转发会作为独立讨论串发送；标题条数按上游最外层节点统计。
+                </p>
+              </div>
             </div>
           </section>
         </form>
@@ -1407,6 +1417,6 @@
 
     <script src="/static/vendor/xterm/xterm.js?v=20260615diagicons1"></script>
     <script src="/static/vendor/xterm/addon-fit.js?v=20260615diagicons1"></script>
-    <script src="/static/app.js?v=20260824linux0231"></script>
+    <script src="/static/app.js?v=sha256-e51eab9f8bf2784e"></script>
   </body>
 </html>

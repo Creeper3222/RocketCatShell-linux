@@ -28,6 +28,7 @@ tools/stress_v022_full_stack.py
 tools/smoke_v022_readonly.py
 tools/build_v022_acceptance_report.py
 tools/build_linux_release.py
+tools/validate_linux_update_compat.py
 tools/deploy_user_identity_windows_live.ps1
 *.log
 *.db

@@ -4,10 +4,23 @@ RocketCatShell 各版本的功能变更、兼容性调整、问题修复和迁�
 
 后续开发先在“未发布”下记录，发布时再归入对应版本。
 
-## 未发布
+## v0.2.4（合并转发、线程打包与 Linux 更新验证）
 
-### Docker / Linux
+### OneBot 消息兼容
 
+- `Websocket客户端` 支持 AstrBot `send_group_forward_msg`、`send_private_forward_msg`，并兼容 NapCat 通用 `send_forward_msg`；普通发送 action 收到纯 node 列表时也按合并转发处理。
+- 自定义节点、已有消息引用、嵌套 `Nodes`、文本/CQ、图片、文件、语音、视频、回复与提及按顺序展开并发送；Rocket.Chat 不添加原发送者昵称、QQ 号或时间前缀。
+- 每批固定目标房间和原线程上下文，逐项复用现有发送链路、目标锁和 60 秒 action 超时。成功返回最后一条真实消息的 OneBot `message_id`；失败立即停止并报告位置与已发送数量，已送达消息仍可通过 `get_msg` 查询。
+- Bot 高级设置中的“是否将合并转发消息转为线程回复”默认关闭并支持导入、导出及持久化：关闭时顺序逐条发送；开启时在房间主时间线创建线程头，再依次发送线程正文。标题中的数量统计上游最外层节点；原会话即使处于讨论串中，也会为本批次新建主时间线线程。`get_forward_msg` 继续返回不支持。
+- 两种模式都保留已发送消息映射并返回最后一条正文的真实 OneBot `message_id`；无效内容、线程不可用或发送失败会停止后续发送并报告阶段与进度。
+- 猫猫日志正文颜色与等级标签一致，便于区分 INFO、WARN、ERROR 和 DEBUG 消息；WebUI 样式与界面脚本使用 v0.2.4 静态资源版本键，避免浏览器复用旧缓存。
+- 源码对照记录：本机 AstrBot 4.28.0、NapCat local checkout（`package.json` 版本 `0.0.1`）的 Node 结构、转发 action 和消息发送入口，对照 Rocket.Chat 官方 8.5.0（tag commit `d0230e1ed86163b5cf9da57fda09fa86ea0b5c9f`；归档 `https://codeload.github.com/RocketChat/Rocket.Chat/zip/refs/tags/8.5.0`；SHA-256 `71caf60ce60dab12cce6b94746749d91c547673ca6ff387552cb575f2a5c5809`）。线程正文通过 Rocket.Chat `tmid` 关联线程头，媒体使用媒体确认链路；由服务端线程 hook 更新线程元数据。
+
+### Linux / Docker
+
+- 保留 Linux PTY、进程组、固定 WebUI 端口、PID 1/helper exec 更新交接及七个独立持久挂载，runtime generation 继续为 1。
+- 进程由容器管理器停止；不加入 Windows WebUI“关闭进程”按钮与 API。停止或更新交接时先收尾在途更新查询、唤醒日志长轮询，发现请求不再拖延默认线程池退出。
+- 新增最近两个稳定版本的隔离容器更新验收，检查事务、受管文件摘要、配置迁移、持久化、重启、回滚、修复及中断恢复。
 - 默认 Compose 将 OneBot HTTP / SSE 和 WebSocket 服务端分别发布到较少冲突的宿主机环回端口 `16300`、`16301`，容器内监听端口继续为 `3000`、`3001`；仅使用客户端传输的部署可完全省略两项服务端端口映射。
 
 ## v0.2.3（五类 OneBot 传输、双向兼容与性能优化）

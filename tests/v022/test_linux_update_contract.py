@@ -147,7 +147,7 @@ def test_webui_update_handoff_reuses_only_the_configured_port() -> None:
 
 @pytest.mark.skipif(os.name != "posix", reason="executable mode is a Linux release contract")
 def test_release_scripts_keep_executable_mode(tmp_path: Path) -> None:
-    output = tmp_path / "RocketCatShell-linux-v0.2.2.zip"
+    output = tmp_path / f"RocketCatShell-linux-{update_manifest.VERSION}.zip"
     result = subprocess.run(
         [
             sys.executable,
@@ -157,7 +157,7 @@ def test_release_scripts_keep_executable_mode(tmp_path: Path) -> None:
             "--output",
             str(output),
             "--tag",
-            "v0.2.2",
+            update_manifest.VERSION,
         ],
         check=False,
         capture_output=True,
@@ -168,7 +168,7 @@ def test_release_scripts_keep_executable_mode(tmp_path: Path) -> None:
     root, manifest = update_manifest.inspect_and_extract_zip(
         output,
         extract,
-        expected_tag="v0.2.2",
+        expected_tag=update_manifest.VERSION,
     )
     assert manifest["platform"] == "linux"
     assert os.access(root / "launcher.sh", os.X_OK)

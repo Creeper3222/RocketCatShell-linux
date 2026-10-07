@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import unittest
@@ -308,7 +309,8 @@ class UiAccessibilityAssetTests(unittest.TestCase):
         self.assertIsNotNone(login_marker)
         self.assertIsNotNone(script_marker)
         self.assertEqual(index_marker.group(1), login_marker.group(1))
-        self.assertEqual(index_marker.group(1), script_marker.group(1))
+        script_digest = hashlib.sha256(self.javascript.encode("utf-8")).hexdigest()[:16]
+        self.assertEqual(f"sha256-{script_digest}", script_marker.group(1))
 
     def test_reconnect_settings_and_diagnostics_are_scoped_by_connection(self) -> None:
         for label in (

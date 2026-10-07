@@ -1128,6 +1128,7 @@ class RocketChatClient:
         attachments: list[dict[str, Any]] | None = None,
         tmid: str | None = None,
         e2e_mentions: dict[str, Any] | None = None,
+        thread_mode: bool = False,
     ) -> dict[str, Any] | None:
         room_info = await self.get_room_info(room_id)
         room_is_e2ee = bool(room_info.get("encrypted") and room_info.get("t") in {"d", "p"})
@@ -1152,16 +1153,50 @@ class RocketChatClient:
                 payload,
             )
         else:
-            payload = {"roomId": room_id, "text": text}
-            if attachments:
-                payload["attachments"] = attachments
-            if tmid:
-                payload["tmid"] = tmid
+            if thread_mode:
+                message_payload: dict[str, Any] = {"rid": room_id, "msg": text}
+                if attachments:
+                    message_payload["attachments"] = attachments
+                if tmid:
+                    message_payload["tmid"] = tmid
+                payload = {"message": message_payload}
+                endpoint = "chat.sendMessage"
+            else:
+                payload = {"roomId": room_id, "text": text}
+                if attachments:
+                    payload["attachments"] = attachments
+                if tmid:
+                    payload["tmid"] = tmid
+                endpoint = "chat.postMessage"
             data = await self._post_json_message(
-                f"{self.config.server_url}/api/v1/chat.postMessage",
+                f"{self.config.server_url}/api/v1/{endpoint}",
                 payload,
             )
         return (data or {}).get("message") or data
+
+    async def are_threads_enabled(self) -> bool | None:
+        data = await self._request_json(
+            "GET",
+            f"{self.config.server_url}/api/v1/settings.public",
+            headers=self._auth_headers(),
+            params={"_id": "Threads_enabled", "count": 1},
+        )
+        if data.get("success") is not True:
+            return None
+        settings = data.get("settings")
+        if not isinstance(settings, list):
+            return None
+        thread_setting = next(
+            (
+                setting
+                for setting in settings
+                if isinstance(setting, dict)
+                and setting.get("_id") == "Threads_enabled"
+            ),
+            None,
+        )
+        value = thread_setting.get("value") if thread_setting is not None else None
+        return value if isinstance(value, bool) else None
 
     async def _normalize_media_url(self, media_url: str) -> str:
         url = media_url
@@ -1238,6 +1273,8 @@ class RocketChatClient:
         tmid: str | None = None,
         mention_usernames: list[str] | None = None,
         reply_mention_username: str | None = None,
+        *,
+        thread_mode: bool = False,
     ) -> dict[str, Any] | None:
         if not text:
             raise ValueError("send_text 需要非空文本")
@@ -1255,6 +1292,7 @@ class RocketChatClient:
                 mention_usernames,
                 reply_mention_username=reply_mention_username,
             ),
+            thread_mode=thread_mode,
         )
 
     async def send_with_quote(
@@ -1266,6 +1304,7 @@ class RocketChatClient:
         tmid: str | None = None,
         mention_usernames: list[str] | None = None,
         reply_mention_username: str | None = None,
+        thread_mode: bool = False,
     ) -> dict[str, Any] | None:
         link = self._build_message_link(room_id, quoted_message_source_id)
         mention_text = await self._build_explicit_reply_mention(room_id, reply_mention_username)
@@ -1283,6 +1322,7 @@ class RocketChatClient:
                 mention_usernames,
                 reply_mention_username=reply_mention_username,
             ),
+            thread_mode=thread_mode,
         )
 
     async def send_image_url(
@@ -1293,6 +1333,7 @@ class RocketChatClient:
         tmid: str | None = None,
         *,
         require_mappable_message: bool = True,
+        thread_mode: bool = False,
     ) -> dict[str, Any] | None:
         return await self.media.send_image_url(
             room_id,
@@ -1300,6 +1341,7 @@ class RocketChatClient:
             text=text,
             tmid=tmid,
             require_mappable_message=require_mappable_message,
+            thread_mode=thread_mode,
         )
 
     async def send_image_file(
@@ -1346,6 +1388,7 @@ class RocketChatClient:
         media_kind: str,
         text: str = "",
         tmid: str | None = None,
+        thread_mode: bool = False,
     ) -> dict[str, Any] | None:
         return await self.media.send_remote_media_fallback(
             room_id,
@@ -1353,6 +1396,7 @@ class RocketChatClient:
             media_kind=media_kind,
             text=text,
             tmid=tmid,
+            thread_mode=thread_mode,
         )
 
     async def _download_remote_media(
@@ -1378,6 +1422,9 @@ class RocketChatClient:
         reply_source_id: str | None = None,
         mention_usernames: list[str] | None = None,
         reply_mention_username: str | None = None,
+        strict_delivery: bool = False,
+        thread_mode: bool = False,
+        on_message: MessageCallback | None = None,
     ) -> list[dict[str, Any]]:
         sent_messages: list[dict[str, Any]] = []
         text_parts: list[str] = []
@@ -1385,6 +1432,19 @@ class RocketChatClient:
         quote_pending = reply_source_id
         pending_mentions = list(mention_usernames or [])
         pending_reply_mention = str(reply_mention_username or "").strip() or None
+
+        async def record_sent_message(
+            raw_message: dict[str, Any] | None,
+            *,
+            description: str,
+        ) -> None:
+            if not raw_message:
+                if strict_delivery:
+                    raise RuntimeError(f"{description}未返回已发送消息")
+                return
+            sent_messages.append(raw_message)
+            if on_message is not None:
+                await on_message(raw_message)
 
         async def flush_text(force_quote: bool = False) -> None:
             nonlocal quote_pending, pending_mentions, pending_reply_mention
@@ -1401,6 +1461,7 @@ class RocketChatClient:
                     tmid=current_thread_source_id,
                     mention_usernames=pending_mentions,
                     reply_mention_username=pending_reply_mention,
+                    thread_mode=thread_mode,
                 )
                 quote_pending = None
             else:
@@ -1410,13 +1471,15 @@ class RocketChatClient:
                     tmid=current_thread_source_id,
                     mention_usernames=pending_mentions,
                     reply_mention_username=pending_reply_mention,
+                    thread_mode=thread_mode,
                 )
 
             pending_mentions = []
             pending_reply_mention = None
-
-            if raw_message:
-                sent_messages.append(raw_message)
+            await record_sent_message(
+                raw_message,
+                description="Rocket.Chat 文本发送",
+            )
 
         segment_index = 0
         while segment_index < len(segments):
@@ -1453,9 +1516,12 @@ class RocketChatClient:
                 data,
                 tmid=current_thread_source_id,
                 description=media_description,
+                thread_mode=thread_mode,
             )
-            if raw_message:
-                sent_messages.append(raw_message)
+            await record_sent_message(
+                raw_message,
+                description=f"Rocket.Chat {segment_type} 媒体发送（消息段 {segment_index}）",
+            )
 
         await flush_text(force_quote=bool(quote_pending))
         return sent_messages
@@ -1487,6 +1553,7 @@ class RocketChatClient:
         *,
         tmid: str | None = None,
         description: str = "",
+        thread_mode: bool = False,
     ) -> dict[str, Any] | None:
         file_ref = str(data.get("file") or data.get("url") or "")
         if not file_ref:
@@ -1494,7 +1561,13 @@ class RocketChatClient:
 
         if segment_type == "image":
             if file_ref.startswith(("http://", "https://")):
-                return await self.send_image_url(room_id, file_ref, text=description, tmid=tmid)
+                return await self.send_image_url(
+                    room_id,
+                    file_ref,
+                    text=description,
+                    tmid=tmid,
+                    thread_mode=thread_mode,
+                )
             local_path, cleanup = await self._resolve_uploadable_path(file_ref, ".png")
             if not local_path:
                 return None
@@ -1530,6 +1603,7 @@ class RocketChatClient:
                         "file": "文件",
                     }.get(segment_type, "媒体"),
                     tmid=tmid,
+                    thread_mode=thread_mode,
                 )
             return None
 

@@ -9,6 +9,7 @@ import re
 import secrets
 import shutil
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -213,6 +214,45 @@ class UpdateService:
         with urllib.request.urlopen(request, timeout=15) as response:
             return response.read().decode("utf-8", "replace")
 
+    @staticmethod
+    async def _run_daemon_thread(function: Any, *args: Any) -> Any:
+        """Run update-discovery I/O without pinning asyncio's default executor.
+
+        urllib is synchronous and cannot be interrupted once a request is in
+        progress. A daemon worker lets the WebUI cancel its await during process
+        shutdown without making asyncio.run wait for the socket timeout.
+        """
+        loop = asyncio.get_running_loop()
+        result_future: asyncio.Future[Any] = loop.create_future()
+
+        def complete(result: Any, error: BaseException | None) -> None:
+            if result_future.done():
+                return
+            if error is not None:
+                result_future.set_exception(error)
+            else:
+                result_future.set_result(result)
+
+        def run() -> None:
+            try:
+                result = function(*args)
+            except BaseException as exc:
+                result, error = None, exc
+            else:
+                error = None
+            try:
+                loop.call_soon_threadsafe(complete, result, error)
+            except RuntimeError:
+                # The event loop may close after its caller was cancelled.
+                pass
+
+        threading.Thread(
+            target=run,
+            name="RocketCatUpdateDiscovery",
+            daemon=True,
+        ).start()
+        return await result_future
+
     @classmethod
     def _fallback_release_feed(cls) -> list[dict[str, Any]]:
         document = ET.fromstring(cls._request_text(GITHUB_RELEASES_ATOM_URL))
@@ -335,7 +375,7 @@ class UpdateService:
                 self._last_manual_refresh = now
             try:
                 try:
-                    raw_releases = await asyncio.to_thread(
+                    raw_releases = await self._run_daemon_thread(
                         self._request_json,
                         GITHUB_RELEASES_URL,
                     )
@@ -348,7 +388,7 @@ class UpdateService:
                         if (release := self._normalize_release(item)) is not None
                     ]
                 except (OSError, ValueError, urllib.error.URLError):
-                    normalized = await asyncio.to_thread(self._fallback_release_feed)
+                    normalized = await self._run_daemon_thread(self._fallback_release_feed)
                 normalized.sort(
                     key=lambda item: parse_tag(item["tag_name"]),
                     reverse=True,

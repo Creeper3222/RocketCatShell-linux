@@ -11,6 +11,7 @@ const DEFAULT_FORM = {
   remote_media_max_size: 20971520,
   room_info_cache_ttl_seconds: 300.0,
   perf_trace_enabled: false,
+  forward_messages_to_thread: false,
 };
 
 const FALLBACK_TRANSPORT_CATALOG = Object.freeze([
@@ -4274,6 +4275,10 @@ function renderBotTransportFields(spec, settings = {}) {
   }
   if (elements.botTransportDescription) {
     elements.botTransportDescription.textContent = spec.description || '';
+  }
+  const forwardMessagesSetting = document.getElementById('forwardMessagesToThreadSetting');
+  if (forwardMessagesSetting) {
+    forwardMessagesSetting.classList.toggle('hidden', spec.type !== 'websocket-client');
   }
 }
 

@@ -398,5 +398,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.inject_synthetic and not str(args.anchor_user_id or "").strip():
+        parser.error("--inject-synthetic requires --anchor-user-id")
+    return args
+
+
 if __name__ == "__main__":
-    asyncio.run(migrate(build_parser().parse_args()))
+    asyncio.run(migrate(parse_args()))

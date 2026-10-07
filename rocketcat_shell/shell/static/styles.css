@@ -5506,23 +5506,27 @@ body.card-order-drag-active [data-card-order-id],
 }
 
 .log-entry-line {
-  color: var(--text-on-dark);
+  color: inherit;
 }
 
 .log-debug .log-entry-level,
+.log-debug .log-entry-line,
 .log-empty {
   color: var(--text-on-dark-muted);
 }
 
-.log-info .log-entry-level {
+.log-info .log-entry-level,
+.log-info .log-entry-line {
   color: #8dc4f4;
 }
 
-.log-warn .log-entry-level {
+.log-warn .log-entry-level,
+.log-warn .log-entry-line {
   color: #f2c46f;
 }
 
-.log-error .log-entry-level {
+.log-error .log-entry-level,
+.log-error .log-entry-line {
   color: #ff8dad;
 }
 

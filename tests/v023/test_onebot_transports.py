@@ -1091,6 +1091,7 @@ class TransportIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 {"post_type": "message", "message_type": "private", "user_id": 42, "message": []}
             )
             await asyncio.wait_for(transport._outgoing.join(), timeout=2)
+            await asyncio.wait_for(transport._dispatcher.queue.join(), timeout=2)
             self.assertEqual(1, len(received))
             body, headers = received[0]
             expected = hmac.new(b"secret", body, hashlib.sha1).hexdigest()
@@ -1148,7 +1149,7 @@ class TransportIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "message_post_format": "array",
                 "report_self_message": False,
                 "enableForcePushEvent": True,
-                "heartbeat_interval_ms": 100,
+                "heartbeat_interval_ms": 1000,
                 "access_token": "secret",
                 "debug": False,
             },

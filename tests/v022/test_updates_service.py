@@ -168,7 +168,7 @@ class UpdateDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             UpdateService,
             "_request_json",
             return_value=[
-                github_release("v0.2.4"),
+                github_release("v0.2.5"),
                 github_release("v0.2.3"),
                 github_release("v0.2.2"),
             ],
@@ -177,8 +177,8 @@ class UpdateDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(status["update_available"])
         self.assertEqual(status["minimum_compatible_tag"], "v0.2.2")
         self.assertEqual(self.service.action_for_tag("v0.2.2"), "rollback")
-        self.assertEqual(self.service.action_for_tag("v0.2.3"), "reinstall")
-        self.assertEqual(self.service.action_for_tag("v0.2.4"), "update")
+        self.assertEqual(self.service.action_for_tag("v0.2.3"), "rollback")
+        self.assertEqual(self.service.action_for_tag("v0.2.4"), "reinstall")
 
 
 class UpdateTransactionMetadataTests(unittest.TestCase):

@@ -33,6 +33,8 @@ class OutboundMessageTranslator:
         *,
         group_id: int | str | None = None,
         user_id: int | str | None = None,
+        fixed_destination: dict[str, Any] | None = None,
+        require_reply_reference: bool = False,
     ) -> dict[str, Any]:
         segments = self._normalize_segments(message)
         normalized_segments: list[dict[str, Any]] = []
@@ -62,6 +64,8 @@ class OutboundMessageTranslator:
                     reply_source_id = str(entry["source_id"])
                 else:
                     reply_source_id = await self._id_map.get_source("message", data.get("id"))
+                if require_reply_reference and not reply_source_id:
+                    raise ValueError(f"无法解析引用消息: {data.get('id')}")
                 continue
             if segment_type in {"image", "file", "record", "video"}:
                 normalized_segments.append({"type": segment_type, "data": dict(data)})
@@ -72,17 +76,25 @@ class OutboundMessageTranslator:
                     normalized_segments.append({"type": "text", "data": {"text": text}})
                 continue
 
-        room_id = await self._resolve_room(
-            group_id=group_id,
-            user_id=user_id,
-            reply_source_id=reply_source_id,
-        )
-        thread_source_id = await self._resolve_thread_source_id(
-            group_id=group_id,
-            reply_source_id=reply_source_id,
-        )
+        if fixed_destination is not None:
+            room_id = str(fixed_destination.get("room_id") or "").strip()
+            if not room_id:
+                raise ValueError("固定发送目标缺少 Rocket.Chat room_id")
+            thread_source_id = (
+                str(fixed_destination.get("thread_source_id") or "").strip() or None
+            )
+        else:
+            room_id = await self._resolve_room(
+                group_id=group_id,
+                user_id=user_id,
+                reply_source_id=reply_source_id,
+            )
+            thread_source_id = await self._resolve_thread_source_id(
+                group_id=group_id,
+                reply_source_id=reply_source_id,
+            )
 
-        if group_id is not None:
+        if group_id is not None and fixed_destination is None:
             await self._refresh_context_room_binding(group_id, room_id, thread_source_id=thread_source_id)
 
         return {

@@ -39,6 +39,12 @@ class OneBotActionDispatcher:
         self._action_handler = action_handler
         self._codec = codec
         self._owner = owner
+        handler_owner = getattr(action_handler, "__self__", None)
+        self._timeout_response_resolver = getattr(
+            handler_owner,
+            "take_timeout_response",
+            None,
+        )
         self.queue: asyncio.Queue[ActionRequest] = asyncio.Queue(
             maxsize=ACTION_QUEUE_CAPACITY
         )
@@ -185,12 +191,26 @@ class OneBotActionDispatcher:
                     raise
                 except asyncio.TimeoutError:
                     self.metrics.increment("timed_out")
-                    response = {
-                        "status": "failed",
-                        "retcode": 1504,
-                        "data": None,
-                        "wording": "RocketCatShell OneBot action timed out after 60 seconds",
-                    }
+                    response = None
+                    if callable(self._timeout_response_resolver):
+                        try:
+                            response = self._timeout_response_resolver(
+                                request.action,
+                                request.params,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "[RocketCatShell] OneBot action timeout response resolver failed | owner=%s | error=%r",
+                                self._owner,
+                                exc,
+                            )
+                    if response is None:
+                        response = {
+                            "status": "failed",
+                            "retcode": 1504,
+                            "data": None,
+                            "wording": "RocketCatShell OneBot action timed out after 60 seconds",
+                        }
                 except Exception as exc:
                     logger.exception(
                         "[RocketCatShell] OneBot action failed | owner=%s | action=%s",

@@ -278,6 +278,7 @@ class BotRecord:
     debug: bool
     onebot_transport_type: str = "websocket-client"
     onebot_transport_settings: dict[str, Any] = field(default_factory=dict)
+    forward_messages_to_thread: bool = False
 
     @classmethod
     def from_mapping(
@@ -364,6 +365,9 @@ class BotRecord:
             debug=_coerce_bool(data.get("debug", defaults.default_debug), defaults.default_debug),
             onebot_transport_type=transport_type,
             onebot_transport_settings=transport_settings,
+            forward_messages_to_thread=_coerce_bool(
+                data.get("forward_messages_to_thread", False), False
+            ),
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -390,6 +394,7 @@ class BotRecord:
             "perf_trace_enabled": self.perf_trace_enabled,
             "skip_own_messages": self.skip_own_messages,
             "debug": self.debug,
+            "forward_messages_to_thread": self.forward_messages_to_thread,
             "onebot_transport": self.onebot_transport_mapping(),
         }
 

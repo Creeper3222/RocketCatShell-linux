@@ -9,7 +9,7 @@
 
 这个 live 目录对应 RocketCatShell 的 Linux / Docker 版：平台中立功能与 Windows 版保持同代，同时保留容器初始化、外部持久挂载、内置插件安全播种、Linux PTY、容器诊断和应用层事务更新等 Linux 专属实现。Rocket.Chat 媒体通过 RocketCatShell WebUI 端口上的令牌 HTTP URL 统一上报，不要求与 AstrBot 共享目录。
 
-当前发布版本为 `v0.2.3`，完整版本变化与迁移记录见 [CHANGELOG.md](CHANGELOG.md)。
+当前发布版本为 `v0.2.4`，完整版本变化与迁移记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 这意味着：
 
@@ -21,8 +21,10 @@
 
 ## Linux / Docker 补充说明
 
+- Docker 版通过容器管理器或 `docker stop` 停止进程，不提供 Windows 设置页的“关闭进程”按钮与 API。`docker pause` 只冻结执行，不代表优雅退出。
+
 - `launcher.sh` 会先调用 `tools/check_requirements.py` 检查依赖，再在缺失或版本不兼容时自动安装并复检；`v0.1.5` 新增的 `psutil` 也包含在这条自动补装链路里。
-- `Dockerfile` 会把 `tools/` 一并打进镜像，保证容器内和宿主机目录里的工具链一致。
+- `Dockerfile` 包含运行所需工具；测试、更新验证器、基准和发布构建工具不进入镜像。
 - `docker/entrypoint.sh` 仍负责容器首次启动时写入 `config/shell.json` 默认值，并对外挂 `data/plugins` 中的内置插件执行缺失补种与版本变更自动刷新；`rocketcat_plugin_built_in_command` 与 `rocketcat_plugin_adapt_iamthinking` 都会随镜像自动同步到外挂插件目录。
 - `docker-compose.yml`、`.env` 和 `.env.example` 已改为 Linux 风格的默认持久化路径 `/opt/rocketcatshell/...`，不再使用旧的 Windows `D:/docker/...` 示例。
 - 用户身份注册表使用独立挂载 `/app/data/user_identity`；默认宿主目录为 `/opt/rocketcatshell/data/user_identity`，必须与 `config/`、`data/bots/` 一起备份。
@@ -112,6 +114,9 @@ AstrBot or other compatible OneBot-side workflow
 - `send_group_msg`
 - `send_private_msg`
 - `send_msg`
+- `send_group_forward_msg`
+- `send_private_forward_msg`
+- `send_forward_msg`
 - `get_msg`
 - `get_group_info`
 - `get_group_member_info`
@@ -122,10 +127,9 @@ AstrBot or other compatible OneBot-side workflow
 
 ### 当前不支持的 OneBot 动作
 
-- `send_group_forward_msg`
-- `send_private_forward_msg`
+- `get_forward_msg`
 
-RocketCatShell 当前这一版明确不承诺合并转发消息语义。
+合并转发支持顺序逐条发送或打包为 Rocket.Chat 讨论串；OneBot 合并转发回读仍不支持。
 
 ---
 
@@ -538,6 +542,28 @@ http://127.0.0.1:5751/
 
 ---
 
+### 合并转发消息
+
+`Websocket客户端` 支持 AstrBot 的 `send_group_forward_msg` 与 `send_private_forward_msg`，也接受 NapCat 的通用 `send_forward_msg`。其它传输类型共用同一 action 处理层。节点按输入顺序展开；嵌套 `Nodes`、已有消息引用以及文本/CQ、图片、文件、语音、视频、回复和提及会复用现有发送链路。Rocket.Chat 中每项作为普通消息发送，不添加节点发送者或时间前缀。普通 `send_group_msg`、`send_private_msg` 和 `send_msg` 收到纯 node 列表时也使用相同处理流程；普通消息与 node 混合会明确报错。
+
+WebSocket 客户端高级设置中的“是否将合并转发消息转为线程回复”默认关闭。关闭时按顺序逐条发送；开启时在目标房间主时间线创建标题“合并转发消息(查看x条转发消息)”，并将正文依次发送到该标题的 Rocket.Chat 讨论串。`x` 统计上游最外层节点数；嵌套节点仍按顺序展开。若原会话已在 Rocket.Chat 线程中，新转发会在相同房间主时间线建立自己的线程。
+
+两种模式均返回最后一条正文的真实 `message_id`，可用 `get_msg` 查询；线程头也保留消息映射。无效节点、未知引用、线程不可用或发送失败会停止后续发送并报告阶段与进度，已发送的消息映射会保留，不会自动重试整批。线程正文中的媒体发送失败不会降级为普通提示文字。
+
+Rocket.Chat 不提供 OneBot 合并转发资源，因此本版不生成虚构的 `forward_id` / `res_id`，`get_forward_msg` 仍不支持。开关值随注册表保存，并完整覆盖配置导入 / 导出；旧配置缺少此字段时默认为关闭。
+
+### 4. 如需导入已有配置
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/ba61315c-9273-4f30-a6a0-ac55a19297f1" width="100%" />
+</p>
+
+在 `基础设置` 页点击 `导入配置`，选择已有的 `rocketcat_config.json`。
+
+如果要迁移当前环境，也可以先点击 `导出配置` 生成配置快照，再导入到新环境。
+
+---
+
+
 ## 配置项说明
 
 ### Shell 主配置
@@ -684,7 +710,7 @@ logs/
 ## 已知限制
 
 - 当前提供五类 OneBot v11 网络传输，但仍是语义桥接器，不是官方 Rocket.Chat 平台适配器。
-- 合并转发消息当前未实现。
+- OneBot `get_forward_msg` 合并转发回读仍不支持。
 - 系统事件、审计事件、编辑 / 撤回 / 已读等非消息类事件不在这一版的桥接承诺范围内。
 - E2EE 仅覆盖 Rocket.Chat 加密私聊和加密私有群组。
 - 远端媒体如果下载失败、超出大小限制或源地址不可用，相关媒体发送会失败或降级。

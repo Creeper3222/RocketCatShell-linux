@@ -1123,6 +1123,7 @@ class ShellManager:
             "enabled": bot.enabled,
             "server_url": bot.server_url,
             "username": bot.username,
+            "forward_messages_to_thread": bot.forward_messages_to_thread,
             "onebot_transport": {
                 "type": bot.onebot_transport_type,
                 "settings": transport_settings,

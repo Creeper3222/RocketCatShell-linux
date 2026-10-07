@@ -85,6 +85,7 @@ class BridgeConfig:
     transport_label: str = "Websocket客户端"
     transport_settings: dict[str, Any] = field(default_factory=dict)
     transport_validation_error: str = ""
+    forward_messages_to_thread: bool = False
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any] | None) -> "BridgeConfig":
@@ -237,6 +238,9 @@ class BridgeConfig:
             transport_label=transport_label,
             transport_settings=transport_settings,
             transport_validation_error=transport_error,
+            forward_messages_to_thread=_coerce_bool(
+                data.get("forward_messages_to_thread", False)
+            ),
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -261,6 +265,7 @@ class BridgeConfig:
             "media_cache_max_age_hours": self.media_cache_max_age_hours,
             "skip_own_messages": self.skip_own_messages,
             "debug": self.debug,
+            "forward_messages_to_thread": self.forward_messages_to_thread,
             "id": self.bot_id,
             "name": self.display_name,
             "type": self.transport_type,

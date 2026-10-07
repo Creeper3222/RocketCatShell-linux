@@ -2066,7 +2066,15 @@ class RocketChatMediaBridge:
         media_kind: str,
         text: str = "",
         tmid: Optional[str] = None,
+        thread_mode: bool = False,
     ) -> Optional[dict[str, Any]]:
+        if thread_mode:
+            logger.error(
+                "[RocketChatOneBotBridge] 线程合并转发媒体不可用，停止媒体发送: room_id=%s kind=%s",
+                room_id,
+                media_kind,
+            )
+            return None
         fallback_text = f"远程{media_kind}发送失败，原文件链接：{media_url}"
         if text:
             fallback_text = f"{text}\n{fallback_text}".strip()
@@ -2080,6 +2088,7 @@ class RocketChatMediaBridge:
         tmid: Optional[str] = None,
         *,
         require_mappable_message: bool = True,
+        thread_mode: bool = False,
     ) -> Optional[dict[str, Any]]:
         local_path, cleanup = await self.download_remote_media(image_url, ".png")
         if not local_path:
@@ -2091,6 +2100,7 @@ class RocketChatMediaBridge:
                     media_kind="图片",
                     text=text,
                     tmid=tmid,
+                    thread_mode=thread_mode,
                 )
             if text:
                 return await self.client._send_structured_message(
@@ -2098,6 +2108,7 @@ class RocketChatMediaBridge:
                     text,
                     attachments=[{"image_url": image_url}],
                     tmid=tmid,
+                    thread_mode=thread_mode,
                 )
             return await self.send_remote_media_fallback(
                 room_id,
@@ -2105,6 +2116,7 @@ class RocketChatMediaBridge:
                 media_kind="图片",
                 text=text,
                 tmid=tmid,
+                thread_mode=thread_mode,
             )
 
         try:

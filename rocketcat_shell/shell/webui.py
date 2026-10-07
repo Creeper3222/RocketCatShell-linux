@@ -378,6 +378,8 @@ class ShellWebUI:
         self._configuration_transaction_lock = asyncio.Lock()
         self._update_shutdown_task: asyncio.Task[Any] | None = None
         self._application_ready = False
+        self._stopping = False
+        self._active_update_requests: set[asyncio.Task[Any]] = set()
         self._app = FastAPI(title="RocketCat Shell", version=__version__)
         self._app.add_middleware(_WebUICacheAuthMiddleware, owner=self)
         self._static_dir = Path(__file__).resolve().parent / "static"
@@ -595,6 +597,7 @@ class ShellWebUI:
         if self._server_task is not None and not self._server_task.done():
             return
 
+        self._stopping = False
         self._attach_log_handler()
         try:
             update_transaction = str(
@@ -621,6 +624,7 @@ class ShellWebUI:
                 log_level="warning",
                 loop="asyncio",
                 lifespan="on",
+                timeout_graceful_shutdown=10.0,
             )
             self._server = uvicorn.Server(config)
             self._server_task = asyncio.create_task(
@@ -671,6 +675,19 @@ class ShellWebUI:
 
     async def stop(self) -> None:
         self._application_ready = False
+        self._stopping = True
+        # Finish pending log long-polls before Uvicorn's graceful drain.
+        # A poll can otherwise wait 30s even after its browser has gone away.
+        self._log_buffer._notify_changed()
+        current_task = asyncio.current_task()
+        update_requests = [
+            task for task in self._active_update_requests
+            if task is not current_task and not task.done()
+        ]
+        for task in update_requests:
+            task.cancel()
+        if update_requests:
+            await asyncio.gather(*update_requests, return_exceptions=True)
         if self._server is None and self._server_task is None and self._bound_socket is None:
             return
 
@@ -1667,13 +1684,17 @@ class ShellWebUI:
         self,
         refresh: bool = Query(default=False),
     ) -> dict[str, Any]:
-        return await self.manager.updates.status(refresh=refresh)
+        if self._stopping:
+            raise HTTPException(status_code=503, detail="RocketCatShell 正在停止")
+        return await self._run_update_request(self.manager.updates.status(refresh=refresh))
 
     async def _handle_update_releases(
         self,
         refresh: bool = Query(default=False),
     ) -> dict[str, Any]:
-        payload = await self.manager.updates.releases(refresh=refresh)
+        if self._stopping:
+            raise HTTPException(status_code=503, detail="RocketCatShell 正在停止")
+        payload = await self._run_update_request(self.manager.updates.releases(refresh=refresh))
         releases = []
         for release in payload.get("releases") or []:
             asset = release.get("asset") or {}
@@ -1702,6 +1723,21 @@ class ShellWebUI:
             "refresh_limited": bool(payload.get("refresh_limited")),
             "releases": releases,
         }
+
+    async def _run_update_request(self, awaitable: Any) -> Any:
+        task = asyncio.current_task()
+        if task is not None:
+            self._active_update_requests.add(task)
+        try:
+            return await awaitable
+        except asyncio.CancelledError:
+            if not self._stopping:
+                raise
+            logger.debug("[RocketCatShell] update discovery request ended during shutdown")
+            raise HTTPException(status_code=503, detail="RocketCatShell 正在停止") from None
+        finally:
+            if task is not None:
+                self._active_update_requests.discard(task)
 
     async def _handle_update_transaction(
         self,
@@ -1971,7 +2007,7 @@ class ShellWebUI:
         reset_cursor = after_id > latest_id
         effective_after_id = 0 if reset_cursor else after_id
         initial_version = self._log_buffer.version
-        if wait > 0 and not reset_cursor and effective_after_id >= latest_id:
+        if not self._stopping and wait > 0 and not reset_cursor and effective_after_id >= latest_id:
             await self._log_buffer.wait_for_change(initial_version, timeout=wait)
             latest_id = self._log_buffer.latest_id()
             reset_cursor = after_id > latest_id
