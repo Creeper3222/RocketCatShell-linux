@@ -133,6 +133,7 @@ class UpdateHarness:
         self.sentinels = {}
         self.bot_id = ""
         self.pre_message_id = 0
+        self.created_root = False
 
     def docker(self, *args):
         # All mutating container commands require this tool's unique prefix.
@@ -167,6 +168,7 @@ class UpdateHarness:
         if self.root.exists():
             raise RuntimeError(f"isolated root already exists: {self.root}")
         self.root.mkdir(parents=True)
+        self.created_root = True
         for mount in MOUNTS:
             (self.mount_root / mount).mkdir(parents=True)
         self.source_asset = await asyncio.to_thread(official_asset, self.source_tag)
@@ -199,9 +201,10 @@ class UpdateHarness:
             path.write_bytes(f"synthetic-{mount}-{self.args.run_id}\0".encode())
             self.sentinels[str(path.relative_to(self.mount_root))] = sha256(path)
         db = self.mount_root / "data/user_identity/validation-preserved.sqlite3"
-        with sqlite3.connect(db) as connection:
+        with contextlib.closing(sqlite3.connect(db)) as connection:
             connection.execute("CREATE TABLE validation_state (marker TEXT PRIMARY KEY, payload TEXT NOT NULL)")
             connection.execute("INSERT INTO validation_state VALUES ('upgrade', 'synthetic-identity-preserved')")
+            connection.commit()
         self.sentinels[str(db.relative_to(self.mount_root))] = sha256(db)
         self.report["sentinels_before"] = dict(self.sentinels)
         await self.create_container()
@@ -323,6 +326,7 @@ class UpdateHarness:
                         raise RuntimeError(f"transaction failed: {detail}")
                     self.report["transactions"].append({key: detail.get(key) for key in ("transaction_id", "action", "status", "stage", "current_version", "target_version")})
                     await self.wait_health(target_health, identifier)
+                    print(f"PASS transaction {identifier}: {detail['action']} {tag} -> {detail['status']}", flush=True)
                     return detail
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 pass
@@ -330,20 +334,28 @@ class UpdateHarness:
         raise TimeoutError("update transaction did not complete")
 
     async def assert_managed(self, *, source=False):
+        manifest = self.source_manifest if source else self.target_manifest
+        # A normal container restart has no handoff environment transaction ID.
+        # The completed transaction still retains the official candidate manifest.
+        transaction_id = self.report["transactions"][-1]["transaction_id"]
         actual = await asyncio.to_thread(self.docker, "exec", self.name, "python", "-c", '''import hashlib,json
+import sys
 from pathlib import Path
-r=Path('/app'); m=json.loads((r/'update-manifest.json').read_text()); paths=[]
+r=Path('/app'); m=json.loads(sys.argv[1]); paths=[]
+t=json.loads((r/'data/update/transactions'/sys.argv[2]/'transaction.json').read_text())
+manifest_path=Path(t['candidate_root'])/'update-manifest.json'
 for d in m['managed_directories']:
  paths.extend(p for p in (r/d).rglob('*') if p.is_file() and '__pycache__' not in p.parts and p.suffix not in {'.pyc','.pyo'})
 paths.extend(r/p for p in m['managed_files'])
-print(json.dumps({'files':{p.relative_to(r).as_posix():{'size':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()} for p in paths},'manifest_sha256':hashlib.sha256((r/'update-manifest.json').read_bytes()).hexdigest()}))''')
+print(json.dumps({'files':{p.relative_to(r).as_posix():{'size':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()} for p in paths},'manifest_tag':t.get('target_tag',m['version']),'manifest_sha256':hashlib.sha256(manifest_path.read_bytes()).hexdigest()}))''', json.dumps(manifest), transaction_id)
         actual = json.loads(actual)
-        manifest = self.source_manifest if source else self.target_manifest
-        reference = self.source_reference if source else self.target_reference
+        reference = self.source_reference if actual["manifest_tag"] == self.source_tag else self.target_reference
         expected = {entry["path"]: {"size": entry["size"], "sha256": entry["sha256"]}
                     for entry in manifest["files"] if entry["path"] not in manifest["image_deployment_files"]}
-        if actual["files"] != expected or actual["manifest_sha256"] != sha256(reference / "update-manifest.json"):
-            raise RuntimeError("installed managed source/manifest differs from official reference")
+        if actual["files"] != expected:
+            raise RuntimeError("installed managed source differs from official reference")
+        if actual["manifest_sha256"] != sha256(reference / "update-manifest.json"):
+            raise RuntimeError("transaction candidate manifest differs from official reference")
         if await self.immutable_hashes() != self.immutable_before:
             raise RuntimeError("in-container update changed immutable entrypoint/helper")
         self.report["checks"].append(f"exact {manifest['version']} manifest and {len(expected)} managed hashes; image entrypoint/helper unchanged")
@@ -365,13 +377,15 @@ print(json.dumps({'files':{p.relative_to(r).as_posix():{'size':p.stat().st_size,
             raise RuntimeError("pre-update message mapping disappeared")
         await asyncio.to_thread(self.docker, "exec", self.name, "python", "/app/tools/check_requirements.py", "/app/requirements.txt")
         self.report["checks"].append("Bot, transport, identity, get_msg and dependencies preserved")
-        self.assert_sentinels()
+        await self.assert_sentinels()
 
     async def inject_failure(self, mode):
         code = '''import hashlib,json,os,signal,time
 from pathlib import Path
-r=Path('/app/data/update/transactions'); known={p.name for p in r.iterdir() if p.is_dir()}
+r=Path('/app/data/update/transactions'); r.mkdir(parents=True,exist_ok=True)
+known={p.name for p in r.iterdir() if p.is_dir()}
 mode=MODE; deadline=time.monotonic()+240
+(r.parent/('validation-'+mode+'-watcher-ready.json')).write_text(json.dumps({'status':'watching'}))
 while time.monotonic()<deadline:
  for d in r.iterdir():
   if not d.is_dir() or d.name in known: continue
@@ -387,14 +401,24 @@ while time.monotonic()<deadline:
    temp=p.with_suffix('.validation.tmp'); temp.write_text(json.dumps(t)); os.replace(temp,p)
    (r.parent/'validation-health-injection.json').write_text(json.dumps({'transaction_id':t['transaction_id'],'stage':stage}))
    raise SystemExit(0)
-  if mode=='interrupt' and stage=='replacing':
-   (r.parent/'validation-interrupt-injection.json').write_text(json.dumps({'transaction_id':t['transaction_id'],'stage':stage}))
-   os.kill(1,signal.SIGKILL); raise SystemExit(0)
+  if mode=='interrupt' and stage=='waiting_for_shutdown' and t.get('status')=='prepared':
+   helper=Path(t['helper_path']); raw=helper.read_text(); needle='        _install(source_root, candidate_root)'
+   if raw.count(needle)!=1: raise RuntimeError('unexpected isolated helper installation point')
+   replacement="        shutil.copy2(candidate_root / 'rocketcat_shell/__init__.py', source_root / 'rocketcat_shell/__init__.py')\\n"
+   replacement+="        (transaction_root.parent.parent / 'validation-interrupt-injection.json').write_text(json.dumps({'transaction_id':payload['transaction_id'],'stage':'replacing'}))\\n"
+   replacement+="        os.kill(1, 9)\\n"+needle
+   helper.write_text(raw.replace(needle,replacement)); raise SystemExit(0)
  time.sleep(0.001)
 raise TimeoutError('isolated failure injection did not observe expected transaction stage')
 '''.replace("mode=MODE", "mode=" + repr(mode)).replace("TARGET", repr(self.args.target_tag))
         await asyncio.to_thread(self.docker, "exec", "-d", self.name, "python", "-c", code)
-        await asyncio.sleep(0.5)
+        for _ in range(20):
+            ready = await asyncio.to_thread(self.docker, "exec", self.name, "python", "-c",
+                f"from pathlib import Path; print(Path('/app/data/update/validation-{mode}-watcher-ready.json').exists())")
+            if ready == "True":
+                return
+            await asyncio.sleep(0.1)
+        raise RuntimeError("isolated fault watcher did not start")
 
     async def recovery_scenarios(self):
         for mode in ("health", "interrupt"):
@@ -405,7 +429,7 @@ raise TimeoutError('isolated failure injection did not observe expected transact
             if json.loads(injection)["transaction_id"] != transaction["transaction_id"]:
                 raise RuntimeError("fault recovery was not caused by the intended injection")
             await self.assert_managed(source=True)
-            self.assert_sentinels()
+            await self.assert_sentinels()
             self.report["checks"].append(f"{mode} failure restores source and completes rolled_back with exact hashes")
         await self.switch(self.args.target_tag)
         await self.assert_target()
@@ -415,15 +439,15 @@ raise TimeoutError('isolated failure injection did not observe expected transact
         self.resources["containers"][-1]["name"] = old_name
         await self.create_container()
         await self.wait_health(self.source_tag)
-        self.assert_sentinels()
+        await self.assert_sentinels()
         await self.onebot.action("get_msg", {"message_id": self.pre_message_id})
         self.report["checks"].append("isolated recreation restores original image version with seven mounts and message mapping preserved")
 
-    def assert_sentinels(self):
+    async def assert_sentinels(self):
         after = {relative: sha256(self.mount_root / relative) for relative in self.sentinels}
         if after != self.sentinels:
             raise RuntimeError("persistent sentinel changed")
-        with sqlite3.connect(self.mount_root / "data/user_identity/validation-preserved.sqlite3") as connection:
+        with contextlib.closing(sqlite3.connect(self.mount_root / "data/user_identity/validation-preserved.sqlite3")) as connection:
             if connection.execute("SELECT payload FROM validation_state WHERE marker='upgrade'").fetchone() != ("synthetic-identity-preserved",):
                 raise RuntimeError("identity sentinel row corrupted")
         identity_scope = self.mount_root / "data/bots" / self.bot_id / "identity_scope.json"
@@ -432,10 +456,15 @@ raise TimeoutError('isolated failure injection did not observe expected transact
             container_db = str(scope["database_path"])
             if not container_db.startswith("/app/data/user_identity/"):
                 raise RuntimeError("identity path escaped protected mount")
-            db = self.mount_root / container_db.removeprefix("/app/")
-            with sqlite3.connect(db) as connection:
-                if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
-                    raise RuntimeError("runtime identity integrity failure")
+            # SQLite WAL/shared-memory locks must stay in the Linux filesystem
+            # view. Opening the live Linux DB through the Windows bind mount can
+            # create/remove incompatible WAL sidecars and break the next restart.
+            result = await asyncio.to_thread(self.docker, "exec", self.name, "python", "-c",
+                "import sqlite3,sys; "
+                "c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True); "
+                "print(c.execute('PRAGMA quick_check').fetchone()[0]); c.close()", container_db)
+            if result != "ok":
+                raise RuntimeError("runtime identity integrity failure")
         self.report["sentinels_after"] = after
 
     async def run(self):
@@ -454,7 +483,7 @@ raise TimeoutError('isolated failure injection did not observe expected transact
             self.report["checks"].append("container restart preserves updated writable layer")
             await self.switch(self.source_tag)
             await self.assert_managed(source=True)
-            self.assert_sentinels()
+            await self.assert_sentinels()
             await self.switch(self.args.target_tag)
             await self.assert_target()
             # Same-version repair intentionally corrupts only an isolated source file.
@@ -479,9 +508,9 @@ raise TimeoutError('isolated failure injection did not observe expected transact
                 await self.proxy.wait_closed()
             self.report["resources"] = self.resources
             self.report["finished_at"] = datetime.now().astimezone().isoformat()
-            self.root.mkdir(parents=True, exist_ok=True)
-            (self.root / "compatibility-report.json").write_text(json.dumps(self.report, ensure_ascii=False, indent=2), encoding="utf-8")
-            (self.root / "compatibility-report.md").write_text(f"# {self.source_tag} → {self.args.target_tag}\n\nResult: {'PASS' if self.report['passed'] else 'FAIL'}\n\n" + "\n".join('- ' + check for check in self.report['checks']) + "\n", encoding="utf-8")
+            if self.created_root:
+                (self.root / "compatibility-report.json").write_text(json.dumps(self.report, ensure_ascii=False, indent=2), encoding="utf-8")
+                (self.root / "compatibility-report.md").write_text(f"# {self.source_tag} → {self.args.target_tag}\n\nResult: {'PASS' if self.report['passed'] else 'FAIL'}\n\n" + "\n".join('- ' + check for check in self.report['checks']) + "\n", encoding="utf-8")
 
 
 def parse_args(argv=None):
